@@ -1,0 +1,39 @@
+{
+  "name": "ai-trans",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI_Trans — Chrome MV3 extension for real-time video subtitle translation",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
+    "build:test": "npm run build && npm run test:cleanup",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:contract": "vitest run --config vitest.contract.config.ts",
+    "test:ci": "npm run test:unit && npm run test:integration && npm run test:contract",
+    "test:e2e": "playwright test",
+    "test:all": "npm run build:test && npm run test:ci && npm run test:e2e && npm run report:merge && npm run test:cleanup",
+    "report:merge": "node scripts/merge-reports.mjs",
+    "mock:serve": "node scripts/serve-mock.mjs",
+    "test:cleanup": "node scripts/cleanup.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.12.0",
+    "@playwright/test": "^1.48.0",
+    "@types/chrome": "^0.0.280",
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "eslint": "^9.12.0",
+    "globals": "^17.9.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.8.0",
+    "vitest": "^2.1.0"
+  }
+}
