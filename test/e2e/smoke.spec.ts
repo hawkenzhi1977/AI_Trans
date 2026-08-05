@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 /**
  * E2E 冒煙：驗證 Mock YouTube 宿主可加載、播放時鐘推進、timedtext 字幕端點可用。

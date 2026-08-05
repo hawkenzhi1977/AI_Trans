@@ -7,3 +7,9 @@ export interface ConfigStore {
   /** 訂閱配置變更，返回取消訂閱函數。 */
   subscribe(cb: (config: EngineConfig) => void): () => void;
 }
+
+/** API 密鑰安全存儲端口——密鑰與 EngineConfig 分離，不明文散播。 */
+export interface ApiKeyStore {
+  getApiKey(slot: 'llm' | 'asr'): Promise<string | undefined>;
+  setApiKey(slot: 'llm' | 'asr', value: string): Promise<void>;
+}

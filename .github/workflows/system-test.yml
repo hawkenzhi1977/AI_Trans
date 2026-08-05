@@ -1,0 +1,61 @@
+# system-test.yml — 全閉環系統測試 CI。
+# 對應 doc/system-test-design.md §5：build → unit → integration → contract → e2e → report → cleanup。
+# 任一階段失敗即中斷；cleanup 與報告匯總強制 if: always()。
+name: system-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  system-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # 1) 構建擴充（測試模式：注入 localhost mock 站點 match + stub 引擎）
+      - name: Build extension (test profile)
+        run: |
+          npm run build:test
+          npm run typecheck
+          npm run lint
+
+      # 2) 單元 + 集成 + 契約（輸出 JUnit XML 至 reports/junit/）
+      - name: Unit / Integration / Contract
+        run: npm run test:ci
+
+      # 3) E2E：Playwright 瀏覽器 + Mock 站點（webServer 由 playwright 自動拉起）
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E (extension loaded)
+        run: npm run test:e2e
+
+      # 4) 匯總報告（JUnit 合併 → reports/junit-merged.xml）
+      - name: Generate merged report
+        if: always()
+        run: npm run report:merge
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: |
+            reports/
+            playwright-report/
+            test-results/
+
+      # 5) 環境恢復（強制執行）
+      - name: Cleanup
+        if: always()
+        run: npm run test:cleanup

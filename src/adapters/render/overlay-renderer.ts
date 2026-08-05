@@ -17,17 +17,24 @@ export class OverlayRenderer implements SubtitleRenderer {
 
     const root = document.createElement('div');
     root.className = 'ai-trans-overlay';
-    root.style.cssText = [
-      'position:absolute',
-      'bottom:12%',
-      'left:50%',
-      'transform:translateX(-50%)',
-      'text-align:center',
-      'max-width:90%',
-      'pointer-events:none',
-      'z-index:2147483647',
-      ...Object.entries(style).map(([k, v]) => `${this.kebab(k)}:${v}`),
-    ].join(';');
+    // 基礎定位樣式（固定值，安全）。
+    const base: Record<string, string> = {
+      position: 'absolute',
+      bottom: '12%',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      'text-align': 'center',
+      'max-width': '90%',
+      'pointer-events': 'none',
+      'z-index': '2147483647',
+    };
+    for (const [k, v] of Object.entries(base)) root.style.setProperty(k, v);
+    // R8：用戶自填樣式值改用 setProperty（瀏覽器會拒絕非法值），不拼進 cssText。
+    // display-mode 為內部渲染開關，不是 CSS 屬性，跳過。
+    for (const [k, v] of Object.entries(style)) {
+      if (k === 'display-mode') continue;
+      root.style.setProperty(this.kebab(k), v);
+    }
 
     container.appendChild(root);
     this.root = root;
@@ -97,5 +104,6 @@ function escapeHtml(s: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }

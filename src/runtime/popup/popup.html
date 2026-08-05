@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { width: 260px; font-family: system-ui, sans-serif; margin: 0; padding: 12px 14px; color: #222; }
+    h1 { font-size: 15px; margin: 0 0 10px; }
+    .line { font-size: 13px; margin: 5px 0; color: #444; }
+    .actions { margin-top: 12px; display: flex; gap: 8px; }
+    button { flex: 1; padding: 7px 10px; font-size: 12px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>AI_Trans</h1>
+  <div class="line" id="status-translation">翻譯: —</div>
+  <div class="line" id="status-asr">ASR: —</div>
+  <div class="line" id="status-lang">目標語言: —</div>
+  <div class="actions">
+    <button id="btn-options">設定</button>
+    <button id="btn-reload">重新載入頁面</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

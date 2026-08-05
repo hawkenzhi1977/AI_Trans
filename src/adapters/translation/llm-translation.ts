@@ -8,6 +8,8 @@ import type { TranslationProvider } from '../../domain/ports/translation-provide
  */
 export class LLMTranslationProvider implements TranslationProvider {
   readonly location = 'cloud' as const;
+  // R1：默認 fetch 必須綁定 globalThis，content-script 中裸 fetch 會拋 Illegal invocation。
+  private readonly fetchFn: typeof fetch;
 
   constructor(
     private readonly opts: {
@@ -17,7 +19,9 @@ export class LLMTranslationProvider implements TranslationProvider {
       apiKey: string;
       fetchFn?: typeof fetch;
     }
-  ) {}
+  ) {
+    this.fetchFn = opts.fetchFn ?? globalThis.fetch.bind(globalThis);
+  }
 
   get engineId(): string {
     return this.opts.engineId;
@@ -44,7 +48,7 @@ export class LLMTranslationProvider implements TranslationProvider {
       ],
     };
 
-    const res = await (this.opts.fetchFn ?? fetch)(this.opts.endpoint, {
+    const res = await this.fetchFn(this.opts.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

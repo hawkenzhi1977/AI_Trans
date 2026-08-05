@@ -1,13 +1,15 @@
 import type { EngineConfig } from '../domain/models/config';
 import { DEFAULT_CONFIG } from '../domain/models/config';
-import type { ConfigStore } from '../domain/ports/config-store';
+import type { ConfigStore, ApiKeyStore } from '../domain/ports/config-store';
 
 /**
  * Chrome storage 配置存儲——持久化於 chrome.storage.local。
+ * EngineConfig 存於主 key；API 密鑰存於獨立 key（apiKeyRef 指向），不明文混入配置。
  * 非擴充環境（測試）提供內存實現見 test/harness。
  */
-export class ChromeStorageConfigStore implements ConfigStore {
+export class ChromeStorageConfigStore implements ConfigStore, ApiKeyStore {
   private static readonly KEY = 'engineConfig';
+  private static readonly KEYS_KEY = 'engineConfigKeys';
 
   async get(): Promise<EngineConfig> {
     const stored = await chrome.storage.local.get(ChromeStorageConfigStore.KEY);
@@ -20,6 +22,21 @@ export class ChromeStorageConfigStore implements ConfigStore {
     const next = this.merge(current, patch);
     await chrome.storage.local.set({ [ChromeStorageConfigStore.KEY]: next });
     for (const cb of this.subscribers) cb(next);
+  }
+
+  /** 讀取某引擎的 API 密鑰（獨立安全 key）。 */
+  async getApiKey(slot: 'llm' | 'asr'): Promise<string | undefined> {
+    const stored = await chrome.storage.local.get(ChromeStorageConfigStore.KEYS_KEY);
+    const keys = (stored[ChromeStorageConfigStore.KEYS_KEY] ?? {}) as Record<string, string>;
+    return keys[slot];
+  }
+
+  /** 寫入某引擎的 API 密鑰。 */
+  async setApiKey(slot: 'llm' | 'asr', value: string): Promise<void> {
+    const stored = await chrome.storage.local.get(ChromeStorageConfigStore.KEYS_KEY);
+    const keys = (stored[ChromeStorageConfigStore.KEYS_KEY] ?? {}) as Record<string, string>;
+    keys[slot] = value;
+    await chrome.storage.local.set({ [ChromeStorageConfigStore.KEYS_KEY]: keys });
   }
 
   subscribe(cb: (config: EngineConfig) => void): () => void {

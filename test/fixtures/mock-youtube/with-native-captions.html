@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Mock YouTube Watch</title>
+  <title>Mock YouTube Watch — With Native Captions</title>
   <style>
     body { background: #111; color: #eee; font-family: sans-serif; margin: 0; }
     #player { position: relative; width: 800px; height: 450px; background: #000; margin: 20px auto; }
@@ -12,7 +12,7 @@
   </style>
 </head>
 <body>
-  <h1 style="text-align:center">Mock YouTube Watch — E2E 測試宿主</h1>
+  <h1 style="text-align:center">Mock YouTube Watch — With Native Captions</h1>
   <div id="player">
     <div id="mock-player"><span id="mock-caption">▶ Mock video playing...</span></div>
     <!-- 供擴充 YouTubePlatformAdapter.observePlayback 讀取的模擬視頻元素。 -->
@@ -23,6 +23,25 @@
     <button id="btn-pause">Pause</button>
     <span id="clock">0.0s</span>
   </div>
+
+  <!-- 模擬 YouTube 內嵌的 ytInitialPlayerResponse（純 JSON，供 FetchCaptionSource 解析）。
+       baseUrl 指向同源 /timedtext 端點，由 app.js 的 fetch 攔截返回字幕。 -->
+  <script id="ytInitialPlayerResponse" type="application/json">
+  {
+    "captions": {
+      "playerCaptionsTracklistRenderer": {
+        "captionTracks": [
+          {
+            "baseUrl": "/timedtext?lang=en&v=abc123",
+            "languageCode": "en",
+            "kind": "standard"
+          }
+        ]
+      }
+    }
+  }
+  </script>
+
   <script src="app.js"></script>
 </body>
 </html>

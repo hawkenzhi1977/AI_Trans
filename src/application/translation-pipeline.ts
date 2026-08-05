@@ -71,12 +71,27 @@ export class TranslationPipeline implements TranslationProvider {
       targetLang: req.targetLang ?? this.opts.targetLang,
       streaming: true,
     };
+    // primary 無流式能力 → 退化為非流式（translate 已含 fallback + 降級事件）。
     if (!this.opts.primary.translateStream) {
       const result = await this.translate(request);
       emit(result);
       return;
     }
-    await this.opts.primary.translateStream(request, emit);
+    // R5：流式路徑與非流式一樣須 try/catch + fallback + 降級事件，
+    // 不能只在 translate() 做降級，否則 primary 流式中途拋錯會直接 reject 且無觀測。
+    try {
+      await this.opts.primary.translateStream(request, emit);
+    } catch (primaryErr) {
+      this.emit({
+        type: 'engine-degraded',
+        port: 'translation',
+        reason: `primary stream failed: ${String(primaryErr)}`,
+      });
+      this.emitError(primaryErr);
+      // 降級為非流式：優先 fallback，否則 translate() 內部再兜底。
+      const result = await this.translate(request);
+      emit(result);
+    }
   }
 
   private emit(e: PipelineEvent): void {

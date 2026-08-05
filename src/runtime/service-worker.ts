@@ -13,5 +13,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     void store.get().then(sendResponse);
     return true; // 異步響應
   }
+  if (msg.topic === 'config:set') {
+    // Options 保存配置 → 寫入存儲；訂閱者（content-script）收到變更。
+    const patch = (msg.payload ?? {}) as Parameters<ChromeStorageConfigStore['set']>[0];
+    void store.set(patch).then(() => {
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
   return false;
 });

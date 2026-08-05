@@ -19,6 +19,29 @@ const PORT = Number(process.env.MOCK_PORT ?? 8721);
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
   let pathname = url.pathname;
+
+  // timedtext 字幕端點：返回固定 JSON 字幕（與 app.js LINES 一致，供擴充抓取）。
+  if (pathname === '/timedtext') {
+    const lines = [
+      'Hello and welcome',
+      'This is the second line',
+      'We are testing subtitles',
+      'Translation should appear below',
+    ];
+    const body = JSON.stringify({
+      events: lines.map((text, i) => ({
+        tStartMs: i * 2000,
+        dDurationMs: 2000,
+        segs: [{ utf8: text }],
+      })),
+      lang: 'en',
+      videoId: 'abc123',
+    });
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+
   if (pathname === '/') pathname = '/index.html';
   if (pathname.endsWith('/')) pathname += 'index.html';
 

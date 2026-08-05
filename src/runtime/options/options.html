@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <title>AI_Trans 配置</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 15px; margin: 20px 0 8px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+    fieldset { border: none; margin: 0 0 12px; padding: 0; }
+    label { display: block; font-size: 13px; margin: 8px 0 2px; color: #444; }
+    input, select { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px; }
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
+    .actions { margin-top: 20px; display: flex; gap: 10px; }
+    button { padding: 8px 18px; font-size: 14px; cursor: pointer; }
+    #status { color: #0a7d32; font-size: 13px; margin-left: 8px; }
+    .hint { font-size: 12px; color: #777; margin: 2px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>AI_Trans 設定</h1>
+
+  <h2>翻譯引擎</h2>
+  <fieldset>
+    <div class="row">
+      <div>
+        <label for="translation-type">引擎類型</label>
+        <select id="translation-type">
+          <option value="cloud-llm">雲端 LLM（OpenAI 兼容）</option>
+          <option value="local">本地模型端點</option>
+          <option value="mt">傳統 MT（字典兜底）</option>
+        </select>
+      </div>
+      <div>
+        <label for="translation-fallback">失敗兜底</label>
+        <select id="translation-fallback">
+          <option value="mt">MT 兜底</option>
+          <option value="none">不兜底</option>
+        </select>
+      </div>
+    </div>
+    <label for="translation-model">模型</label>
+    <input id="translation-model" type="text" placeholder="gpt-4o-mini" />
+    <label for="translation-endpoint">端點（Base URL / chat/completions）</label>
+    <input id="translation-endpoint" type="text" placeholder="https://api.openai.com/v1/chat/completions" />
+    <label for="translation-api-key">API Key（本地安全存儲）</label>
+    <input id="translation-api-key" type="password" autocomplete="off" placeholder="sk-..." />
+  </fieldset>
+
+  <h2>語音識別（ASR，M2 起用）</h2>
+  <fieldset>
+    <div class="row">
+      <div>
+        <label for="asr-type">引擎類型</label>
+        <select id="asr-type">
+          <option value="local-whisper">本地 Whisper</option>
+          <option value="cloud">雲端 ASR</option>
+        </select>
+      </div>
+      <div>
+        <label for="asr-tier">本地模型檔</label>
+        <select id="asr-tier">
+          <option value="tiny">tiny（低延遲）</option>
+          <option value="base">base（默認）</option>
+          <option value="small">small（高準確）</option>
+        </select>
+      </div>
+    </div>
+    <label for="asr-endpoint">雲端端點</label>
+    <input id="asr-endpoint" type="text" placeholder="https://api.openai.com/v1/audio/transcriptions" />
+    <label for="asr-api-key">API Key（本地安全存儲）</label>
+    <input id="asr-api-key" type="password" autocomplete="off" placeholder="sk-..." />
+  </fieldset>
+
+  <h2>字幕</h2>
+  <fieldset>
+    <div class="row">
+      <div>
+        <label for="target-lang">目標語言（BCP-47）</label>
+        <input id="target-lang" type="text" placeholder="zh-Hant" />
+      </div>
+      <div>
+        <label for="display-mode">顯示模式</label>
+        <select id="display-mode">
+          <option value="mono">僅譯文</option>
+          <option value="bilingual">雙語（原文+譯文）</option>
+        </select>
+      </div>
+    </div>
+    <label for="performance-profile">性能檔位</label>
+    <select id="performance-profile">
+      <option value="streaming">streaming（低延遲優先）</option>
+      <option value="balanced">balanced（默認）</option>
+      <option value="quality">quality（準確優先）</option>
+    </select>
+    <div class="row">
+      <div>
+        <label for="style-font-size">字號</label>
+        <input id="style-font-size" type="text" placeholder="24px" />
+      </div>
+      <div>
+        <label for="style-color">文字顏色</label>
+        <input id="style-color" type="text" placeholder="#ffffff" />
+      </div>
+      <div>
+        <label for="style-bg">背景</label>
+        <input id="style-bg" type="text" placeholder="transparent" />
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button id="btn-save">保存</button>
+    <button id="btn-reset">恢復默認</button>
+    <span id="status"></span>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

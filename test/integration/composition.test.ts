@@ -1,0 +1,116 @@
+import { describe, it, expect, vi } from 'vitest';
+import { buildDefaultRegistry } from '../../src/runtime/composition';
+import { DEFAULT_CONFIG, type EngineConfig } from '../../src/domain/models/config';
+import type { ApiKeyStore } from '../../src/domain/ports/config-store';
+import type { Registry } from '../../src/application/registry';
+
+/** 內存 ApiKeyStore stub。 */
+class MemoryApiKeyStore implements ApiKeyStore {
+  constructor(private readonly keys: Record<string, string> = {}) {}
+  async getApiKey(slot: 'llm' | 'asr'): Promise<string | undefined> {
+    return this.keys[slot];
+  }
+  async setApiKey(slot: 'llm' | 'asr', value: string): Promise<void> {
+    this.keys[slot] = value;
+  }
+}
+
+const CONFIG = (patch: Partial<EngineConfig>): EngineConfig => ({
+  ...DEFAULT_CONFIG,
+  ...patch,
+  translation: { ...DEFAULT_CONFIG.translation, ...(patch.translation ?? {}) },
+  asr: { ...DEFAULT_CONFIG.asr, ...(patch.asr ?? {}) },
+});
+
+describe('buildDefaultRegistry 配置注入（M1-25）', () => {
+  it('cloud-llm 配置註冊 llm + mt，且 apiKey 從安全存儲解析', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({ translation: { type: 'cloud-llm', model: 'gpt-test', endpoint: 'https://x/chat/completions' } }),
+      { apiKeyStore: new MemoryApiKeyStore({ llm: 'sk-secret' }) }
+    );
+
+    const llm = registry.translation.get('llm');
+    expect(llm).toBeDefined();
+    expect(llm?.engineId).toBe('llm');
+    expect(llm?.location).toBe('cloud');
+    expect(registry.translation.has('mt')).toBe(true);
+  });
+
+  it('local 類型註冊 engineId=local-llm', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({ translation: { type: 'local' } }),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    expect(registry.translation.get('local-llm')?.engineId).toBe('local-llm');
+  });
+
+  it('mt 類型僅註冊 mt，不註冊 llm', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({ translation: { type: 'mt' } }),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    expect(registry.translation.has('mt')).toBe(true);
+    expect(registry.translation.has('llm')).toBe(false);
+  });
+
+  it('註冊默認策略鏈（native → lookahead → realtime）與 YouTube 平台', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({}),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    expect(registry.platforms.map((p) => p.platformId)).toEqual(['youtube']);
+    expect(registry.strategies.map((s) => s.origin)).toEqual([
+      'native',
+      'lookahead-asr',
+      'realtime-asr',
+    ]);
+  });
+
+  it('apiKey 不散播入配置對象，僅存於安全存儲', async () => {
+    const store = new MemoryApiKeyStore({ llm: 'sk-secret' });
+    const config = CONFIG({ translation: { type: 'cloud-llm' } });
+    await buildDefaultRegistry(config, { apiKeyStore: store });
+    expect(JSON.stringify(config)).not.toContain('sk-secret');
+    expect(await store.getApiKey('llm')).toBe('sk-secret');
+  });
+
+  it('LLM 翻譯請求實際攜帶從安全存儲解析的 Authorization', async () => {
+    // 捕獲發往 LLM 端點的請求頭。
+    const captured: RequestInit[] = [];
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured.push(init ?? {});
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '0\thello world' } }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const registry: Registry = await buildDefaultRegistry(
+        CONFIG({
+          translation: {
+            type: 'cloud-llm',
+            model: 'gpt-test',
+            endpoint: 'https://llm.example.com/chat/completions',
+          },
+        }),
+        { apiKeyStore: new MemoryApiKeyStore({ llm: 'sk-secret' }) }
+      );
+
+      const llm = registry.translation.get('llm');
+      const result = await llm?.translate({
+        segments: [{ id: '0', start: 0, end: 1000, sourceText: 'hello world', origin: 'native', provisional: false, revision: 0 }],
+        targetLang: 'zh-Hant',
+      });
+
+      expect(captured).toHaveLength(1);
+      const headers = captured[0]!.headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer sk-secret');
+      expect(result?.segments[0]?.translatedText).toBe('hello world');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
