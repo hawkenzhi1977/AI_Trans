@@ -6,6 +6,8 @@ export default defineConfig({
     name: 'unit',
     include: ['test/unit/**/*.test.ts'],
     environment: 'node',
+    // 明文守衛：收集不到任何用例即視為失敗（防範收集期崩潰被靜默為 0 tests 通過）。
+    passWithNoTests: false,
     reporters: ['default', ['junit', { outputFile: 'reports/junit/unit.xml' }]],
     coverage: {
       provider: 'v8',

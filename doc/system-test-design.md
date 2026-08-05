@@ -125,7 +125,7 @@ export function buildTestRegistry(overrides?: Partial<Registry>): Registry {
 | `jsdom` | 鎖定 `^26.x` | 26.x 已移除對 `undici` 的依賴，engines `node>=18`；**禁止升到 30.x**（其依賴 `undici@8` 在 import 期調用 `webidl.util.markAsUncloneable`，Node 20.x 未提供該 API → `TypeError` 致集成收集期崩潰）。 |
 | CI Node | `system-test.yml` 固定 `node-version: 20`，與 AGENTS.md「node>=20」一致 | 換 Node 大版本須同步核對 jsdom/undici 相容矩陣並重跑 `test:all`。 |
 
-**紅線**：任何依賴變更（尤其 `jsdom`）後，必須本地 `npm install` 更新 lockfile 並跑 `test:ci` 確認**集成用例數不為 0**；`npm warn EBADENGINE` 不可忽視。`test:ci` 現為 `&&` 串聯，單段收集期崩潰會短路掩蓋後續 contract/E2E 報告——排查時須以完整 CI 日誌（非僅 junit）確認真實錯誤。
+**紅線**：任何依賴變更（尤其 `jsdom`）後，必須本地 `npm install` 更新 lockfile 並跑 `test:ci` 確認**集成用例數不為 0**；`npm warn EBADENGINE` 不可忽視。`test:ci` 現由 `scripts/run-ci-tests.mjs` 分段執行（unit → integration → contract），單段失敗不短路後續段、各自產出 junit、末尾統一判定退出碼；三個 vitest config 明文 `passWithNoTests: false`（收集 0 用例即失敗）。`merge-reports.mjs` 對 `tests=0` 的 suite 顯式 warn——若再遇到應以完整 CI 日誌（非僅 junit）確認真實錯誤。
 
 ---
 

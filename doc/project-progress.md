@@ -75,6 +75,7 @@
 | M1-32 | **可靠性紅線全庫審計與加固**：修復 restart 訂閱洩漏（observePlayback unsubscribe 未保存）、ensureMounted MutationObserver 洩漏+永久懸掛（加 handle+15s 超時）、`platforms[0]?` 靜默失敗改顯式判空發降級、LLM 默認 fetch 綁定 globalThis、YT `script:not([src])` 誤匹配+JSON.parse 未捕獲、translateStream 無 fallback、overlay cssText 改 setProperty、escapeHtml 補單引號、options showStatus 去抖 | P0 | 5 | ✅ 已完成 | `content-script.ts` / `platform-adapter.ts` / `llm-translation.ts` / `translation-pipeline.ts` / `overlay-renderer.ts` / `options.ts` |
 | M1-33 | **發布件與雙語 README**：`npm run release` 生成乾淨未打包擴充 + zip（剔除 sourcemap/.d.ts）；`README.md`/`README.zh-Hant.md` 描述功能特性（已實現/待實現）與三平台安裝/源碼構建步驟；`release/README.md` 快速安裝說明。文檔一致性規則納入 README/發布件 | P1 | 5 | ✅ 已完成 | `scripts/package-release.mjs` / `release/` / `README*.md` / `AGENTS.md` §2 |
 | M1-34 | **CI 集成測試環境相容性修復**：首次遠端 CI（Node 20.20.2）集成階段整體崩潰——`jsdom@30` 依賴的 `undici@8.10` 於 import 期調用 `webidl.util.markAsUncloneable`（Node 20 未提供）拋 `TypeError`，致 4 個集成測試文件收集階段失敗（junit `tests="0"`、退出碼 1），`test:ci` 的 `&&` 短路使 contract/E2E 未執行。降級 `jsdom@^26.1.0`（26.x 已移除 undici 依賴，engines `node>=18`）徹底繞開；`npm install` 更新 lockfile 後 undici 退出依賴樹。本地 `test:all` 66 全綠，集成回升 25 | P0 | 4 | ✅ 已完成 | `package.json` / `package-lock.json` |
+| M1-35 | **test:ci 分段執行加固**：新增 `scripts/run-ci-tests.mjs`，unit/integration/contract 三段獨立執行，任一段失敗不短路後續段，各自產出 junit，末尾統一判定退出碼（任一段失敗即 exit 1）。根治 M1-34 暴露的「`&&` 串聯 + 收集期崩潰（0 tests）→ 後續段報告缺失」診斷盲區。配套：三個 vitest config 明文 `passWithNoTests: false`（收集 0 用例即失敗）；`merge-reports.mjs` 對 `tests=0` 的 suite 顯式 warn。驗證：正常 `test:all` 66 全綠；人為製造集成段失敗後 contract 仍執行且退出碼為 1 | P1 | 3 | ✅ 已完成 | `scripts/run-ci-tests.mjs` / `scripts/merge-reports.mjs` / `vitest.*.config.ts` / `package.json` |
 
 ### 3.2 M2 — 實時擷取 ASR（P1，待完成）
 
@@ -134,7 +135,8 @@
 - **CI 自動化**（M1-23）：`.github/workflows/system-test.yml` 串聯 build→test→e2e→report→cleanup。
 - **測試基礎設施已搭**：66 個測試全綠（25 單元 + 5 契約 + 25 集成 + 11 E2E），`npm run test:all` 一次通過，含構建→測試→報告合併→環境清理（M1-20~22）。
 - **可靠性紅線加固**（M1-32）：全庫審計並修復 restart 訂閱/Observer 洩漏、fetch 未綁定、JSON parse 未容錯、stream 無 fallback 等 MV3 真實環境陷阱；每項配專屬回歸測試（單元/集成/E2E）。AGENTS.md §5 沉澱 8 條紅線，governance skill 加自查清單。
-- **CI 環境相容性修復**（M1-34）：首次遠端 CI 集成階段崩潰於 `jsdom@30`→`undici@8` 在 Node 20 的 `webidl.util.markAsUncloneable` 缺失；降級 `jsdom@^26`（無 undici 依賴）根治。教訓：依賴版本須與 CI 目標 Node 版本相容，`EBADENGINE` 警告不可忽視；`test:ci` 的 `&&` 串聯會因單段收集期崩潰（0 tests）短路掩蓋後續階段，宜後續加固為分步產出各自 junit。
+- **CI 環境相容性修復**（M1-34）：首次遠端 CI 集成階段崩潰於 `jsdom@30`→`undici@8` 在 Node 20 的 `webidl.util.markAsUncloneable` 缺失；降級 `jsdom@^26`（無 undici 依賴）根治。教訓：依賴版本須與 CI 目標 Node 版本相容，`EBADENGINE` 警告不可忽視。
+- **test:ci 分段執行加固**（M1-35）：`run-ci-tests.mjs` 分段執行 unit/integration/contract，單段失敗不再 `&&` 短路，各自產出 junit、末尾統一判定退出碼；三個 vitest config 明文 `passWithNoTests:false`、merge-reports 對 `tests=0` warn。診斷盲區「收集期崩潰被靜默為 0 tests」已根治。
 - **已修復測試/真實環境暴露的缺陷**：翻譯管線降級事件被吞、mock 站點 `/watch` 路由 404、manifest SW/CS 路徑錯誤、mock 播放器容器 `textContent` 覆寫刪除覆蓋層、content-script fetch 未綁定。
 
 ## 5. 進行中與下一步
