@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-04
+> 最後更新：2026-08-05（補 §7.1 可靠性紅線加固）
 
 ---
 
@@ -165,11 +165,15 @@ src/
 │       └── metrics.ts
 │
 └── runtime/                     # MV3 運行時入口
-    ├── service-worker.ts
-    ├── content-script.ts
-    ├── offscreen.ts
-    └── options/
+    ├── service-worker.ts        # 配置路由 SW（manifest "type":"module"，ESM 打包）
+    ├── content-script.ts        # SubtitleController：自動掛載 + rAF 渲染 + 熱重啟（IIFE 打包）
+    ├── composition.ts           # buildDefaultRegistry（async，依配置選引擎 + 解析 apiKey）
+    ├── offscreen.ts             # M2：音頻/推理
+    ├── options/                 # 配置頁（options.ts/html，IIFE）
+    └── popup/                   # 彈出頁（popup.ts/html，IIFE）
 ```
+
+> **構建打包**：`scripts/build.mjs` 用 esbuild 對 4 個 runtime 入口 bundle。MV3 content script 不支持 `import` 語句，故 content-script/options/popup 打包為 **IIFE**；service-worker 聲明為 module 型（manifest `"type":"module"`），打包為 **ESM**。`scripts/copy-static.mjs` 拷貝 manifest 與頁面 HTML；`TEST_PROFILE=1` 時向 dist manifest 追加 `localhost` match 供 E2E 加載擴充（生產構建保持乾淨）。
 
 ### 5.2 模塊職責與依賴方向
 
@@ -341,6 +345,14 @@ export interface PlatformAdapter {
 
 **插拔說明**：新增平台 → 新建一個 `PlatformAdapter` 實現並註冊；YouTube 改版 → 只改 `YouTubePlatformAdapter` 內部選擇器/接口解析，其餘不動。
 
+> **content-script 運行時約束（實裝經驗）**：`FetchCaptionSource` 在 content script（isolated world）中拉取 timedtext。直接調用 `window.fetch`（未綁定接收者）會拋 `TypeError: Illegal invocation`——`fetch` 必須以 `window` 為接收者。因此默認 fetch 在構造時 `bind(globalThis)`（LLM 適配器同理）。此外字幕 `baseUrl` 可能為相對路徑（如 Mock 站點），統一以 `new URL(baseUrl, location.href)` 解析為絕對 URL。
+>
+> **訂閱/Observer 洩漏**（restart 路徑）：`SubtitleController` 的 `observePlayback` 返回 unsubscribe 必須保存為實例字段並在 `stop()` 調用；`MutationObserver` 等待播放器就緒時須保存 handle 供 stop 中斷，並加 15s 超時避免 Promise 永久懸掛（SPA 導航離開 watch 頁時播放器永不出現）。每次 restart（配置變更）前必須完整清理上一輪全部訂閱/Observer/rAF，否則監聽器線性累積 → 內存洩漏 + CPU 空轉。
+>
+> **外部 JSON 容錯**：`fetchTrackList` 選擇器優先取具名 `#ytInitialPlayerResponse`，回退掃描內聯腳本時用正則匹配 `ytInitialPlayerResponse = {...}` 賦值，避免 `script:not([src])` 誤匹配頁面首個任意內聯 JS。`JSON.parse` 外部內容必須 try/catch 兜底返回 `[]`，禁止 parse 錯誤冒泡成功能降級誤判。
+>
+> 覆蓋層由 `SubtitleController` 在播放器容器就緒後掛載，並以 `observePlayback` + `requestAnimationFrame` 對齊 `currentTime` 重繪；注意宿主頁若對掛載容器做 `textContent` 全量覆寫會刪除覆蓋層節點（真實 YouTube 不會，Mock 頁需用獨立子節點顯示占位文本）。詳見 AGENTS.md §5 可靠性紅線八條，專屬回歸測試在 TC-R 系列。
+
 ### 7.2 CaptionStrategy（三級策略鏈）
 
 ```typescript
@@ -410,7 +422,7 @@ export interface TranslationProvider {
 ```typescript
 export interface SubtitleRenderer {
   mount(container: HTMLElement, style?: Record<string, string>): void;
-  render(cues: RenderableCue[]): void;       // 按當前播放時間渲染
+  render(cues: RenderableCue[], currentTime: Millis): void; // 按當前播放時間渲染
   updateProvisional(cue: RenderableCue): void;// 臨時字幕原地更新
   unmount(): void;
 }
@@ -420,6 +432,8 @@ export interface RenderableCue {
   sourceText?: string;
   translatedText: string;
   provisional: boolean;
+  start: Millis;               // 用於按 currentTime 選段
+  end: Millis;
 }
 
 export interface ConfigStore {
@@ -428,11 +442,19 @@ export interface ConfigStore {
   subscribe(cb: (c: EngineConfig) => void): () => void;
 }
 
+/** API 密鑰安全存儲：與 EngineConfig 分離，密鑰不明文入配置對象。 */
+export interface ApiKeyStore {
+  getApiKey(slot: 'llm' | 'asr'): Promise<string | undefined>;
+  setApiKey(slot: 'llm' | 'asr', value: string): Promise<void>;
+}
+
 export interface MessageBus {
   publish<T>(topic: string, payload: T): void;
   subscribe<T>(topic: string, cb: (payload: T) => void): () => void;
 }
 ```
+
+**ApiKeyStore 說明**：`EngineConfig.translation.apiKeyRef` 僅為「密鑰存在性標記」，實際密鑰值存於獨立 storage key（`engineConfigKeys`），由 `ApiKeyStore` 讀寫。`ChromeStorageConfigStore` 同時實現 `ConfigStore` 與 `ApiKeyStore`。組裝時 `buildDefaultRegistry`（async）從 `ApiKeyStore.getApiKey` 解析密鑰注入 LLM 適配器，密鑰不隨配置對象散播。
 
 ---
 

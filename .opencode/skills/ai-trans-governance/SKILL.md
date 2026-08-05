@@ -28,6 +28,21 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 
 - 只做進展文檔中**標記的技術點**；若任務超出文檔範圍，視為**新增特性**，走 Step 3 同步流程。
 - 保持依賴方向：domain 不 import adapters/infrastructure；適配層只 import domain。
+- **同步寫測試**：改純邏輯（domain/application/adapter）必補單元/集成測試；修 bug 先寫能復現的失敗測試（紅→綠）；改 content-script/DOM/播放驅動/注入行為必補 E2E。
+- **逐條自查 §可靠性紅線**（見下方「代碼可靠性紅線自查清單」），這些陷阱 jsdom 單測不暴露，只在真實瀏覽器崩潰。
+
+### Step 1.5 — 代碼可靠性紅線自查清單（改 runtime/adapters 必查）
+
+| # | 紅線 | 自查點 | 對應專屬測試 |
+|---|---|---|---|
+| R1 | 宿主方法綁定接收者 | `fetch`/`postMessage`/`navigator.*`/`chrome.*` 賦值或作回調前有無 `.bind()`？默認 fetch 一律 `globalThis.fetch.bind(globalThis)`，禁裸 `fetch`/`?? fetch` | 斷言傳入 mock fetchFn 被以正確 this 調用 |
+| R2 | URL 絕對化 | 傳 `fetch()`/`new URL()` 的字符串是否 `new URL(x, location.href)` 解析 | 斷言相對 baseUrl 被解析為絕對 URL |
+| R3 | 禁全量覆寫共享容器 | overlay/文本是否寫在自建子節點，未對播放器容器 `.textContent=`/`.innerHTML=`/`.replaceChildren()` | E2E：暫停/改配置後覆蓋層節點仍 attached |
+| R4 | 註冊必配解除 | 每處 `addEventListener`/`observe`/`setInterval`/`rAF`/`subscribe`/`observePlayback` 有無存 handle 並在 stop/cleanup 解除？restart 前是否完整清上一輪？unsubscribe 返回值有無丟棄？ | 斷言 stop 後 unsubscribe 被調用；restart×N 後監聽器數不增長 |
+| R5 | async 組裝/事件驅動 | Promise 有無 await 或 `void ...catch`？`translateStream` 有無 try/catch+fallback+降級事件？等待型 Observer 有無超時避免懸掛？ | 斷言 stream 失敗走 fallback 並發降級事件 |
+| R6 | 不用可選鏈掩蓋缺失 | `platforms[0]?.foo()` 這類是否把「本應存在卻缺失」變靜默無錯？異常應顯式判空報錯/發降級 | 斷言缺失時發 degraded 事件而非靜默 |
+| R7 | 外部 JSON/DOM 容錯 | 選擇器精確（避免 `script:not([src])` 誤匹配）？`JSON.parse` 外部內容有無 try/catch 兜底？ | 斷言非法 JSON/多內聯腳本時不誤判降級 |
+| R8 | innerHTML/cssText 注入 | 拼 innerHTML 文本有 escape？拼 cssText 用 `style.setProperty(k,v)`？ | 斷言注入字符被轉義 |
 
 ### Step 2 — 修改後：更新進展文檔
 
@@ -51,6 +66,7 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 - 改完後重新跑 `npm run typecheck`、`npm run lint`、`npm run test:all`。
 - 確認進展文檔所有 ✅ 項都有對應代碼與測試，所有代碼都有對應條目。
 - 如果某項標記 ✅ 但實際是部分實現（如測試只有 3/5 用例），不要標 ✅，保持 🟡。
+- **三者一致性最終核對**：設計文檔的接口/行為 = 代碼實現 = 測試斷言，一一對應；新增測試在 system-test-design.md 有 TC 編號；§可靠性紅線涉及項有專屬回歸測試。
 
 ## 狀態語義
 
@@ -70,6 +86,14 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 **場景 B：修改現有功能**（如翻譯管線降級邏輯）
 1. 若只是修 bug，不新增功能 → 只更新進展文檔的技術點說明。
 2. 若改變了接口或行為 → 更新 architecture-design.md §7/§10 對應章節。
+3. **修 bug 必先寫失敗測試**（紅→綠回歸）；若屬 §可靠性紅線（洩漏/綁定/覆寫）則補專屬回歸測試 + 必要時 E2E。
+
+**場景 D：修可靠性紅線問題**（如 restart 訂閱洩漏、fetch 未綁定）
+1. 先寫能復現的失敗測試（如斷言 restart 後 unsubscribe 被調用、監聽器數不增長）。
+2. 修代碼；跑測試確認紅→綠。
+3. architecture-design.md §7.1「content-script 運行時約束」補記該陷阱與規範。
+4. system-test-design.md 給新 TC 編號；project-progress.md 加技術點條目（含落點）。
+5. AGENTS.md §5 可靠性紅線若出現新類型，補一條。
 
 **場景 C：新增性能優化**（如 WebGPU 加速）
 1. architecture-design.md §11.5 已是設計內容 → 在進展文檔 X-02 標記進度即可。

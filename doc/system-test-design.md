@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-04
+> 最後更新：2026-08-05（新增 TC-R 可靠性紅線回歸系列）
 
 ---
 
@@ -94,10 +94,12 @@ export function buildTestRegistry(overrides?: Partial<Registry>): Registry {
 - 位置：`test/fixtures/mock-youtube/`
 - 形態：本地靜態站點 + HTML5 `<video>` 播放器，模擬 YouTube DOM 結構與播放器容器。
 - 提供多種頁面變體，覆蓋不同場景：
-  - `with-native-captions.html`：帶原生字幕軌（含 `timedtext` mock 接口）
-  - `no-captions.html`：無字幕（觸發 ASR 路徑）
-  - `changed-dom.html`：模擬 YouTube 改版（驗證適配器隔離與降級）
-- 由本地 HTTP 服務（如 `http-server`）在固定端口提供，E2E 指向該地址。
+  - `index.html`：基礎播放器（`/watch` 回退），含 `#mock-player` 容器與 `<video class="html5-main-video">` 供 observePlayback；視頻占位文本置於獨立 `#mock-caption` 子節點，避免覆寫覆蓋層。
+  - `with-native-captions.html`：帶原生字幕軌（內嵌 `ytInitialPlayerResponse` JSON，`baseUrl` 指向 `/timedtext`）
+  - `no-captions.html`：無字幕（觸發 ASR 路徑，M2）
+  - `changed-dom.html`：模擬 YouTube 改版（驗證適配器隔離與降級，M2/M3）
+- `app.js` 每 100ms 推進時鐘並同步 `video.currentTime` + `dispatchEvent('timeupdate')`（模擬真實媒體事件驅動 observePlayback）。
+- 由 `scripts/serve-mock.mjs` 在固定端口 8721 提供（含 `/timedtext` JSON 端點），E2E 經 Playwright `webServer` 自動拉起。
 
 ### 3.2 Stub 引擎（確定性）
 
@@ -151,14 +153,22 @@ export function buildTestRegistry(overrides?: Partial<Registry>): Registry {
 
 ### 4.4 E2E 測試（Playwright + 加載擴充）
 
-- 以 `--load-extension` 加載構建產物（`dist/`），配合 Mock 站點與 stub 引擎（通過測試組裝注入）。
+- 以構建產物（`dist/`，`build:test` 產出）加載擴充，配合 Mock 站點驗證全鏈路。
+- **擴充加載範式（實裝關鍵）**：Playwright 默認的 `chromium.launch()` + `newContext()` **不會注入擴充**，且默認注入 `--disable-extensions`。必須：
+  1. 用 `chromium.launchPersistentContext('', {...})`（持久上下文才注入擴充）；
+  2. `ignoreDefaultArgs: ['--disable-extensions']`（移除禁用擴充的默認參數）；
+  3. `channel: 'chromium'`（headless 下默認走 headless_shell，不支持 `--load-extension`）；
+  4. `--load-extension` / `--disable-extensions-except` 傳**絕對路徑**。
+  以上封裝於 `test/e2e/fixtures.ts` 的自定義 `test` fixture（覆蓋 `context`），供各 spec 復用。
+- `TEST_PROFILE=1` 構建向 dist manifest 追加 `http://localhost:8721/*` 的 content_scripts match 與 host_permissions，使 content-script 得以注入 Mock 頁。
 - 用臨時 Chromium user-data-dir（測試後清理），持久化狀態隔離。
 
 | 用例組 | 覆蓋場景 |
 |---|---|
-| E-NATIVE | 打開帶字幕頁面 → 覆蓋層出現譯文字幕 → 隨播放同步 |
-| E-REALTIME | 打開無字幕頁面 → provisional 字幕先顯示 → 定稿修正 |
-| E-DEGRADE | 模擬預取失效 → 降級三級，字幕不中斷 |
+| E-NATIVE | 打開帶字幕頁面 → 覆蓋層出現譯文字幕 → 隨播放同步（TC-F01/02/03） |
+| E-INJECT | content-script 注入 Mock 頁 → 覆蓋層掛載於播放器容器 → 暫停後仍掛載 |
+| E-REALTIME | 打開無字幕頁面 → provisional 字幕先顯示 → 定稿修正（M2） |
+| E-DEGRADE | 模擬預取失效 → 降級三級，字幕不中斷（M2/M3） |
 | E-CONFIG | Options 切換引擎/目標語言/顯示模式 → 生效 |
 | E-PRIVACY | 本地模式運行 → 斷言無外發網絡請求 |
 
@@ -317,6 +327,41 @@ jobs:
 - 步驟：`StubLLM` 模擬超時/超額。
 - 預期：自動切 `StubMT`；`TranslationResult.degraded=true`；發射 `engine-degraded`；字幕仍產出。
 
+#### TC-E01 擴充注入與覆蓋層掛載（對應 F-01/F-02，已實裝）
+- 前置：`build:test` 產出 dist；Playwright persistent context fixture 加載擴充；打開 `with-native-captions.html`。
+- 步驟：等待 content-script 注入並掛載覆蓋層。
+- 預期：`.ai-trans-overlay` 節點掛載於 `#mock-player` 容器（`toBeAttached`）；暫停後覆蓋層仍掛載（不隨播放狀態消失）。
+
+#### TC-E02 覆蓋層含譯文字幕（對應 F-01/F-03，已實裝）
+- 前置：同 TC-E01。
+- 步驟：播放時鐘推進至字幕時間窗（0~2000ms）。
+- 預期：`.ai-trans-overlay` 非空（`not.toBeEmpty`）；字幕隨 `currentTime` 顯示。驗證了「抓字幕（timedtext fetch）→ 翻譯 → observePlayback + rAF 渲染」全鏈路。
+
+#### TC-E03 timedtext 端點與 Mock 宿主基線（已實裝）
+- 步驟：請求 `/timedtext`；讀取 `__mockState` 播放時鐘；暫停/播放控制。
+- 預期：timedtext 返回 4 行 events；時鐘推進/暫停/恢復符合預期（smoke + extension spec 共 5 個宿主基線用例）。
+
+> 已實裝 E2E 共 11 個用例（`test/e2e/smoke.spec.ts` 5 + `test/e2e/extension.spec.ts` 6，含 TC-R3 覆蓋層不累積），全綠。TC-E01/02 覆蓋擴充注入與渲染全鏈路，TC-E03 為宿主與端點基線。
+
+#### TC-R 可靠性紅線回歸（對應 AGENTS.md §5 / architecture §7.1，已實裝）
+
+覆蓋 MV3 真實環境陷阱，jsdom 單測與 E2E 分工驗證：
+
+| TC | 紅線 | 斷言 | 落點 |
+|---|---|---|---|
+| TC-R1a | R1 fetch 綁定 | LLM 默認 fetch 以 globalThis 為接收者調用不拋 Illegal invocation | `test/unit/llm-translation.test.ts` |
+| TC-R1b | R1 fetch 綁定 | `FetchCaptionSource` 默認 fetch 綁定 globalThis | `test/integration/platform-adapter.test.ts` |
+| TC-R2 | R2 URL 絕對化 | 相對 baseUrl 被解析為絕對 URL 傳入 fetch | `test/integration/platform-adapter.test.ts` |
+| TC-R3 | R3 禁覆寫共享容器 | restart/暫停後 `.ai-trans-overlay` 恰好 1 個、仍 attached | `test/e2e/extension.spec.ts` |
+| TC-R4a | R4 註冊必解除 | `observePlayback` 的 unsubscribe 解除全部事件監聽 | `test/integration/platform-adapter.test.ts` |
+| TC-R4b | R4 不累積 | 多次 observe/unsubscribe 後 add 次數 == remove 次數 | `test/integration/platform-adapter.test.ts` |
+| TC-R5 | R5 stream 降級 | `translateStream` 的 primary 流式拋錯時降級 fallback 並發 engine-degraded + pipeline-error | `test/unit/translation-pipeline.test.ts` |
+| TC-R6 | R6 不掩蓋缺失 | 播放器缺失時 observePlayback 返回 noop 不拋錯 | `test/integration/platform-adapter.test.ts` |
+| TC-R7a | R7 選擇器精確 | 具名 `#ytInitialPlayerResponse` 優先，忽略其他內聯腳本 | `test/integration/platform-adapter.test.ts` |
+| TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
+
+> 全部測試合計 66（單元 25 + 契約 5 + 集成 25 + E2E 11）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。
+
 ### 7.2 非功能測試用例
 
 #### TC-NF-LATENCY 三級延遲（對應非功能：延遲）
@@ -357,6 +402,10 @@ jobs:
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |
+| TC-E01 | F-01/F-02 | E2E（已實裝） |
+| TC-E02 | F-01/F-03 | E2E（已實裝） |
+| TC-E03 | 宿主基線 | E2E（已實裝） |
+| TC-R1~R7 | AGENTS.md §5 可靠性紅線 / architecture §7.1 | 單元/集成/E2E（已實裝） |
 | TC-NF-LATENCY | 非功能·延遲 | E2E |
 | TC-NF-ACCURACY | 非功能·準確率 | 單元 |
 | TC-NF-STABILITY | 非功能·穩定性 | 契約/E2E |

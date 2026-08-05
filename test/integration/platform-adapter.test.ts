@@ -1,0 +1,148 @@
+import { describe, it, expect, vi } from 'vitest';
+import { FetchCaptionSource, YouTubePlatformAdapter } from '../../src/adapters/platform/youtube/platform-adapter';
+
+// 針對 §5 紅線的專屬回歸測試：
+//  R1 fetch 綁定、R2 URL 絕對化、R4 observePlayback 解除、R7 JSON/選擇器容錯。
+// 這些在 jsdom 集成環境驗證（unit 為 node 無 DOM）。
+
+function setPlayerResponse(json: string, opts?: { extraInlineScript?: string; named?: boolean }): void {
+  document.head.innerHTML = '';
+  document.body.innerHTML = '';
+  if (opts?.extraInlineScript) {
+    const noise = document.createElement('script');
+    noise.textContent = opts.extraInlineScript;
+    document.body.appendChild(noise);
+  }
+  const script = document.createElement('script');
+  if (opts?.named !== false) script.id = 'ytInitialPlayerResponse';
+  script.type = 'application/json';
+  script.textContent = json;
+  document.body.appendChild(script);
+}
+
+const validPlayerResponse = JSON.stringify({
+  captions: {
+    playerCaptionsTracklistRenderer: {
+      captionTracks: [{ baseUrl: '/timedtext?lang=en', languageCode: 'en', kind: 'standard' }],
+    },
+  },
+});
+
+describe('FetchCaptionSource — R1 fetch 綁定 / R2 URL 絕對化 / R7 JSON 容錯', () => {
+  it('[R1] 默認 fetch 綁定 globalThis，不拋 Illegal invocation', async () => {
+    setPlayerResponse(validPlayerResponse);
+    const impl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'hi' }] }] }),
+    }) as Response);
+    // 模擬宿主 fetch：this 必須為 globalThis，否則拋。
+    const guard = function (this: unknown, ...args: Parameters<typeof fetch>) {
+      if (this !== globalThis && this !== undefined) throw new TypeError('Illegal invocation');
+      return impl(...args);
+    } as unknown as typeof fetch;
+    vi.stubGlobal('fetch', guard);
+
+    const src = new FetchCaptionSource(document); // 默認 fetch → 應被 bind
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(impl).toHaveBeenCalledOnce();
+    expect(segs.length).toBeGreaterThan(0);
+    vi.unstubAllGlobals();
+  });
+
+  it('[R2] 相對 baseUrl 被解析為絕對 URL 傳入 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [] }),
+    }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await src.fetchTracks('/timedtext?lang=en', 'en');
+    const calledUrl = String(fetchFn.mock.calls[0][0]);
+    // jsdom 默認 location 為 http://localhost/
+    expect(calledUrl).toMatch(/^https?:\/\/[^/]+\/timedtext\?lang=en$/);
+  });
+
+  it('[R7] 具名 #ytInitialPlayerResponse 優先，忽略其他內聯腳本', async () => {
+    setPlayerResponse(validPlayerResponse, {
+      extraInlineScript: 'window.__ytExtra = 1;',
+    });
+    const src = new FetchCaptionSource(document);
+    const list = await src.fetchTrackList();
+    expect(list).toHaveLength(1);
+    expect(list[0].lang).toBe('en');
+    expect(list[0].baseUrl).toBe('/timedtext?lang=en');
+  });
+
+  it('[R7] 非法 JSON 不拋錯，返回空數組（避免誤判功能降級）', async () => {
+    document.body.innerHTML = '';
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    // type=application/json：jsdom 不會執行為 JS，僅作數據容器。
+    script.type = 'application/json';
+    script.textContent = '{ this is not valid json ]]';
+    document.body.appendChild(script);
+    const src = new FetchCaptionSource(document);
+    await expect(src.fetchTrackList()).resolves.toEqual([]);
+  });
+
+  it('[R7] 頁面首個內聯腳本非字幕數據時不誤 parse 崩潰', async () => {
+    document.body.innerHTML = '';
+    const noise = document.createElement('script');
+    // 合法 JS（jsdom 會執行），但不含 captionTracks，適配器應忽略並返回空。
+    noise.textContent = 'window.__ytNoise = { unrelated: true };';
+    document.body.appendChild(noise);
+    const src = new FetchCaptionSource(document);
+    // 沒有具名節點且無 captionTracks 內聯 → 返回空，不拋 SyntaxError
+    await expect(src.fetchTrackList()).resolves.toEqual([]);
+  });
+});
+
+describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {
+  function mountVideo(): HTMLVideoElement {
+    document.body.innerHTML = '<video class="html5-main-video"></video>';
+    return document.querySelector<HTMLVideoElement>('video.html5-main-video')!;
+  }
+
+  it('[R4] observePlayback 返回的 unsubscribe 解除全部事件監聽', () => {
+    const video = mountVideo();
+    const addSpy = vi.spyOn(video, 'addEventListener');
+    const removeSpy = vi.spyOn(video, 'removeEventListener');
+    const adapter = new YouTubePlatformAdapter({ doc: document });
+
+    const cb = vi.fn();
+    const unsub = adapter.observePlayback(cb);
+    const added = addSpy.mock.calls.map((c) => c[0]);
+    expect(added.length).toBeGreaterThan(0);
+    // 初次調用會立即讀一次狀態
+    expect(cb).toHaveBeenCalled();
+
+    unsub();
+    const removed = removeSpy.mock.calls.map((c) => c[0]);
+    // 每個註冊的事件都被解除
+    for (const ev of added) expect(removed).toContain(ev);
+    expect(removeSpy).toHaveBeenCalledTimes(addSpy.mock.calls.length);
+  });
+
+  it('[R4] 多次 observe/unsubscribe 後淨監聽器數為 0（不累積）', () => {
+    const video = mountVideo();
+    const addSpy = vi.spyOn(video, 'addEventListener');
+    const removeSpy = vi.spyOn(video, 'removeEventListener');
+    const adapter = new YouTubePlatformAdapter({ doc: document });
+
+    for (let i = 0; i < 5; i++) {
+      const unsub = adapter.observePlayback(() => {});
+      unsub();
+    }
+    // add 次數 == remove 次數 → 無殘留
+    expect(removeSpy.mock.calls.length).toBe(addSpy.mock.calls.length);
+  });
+
+  it('[R6] 播放器缺失時 observePlayback 返回 noop 而非拋錯', () => {
+    document.body.innerHTML = '';
+    const adapter = new YouTubePlatformAdapter({ doc: document });
+    const unsub = adapter.observePlayback(() => {});
+    expect(() => unsub()).not.toThrow();
+  });
+});

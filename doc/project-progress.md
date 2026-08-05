@@ -1,8 +1,8 @@
 # AI_Trans 項目進展文檔
 
 > 版本：v0.1
-> 狀態：M1 開發中（測試基礎設施進行中）
-> 最後更新：2026-08-04
+> 狀態：M1 收尾完成（原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環 + 可靠性紅線加固）
+> 最後更新：2026-08-05
 
 ---
 
@@ -12,7 +12,7 @@
 
 | 里程碑 | 名稱 | 對應功能 | 目標 | 狀態 |
 |---|---|---|---|---|
-| **M1** | 原生字幕翻譯 | F-01, F-02, F-03, F-04, F-05 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 | 🟡 **進行中** |
+| **M1** | 原生字幕翻譯 | F-01, F-02, F-03, F-04, F-05 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 | ✅ **完成** |
 | **M2** | 實時擷取 ASR | F-06, F-07 | 三級策略：tabCapture 音頻 → ASR（雲端/本地可配）→ 翻譯 → 顯示 | ⚪ 待完成 |
 | **M3** | 預緩衝提前處理 | F-08 | 二級策略（高風險優化）：M2 管線上做音頻來源前置 | ⚪ 待完成 |
 
@@ -60,14 +60,19 @@
 | M1-17 | **Content Script 入口**：注入頁面啟動 M1 流程 | P0 | 2 | ✅ 已完成 | `src/runtime/content-script.ts` |
 | M1-18 | **Service Worker 入口**：配置路由 | P0 | 2 | ✅ 已完成 | `src/runtime/service-worker.ts` |
 | M1-19 | **manifest.json（MV3）** | P0 | 2 | ✅ 已完成 | `manifest.json` |
-| M1-20 | **測試基礎設施**：Vitest 三層配置 / stub 引擎 / mock 平台 / timedtext 契約樣本 / Mock YouTube 站點 / Playwright E2E | P0 | 3 | 🟡 進行中 | `test/` + `vitest.*.config.ts` + `playwright.config.ts` |
-| M1-21 | **腳本閉環**：build / serve-mock / merge-reports / cleanup | P0 | 3 | 🟡 進行中 | `scripts/*.mjs` |
-| M1-22 | **測試用例**：16 單元 + 5 契約 + 5 集成 + 5 E2E = 31 全綠 | P0 | 3 | 🟡 進行中 | `test/**` |
-| M1-23 | **CI 自動化（GitHub Actions）**：構建→部署→測試→報告→清理 | P1 | 4 | ⬜ 待完成 | `.github/workflows/` |
-| M1-24 | **Options/Popup 配置界面**：引擎選擇、API Key/端點、語言、樣式 | P0 | 4 | ⬜ 待完成 | `src/runtime/options/` + `src/runtime/popup/` |
-| M1-25 | **配置 → 適配器實際注入**（LLM 密鑰從 apiKeyRef 安全解析、真實調用） | P0 | 4 | ⬜ 待完成 | `src/runtime/composition.ts` |
-| M1-26 | **播放器就緒後自動掛載 + 播放狀態驅動渲染**（現僅初始化時渲染一次） | P1 | 4 | ⬜ 待完成 | `src/runtime/content-script.ts` |
-| M1-27 | **真實 YouTube 頁面驗證**（手動冒煙 + 自動字幕接口容錯） | P1 | 4 | ⬜ 待完成 | E2E + 手動 |
+| M1-20 | **測試基礎設施**：Vitest 三層配置 / stub 引擎 / mock 平台 / timedtext 契約樣本 / Mock YouTube 站點 / Playwright E2E | P0 | 3 | ✅ 已完成 | `test/` + `vitest.*.config.ts` + `playwright.config.ts` + `test/e2e/fixtures.ts` |
+| M1-21 | **腳本閉環**：build（esbuild 打包）/ serve-mock / merge-reports / cleanup / copy-static | P0 | 3 | ✅ 已完成 | `scripts/*.mjs`（`build.mjs` 4 入口打包、`copy-static.mjs` TEST_PROFILE 注入） |
+| M1-22 | **測試用例**：25 單元 + 5 契約 + 25 集成 + 11 E2E = 66 全綠（含 §5 可靠性紅線回歸） | P0 | 3 | ✅ 已完成 | `test/**` |
+| M1-23 | **CI 自動化（GitHub Actions）**：構建→部署→測試→報告→清理 | P1 | 4 | ✅ 已完成 | `.github/workflows/system-test.yml` |
+| M1-24 | **Options/Popup 配置界面**：引擎選擇、API Key/端點、語言、樣式 | P0 | 4 | ✅ 已完成 | `src/runtime/options/` + `src/runtime/popup/` |
+| M1-25 | **配置 → 適配器實際注入**（LLM 密鑰從 apiKeyRef 安全解析、真實調用） | P0 | 4 | ✅ 已完成 | `src/runtime/composition.ts` + `ApiKeyStore`（`chrome-config-store.ts`） |
+| M1-26 | **播放器就緒後自動掛載 + 播放狀態驅動渲染**（MutationObserver 等待 + rAF 對齊 + 配置熱重啟） | P1 | 4 | ✅ 已完成 | `src/runtime/content-script.ts`（`SubtitleController`） |
+| M1-27 | **真實 YouTube 頁面驗證**（手動冒煙 + 自動字幕接口容錯） | P1 | 4 | 🟡 進行中 | E2E（Mock 已驗證閉環）+ 待手動真實冒煙 |
+| M1-28 | **esbuild 打包基建**：4 入口 bundle（content-script/options/popup 用 IIFE，SW 用 ESM）；解決 MV3 content script 不支持 `import` | P0 | 3 | ✅ 已完成 | `scripts/build.mjs` |
+| M1-29 | **TEST_PROFILE 測試構建**：`copy-static.mjs` 於 `TEST_PROFILE=1` 向 manifest 追加 `localhost:8721` match 與 host_permissions；生產構建保持乾淨 | P0 | 3 | ✅ 已完成 | `scripts/copy-static.mjs` + `build:test` |
+| M1-30 | **E2E 擴充加載範式**：Playwright `launchPersistentContext` + `ignoreDefaultArgs:['--disable-extensions']` + `channel:'chromium'` 自定義 fixture（chromium.launch 不注入擴充） | P0 | 3 | ✅ 已完成 | `test/e2e/fixtures.ts` |
+| M1-31 | **content-script fetch 綁定修復**：`FetchCaptionSource` 直接調用 `window.fetch` 拋 "Illegal invocation"，構造時 `bind(globalThis)`；baseUrl 相對路徑統一解析絕對 URL | P0 | 4 | ✅ 已完成 | `src/adapters/platform/youtube/platform-adapter.ts` |
+| M1-32 | **可靠性紅線全庫審計與加固**：修復 restart 訂閱洩漏（observePlayback unsubscribe 未保存）、ensureMounted MutationObserver 洩漏+永久懸掛（加 handle+15s 超時）、`platforms[0]?` 靜默失敗改顯式判空發降級、LLM 默認 fetch 綁定 globalThis、YT `script:not([src])` 誤匹配+JSON.parse 未捕獲、translateStream 無 fallback、overlay cssText 改 setProperty、escapeHtml 補單引號、options showStatus 去抖 | P0 | 5 | ✅ 已完成 | `content-script.ts` / `platform-adapter.ts` / `llm-translation.ts` / `translation-pipeline.ts` / `overlay-renderer.ts` / `options.ts` |
 
 ### 3.2 M2 — 實時擷取 ASR（P1，待完成）
 
@@ -120,16 +125,23 @@
 
 - **全部端口接口**與**內部穩定數據結構**已定義（M1-01/02/03）。
 - **一級全鏈路**：YouTube 適配器 → timedtext 解析 → 原生字幕策略 → 翻譯管線（LLM 主 + MT 兜底）→ 覆蓋層渲染 → Orchestrator 調度，已打通並通過測試（M1-05~M1-19）。
-- **測試基礎設施已搭**：31 個測試全綠（16 單元 + 5 契約 + 5 集成 + 5 E2E），`npm run test:all` 一次通過，含構建→測試→報告合併→環境清理（M1-20~22）。視為**進行中**——用例集與 CI 閉環將持續擴展。
-- **已修復 2 個測試暴露的真 bug**：翻譯管線降級事件被吞、mock 站點 `/watch` 路由 404。
+- **配置界面與實注入**（M1-24/25）：Options/Popup 引擎/語言/樣式配置；`ApiKeyStore` 獨立安全 key 存密鑰（不明文入 EngineConfig）；`buildDefaultRegistry` 改 async，依配置選主/兜底引擎並解析 apiKey 注入。
+- **播放驅動渲染**（M1-26）：`SubtitleController` 用 MutationObserver 等待播放器就緒自動掛載、observePlayback + rAF 對齊重繪、配置變更熱重啟（僅訂閱一次避免累積）。
+- **打包與測試構建基建**（M1-28/29）：引入 esbuild 4 入口打包（content-script/options/popup IIFE、SW ESM）；`TEST_PROFILE=1` 向 dist manifest 注入 localhost match 供 E2E。
+- **E2E 擴充驗證閉環**（M1-30/31）：以 `launchPersistentContext` 自定義 fixture 加載擴充；修復 content-script 直接調用 `window.fetch` 的 "Illegal invocation"（構造時 bind）。全鏈路在 Mock 站點驗證：注入 → 抓字幕 → 翻譯 → 覆蓋層顯示。
+- **CI 自動化**（M1-23）：`.github/workflows/system-test.yml` 串聯 build→test→e2e→report→cleanup。
+- **測試基礎設施已搭**：66 個測試全綠（25 單元 + 5 契約 + 25 集成 + 11 E2E），`npm run test:all` 一次通過，含構建→測試→報告合併→環境清理（M1-20~22）。
+- **可靠性紅線加固**（M1-32）：全庫審計並修復 restart 訂閱/Observer 洩漏、fetch 未綁定、JSON parse 未容錯、stream 無 fallback 等 MV3 真實環境陷阱；每項配專屬回歸測試（單元/集成/E2E）。AGENTS.md §5 沉澱 8 條紅線，governance skill 加自查清單。
+- **已修復測試/真實環境暴露的缺陷**：翻譯管線降級事件被吞、mock 站點 `/watch` 路由 404、manifest SW/CS 路徑錯誤、mock 播放器容器 `textContent` 覆寫刪除覆蓋層、content-script fetch 未綁定。
 
 ## 5. 進行中與下一步
 
-- **進行中**：M1 里程碑（測試基礎設施使用中，進入 M1 剩餘交付項）。
-- **下一步優先**：
-  1. M1-23 CI 自動化（GitHub Actions workflow）。
-  2. M1-24 Options/Popup 配置界面（配置 → 適配器實注入的前提）。
-  3. M1-25/26 配置實際注入與播放狀態驅動渲染。
+- **M1 里程碑已完成**：原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環全部交付並測試覆蓋。
+- **M1 尾項（P1，非阻塞）**：M1-27 真實 YouTube 頁面手動冒煙驗證（Mock 已閉環，待接入真實環境驗證接口容錯）。
+- **下一步優先（M2）**：
+  1. M2-04 tabCapture 音頻源 + M2-09 Offscreen Document 入口。
+  2. M2-05/06 本地 Whisper / 雲端 ASR 適配器。
+  3. M2-08 RealtimeASRStrategy 實裝（tabCapture → ASR → 翻譯 → 推送）。
 
 ## 6. 主要風險
 

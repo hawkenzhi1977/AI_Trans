@@ -85,6 +85,40 @@ describe('TranslationPipeline', () => {
     );
   });
 
+  it('[R5] translateStream 的 primary.stream 拋錯時降級 fallback 並發降級事件', async () => {
+    // primary 具備 translateStream 但會拋錯；驗證流式路徑也走 fallback（不只 translate 做降級）。
+    const failingStream: import('../../src/domain/ports/translation-provider').TranslationProvider = {
+      engineId: 'llm',
+      location: 'cloud',
+      translate: async () => {
+        throw new Error('primary translate should not be reached before stream');
+      },
+      translateStream: async () => {
+        throw new Error('stream boom');
+      },
+    };
+    const mt = new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' });
+    const events: unknown[] = [];
+    const pipeline = new TranslationPipeline({
+      primary: failingStream,
+      fallback: mt,
+      targetLang: 'zh-Hant',
+      streaming: true,
+      onEvent: (e) => events.push(e),
+    });
+
+    const emitted: unknown[] = [];
+    await pipeline.translateStream(req(), (r) => emitted.push(r));
+
+    // 降級後由 fallback 產出結果並 emit
+    expect(emitted).toHaveLength(1);
+    expect((emitted[0] as { engineId: string }).engineId).toBe('mt');
+    expect((emitted[0] as { degraded: boolean }).degraded).toBe(true);
+    // 必發 engine-degraded + pipeline-error（觀測性與非流式一致）
+    expect(events.some((e) => (e as { type: string }).type === 'engine-degraded')).toBe(true);
+    expect(events.some((e) => (e as { type: string }).type === 'pipeline-error')).toBe(true);
+  });
+
   it('未指定 targetLang 時使用管線默認值', async () => {
     const llm = new StubTranslationProvider({ engineId: 'llm' });
     const pipeline = new TranslationPipeline({
