@@ -116,6 +116,17 @@ export function buildTestRegistry(overrides?: Partial<Registry>): Registry {
 - 內容：字幕樣本（含時間軸）、音頻 fixture（PCM/波形描述 + 期望識別文本）、期望譯文對照表、時間軸校驗基準。
 - 原則：所有斷言基於**固定 fixture**，不依賴模型隨機性。
 
+### 3.4 測試依賴與 CI Node 版本相容性（硬約束）
+
+集成測試在 **jsdom** 環境運行，其依賴鏈必須與 CI 目標 Node 版本相容，否則會在 **import/收集階段整體崩潰**（junit `tests="0"`、退出碼 1），而非單個用例失敗——這類問題在本地新版 Node 上不暴露，只在 CI 才復現。
+
+| 依賴 | 約束 | 原因 |
+|---|---|---|
+| `jsdom` | 鎖定 `^26.x` | 26.x 已移除對 `undici` 的依賴，engines `node>=18`；**禁止升到 30.x**（其依賴 `undici@8` 在 import 期調用 `webidl.util.markAsUncloneable`，Node 20.x 未提供該 API → `TypeError` 致集成收集期崩潰）。 |
+| CI Node | `system-test.yml` 固定 `node-version: 20`，與 AGENTS.md「node>=20」一致 | 換 Node 大版本須同步核對 jsdom/undici 相容矩陣並重跑 `test:all`。 |
+
+**紅線**：任何依賴變更（尤其 `jsdom`）後，必須本地 `npm install` 更新 lockfile 並跑 `test:ci` 確認**集成用例數不為 0**；`npm warn EBADENGINE` 不可忽視。`test:ci` 現為 `&&` 串聯，單段收集期崩潰會短路掩蓋後續 contract/E2E 報告——排查時須以完整 CI 日誌（非僅 junit）確認真實錯誤。
+
 ---
 
 ## 4. 分層測試設計

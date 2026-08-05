@@ -177,6 +177,8 @@ src/
 >
 > **發布件**：`scripts/package-release.mjs`（`npm run release`）在生產構建基礎上，把 `dist/` 中運行必需文件拷入 `release/ai-trans-extension/`（剔除 `.js.map` 與 `.d.ts`、移除 sourcemap 引用註釋），並生成 `release/ai-trans-extension-v<version>.zip`。用戶通過瀏覽器「加載已解壓的擴充程序」選擇該目錄即可使用（三平台一致）。發布件版本須與 `package.json` 的 `version` 一致，改動用戶可見行為後須重新生成——見 AGENTS.md §2 一致性規則。
 
+> **測試依賴的 CI 相容性（實裝經驗）**：集成測試以 **jsdom** 提供 DOM。jsdom 的傳遞依賴必須與 CI 目標 Node 版本相容——`jsdom@30` 依賴的 `undici@8` 在 Node 20 的 import 期即調用 `webidl.util.markAsUncloneable`（該版 Node 未提供）而拋 `TypeError`，令集成測試**收集階段整體崩潰**（0 用例、退出碼 1），並因 `test:ci` 的 `&&` 短路掩蓋 contract/E2E。故 **`jsdom` 鎖定 `^26`**（已移除 undici 依賴），CI Node 固定 20。此類問題只在 CI（真實 Node/Linux）暴露，本地新版 Node 不復現——依賴升級後必須跑 `test:ci` 確認集成用例數非 0，且不可忽視 `npm warn EBADENGINE`。詳見 system-test-design §3.4。
+
 ### 5.2 模塊職責與依賴方向
 
 - `domain/*`：只定義類型與接口，**不 import 任何 adapters/infrastructure**。
