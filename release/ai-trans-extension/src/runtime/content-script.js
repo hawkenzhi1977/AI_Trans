@@ -300,6 +300,16 @@
     }
   };
 
+  // src/runtime/endpoint.ts
+  function normalizeEndpoint(raw) {
+    const trimmed = (raw ?? "").trim();
+    if (!trimmed) return "https://api.openai.com/v1/chat/completions";
+    const base = trimmed.replace(/\/+$/, "");
+    if (/\/chat\/completions$/i.test(base)) return base;
+    if (/\/v\d+$/i.test(base)) return `${base}/chat/completions`;
+    return `${base}/v1/chat/completions`;
+  }
+
   // src/adapters/platform/youtube/timedtext.ts
   function parseTimedText(raw, lang) {
     const trimmed = raw.trim();
@@ -488,11 +498,13 @@
     constructor(opts) {
       this.opts = opts;
       this.fetchFn = opts.fetchFn ?? globalThis.fetch.bind(globalThis);
+      this.timeoutMs = opts.timeoutMs ?? 3e4;
     }
     opts;
     location = "cloud";
     // R1：默認 fetch 必須綁定 globalThis，content-script 中裸 fetch 會拋 Illegal invocation。
     fetchFn;
+    timeoutMs;
     get engineId() {
       return this.opts.engineId;
     }
@@ -510,19 +522,31 @@
           { role: "user", content: lines.join("\n") }
         ]
       };
-      const res = await this.fetchFn(this.opts.endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.opts.apiKey}`
-        },
-        body: JSON.stringify(body)
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      let res;
+      try {
+        res = await this.fetchFn(this.opts.endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.opts.apiKey}`
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        });
+      } catch (err) {
+        throw new Error(
+          `LLM translation request failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      } finally {
+        clearTimeout(timer);
+      }
       if (!res.ok) {
         throw new Error(`LLM translation failed: HTTP ${res.status}`);
       }
       const data = await res.json();
-      const content = data.choices?.[0]?.message?.content ?? "";
+      const content = stripReasoning(data.choices?.[0]?.message?.content ?? "");
       const map = /* @__PURE__ */ new Map();
       for (const line of content.split("\n")) {
         const m = /^(\d+)\t(.+)$/.exec(line.trim());
@@ -536,6 +560,9 @@
       return { segments: translated, engineId: this.opts.engineId, degraded: false };
     }
   };
+  function stripReasoning(raw) {
+    return raw.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").replace(/^\s+/, "");
+  }
 
   // src/adapters/translation/mt-translation.ts
   var MTTranslationProvider = class {
@@ -682,7 +709,7 @@
   }
   async function createLLM(tc, apiKeyStore) {
     if (tc.type !== "cloud-llm" && tc.type !== "local") return void 0;
-    const endpoint = tc.endpoint ?? "https://api.openai.com/v1/chat/completions";
+    const endpoint = normalizeEndpoint(tc.endpoint);
     const model = tc.model ?? "gpt-4o-mini";
     const apiKey = await apiKeyStore.getApiKey("llm") ?? "";
     return new LLMTranslationProvider({
@@ -745,6 +772,42 @@
     }
   };
 
+  // src/infrastructure/diagnostics.ts
+  var DIAGNOSTIC_KEY = "lastDiagnostic";
+  function extractDiagnostic(e) {
+    switch (e.type) {
+      case "engine-degraded":
+        if (e.port === "translation" || e.port === "asr") {
+          return { kind: "degraded", message: e.reason };
+        }
+        return void 0;
+      case "pipeline-error":
+        return { kind: "error", message: formatCause(e.error.cause) };
+      default:
+        return void 0;
+    }
+  }
+  function formatCause(cause) {
+    if (cause instanceof Error) {
+      return `${cause.name}: ${cause.message}`;
+    }
+    return String(cause ?? "unknown error");
+  }
+  async function recordDiagnostic(e) {
+    const diag = extractDiagnostic(e);
+    if (!diag) return;
+    const record = {
+      kind: diag.kind,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      message: diag.message
+    };
+    console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
+    try {
+      await chrome.storage.local.set({ [DIAGNOSTIC_KEY]: record });
+    } catch {
+    }
+  }
+
   // src/runtime/content-script.ts
   var PLAYER_SELECTOR = "div#movie_player, .html5-video-player, #mock-player";
   var MOUNT_WAIT_TIMEOUT_MS = 15e3;
@@ -753,9 +816,14 @@
     constructor(config, url) {
       this.config = config;
       this.url = url;
-      this.unsubscribeConfig = store.subscribe(() => {
-        void this.restart();
-      });
+      const onStorageChanged = (changes, areaName) => {
+        if (areaName !== "local") return;
+        if ("engineConfig" in changes || "engineConfigKeys" in changes) {
+          void this.restart();
+        }
+      };
+      chrome.storage.onChanged.addListener(onStorageChanged);
+      this.unsubscribeConfig = () => chrome.storage.onChanged.removeListener(onStorageChanged);
     }
     config;
     renderer = new OverlayRenderer();
@@ -841,7 +909,9 @@
           end: s.end
         }));
         this.scheduleDraw();
+        return;
       }
+      void recordDiagnostic(e);
     }
     /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */
     async ensureMounted() {

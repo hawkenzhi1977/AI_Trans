@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-05（補 §7.1 可靠性紅線加固）
+> 最後更新：2026-08-05（§7.1 可靠性紅線加固；§7.5/7.6 補本地 LLM 兼容 F-10：端點規範化、reasoning 剝離、超時降級、storage.onChanged 熱重啟；§7 補翻譯失敗診斷可見性 F-11：diagnostics 模塊 + lastDiagnostic + Popup 常駐診斷行 + 測試連接按鈕；endpoint.ts 抽離）
 
 ---
 
@@ -168,9 +168,10 @@ src/
     ├── service-worker.ts        # 配置路由 SW（manifest "type":"module"，ESM 打包）
     ├── content-script.ts        # SubtitleController：自動掛載 + rAF 渲染 + 熱重啟（IIFE 打包）
     ├── composition.ts           # buildDefaultRegistry（async，依配置選引擎 + 解析 apiKey）
+    ├── endpoint.ts              # normalizeEndpoint：端點規範化純函數（零依賴，composition/connection-test 共用）
     ├── offscreen.ts             # M2：音頻/推理
     ├── options/                 # 配置頁（options.ts/html，IIFE）
-    └── popup/                   # 彈出頁（popup.ts/html，IIFE）
+    └── popup/                   # 彈出頁（popup.ts/html + connection-test.ts 連接測試，IIFE）
 ```
 
 > **構建打包**：`scripts/build.mjs` 用 esbuild 對 4 個 runtime 入口 bundle。MV3 content script 不支持 `import` 語句，故 content-script/options/popup 打包為 **IIFE**；service-worker 聲明為 module 型（manifest `"type":"module"`），打包為 **ESM**。`scripts/copy-static.mjs` 拷貝 manifest 與頁面 HTML；`TEST_PROFILE=1` 時向 dist manifest 追加 `localhost` match 供 E2E 加載擴充（生產構建保持乾淨）。
@@ -421,6 +422,11 @@ export interface TranslationProvider {
 
 **插拔說明**：LLM 與 MT 均實現此接口。混合策略在 `TranslationPipeline` 中組合：主用 LLM，失敗/超時降級 MT（見第 10 章）。
 
+> **本地 LLM 服務兼容（F-10，實裝經驗）**：`LLMTranslationProvider` 同時服務雲端與本地 OpenAI 兼容服務（mlx/omlx/LM Studio/Ollama）。三個實裝要點：
+> 1. **端點規範化**：組裝時（`composition.ts` 的 `normalizeEndpoint`）兼容兩種填法——已含 `/chat/completions` 的完整路徑原樣保留；含 `/v{n}` 版本段（如 `http://127.0.0.1:8000/v1`）補 `/chat/completions`；裸 host 補 `/v1/chat/completions`；空值回落 OpenAI 默認端點。避免用戶填 Base URL 卻直接 POST 到 `/v1` 得 404。
+> 2. **reasoning `<think>` 剝離**：`stripReasoning` 在解析 `content` 前移除成對 `<think>...</think>`、殘留單邊標籤與前導空白。OpenAI 規範把思考放 `reasoning_content`（我們只讀 `content` 本不受影響），但部分本地 MLX 服務把 `<think>` 直接塞進 `content`，不剝離會污染 `ID<TAB>譯文` 行解析。
+> 3. **超時降級**：`timeoutMs`（默認 30_000）配 `AbortController`，reasoning 模型單次思考可能 30~40s，超時後拋錯，交由 `TranslationPipeline` 降級 MT 兜底（`finally` 清 timer，避免定時器洩漏——呼應 §7.1 R4）。本地 host 需 `manifest.json` 的 `host_permissions` 含 `http://127.0.0.1/*` 與 `http://localhost/*`。
+
 ### 7.6 SubtitleRenderer / ConfigStore / MessageBus
 
 ```typescript
@@ -459,6 +465,23 @@ export interface MessageBus {
 ```
 
 **ApiKeyStore 說明**：`EngineConfig.translation.apiKeyRef` 僅為「密鑰存在性標記」，實際密鑰值存於獨立 storage key（`engineConfigKeys`），由 `ApiKeyStore` 讀寫。`ChromeStorageConfigStore` 同時實現 `ConfigStore` 與 `ApiKeyStore`。組裝時 `buildDefaultRegistry`（async）從 `ApiKeyStore.getApiKey` 解析密鑰注入 LLM 適配器，密鑰不隨配置對象散播。
+
+> **跨上下文配置熱重啟（F-10，實裝經驗）**：Options 頁與 Content Script 各自持有獨立的 `ChromeStorageConfigStore` 實例，`store.subscribe` 只通知**本進程內**的回調——Options 保存配置後 content-script 收不到通知。因此 `SubtitleController` 改用 **`chrome.storage.onChanged.addListener`**（監聽 local area 的 `engineConfig` / `engineConfigKeys` 兩個 key），配置一變即觸發 `restart()` 完成熱重載；`unsubscribeConfig` 相應改為 `removeListener`。這也保證 `engineConfigKeys`（密鑰）變更同樣觸發重啟。詳見 AGENTS.md §5 R4 與 system-test-design TC-R8。
+
+> **翻譯失敗診斷可見性（F-11，實裝經驗）**：翻譯降級/錯誤事件（`engine-degraded` / `pipeline-error`）此前在 content-script 的 `onEvent` 被靜默忽略——只處理 `segments-*`，其餘事件丟棄。結果：LLM 請求失敗（模型名不符 → omlx 回 `404 Model not found`；或端點錯誤；或網絡層失敗）被管線降級到 MT 兜底後，用戶只見字幕不動、無任何可見線索。（注：曾疑 HTTPS 頁面 mixed-content 攔截本地 `http://127.0.0.1`，但實測 Chrome 對 `localhost`/`127.0.0.1` 明文 HTTP 有豁免，請求正常送達；診斷面反而定位到真實根因是模型名 404。）
+> 
+> 新增 `src/infrastructure/diagnostics.ts` 承載診斷職責（純邏輯，可單測）：
+> - `extractDiagnostic(event)`：從 `engine-degraded`（僅 `translation`/`asr` 端口，策略級 `strategy-degraded` 屬正常流轉不計）與 `pipeline-error` 提取人類可讀原因；`pipeline-error.cause` 若為 `Error` 保留 `name: message`（如 `LLM translation failed: HTTP 404`）。
+> - `recordDiagnostic(event)`：寫入 `chrome.storage.local['lastDiagnostic']`（`{ kind, timestamp, message }`）並 `console.warn('[AI_Trans] translation degraded: …')`。§5.7：`chrome.storage.set` 以 try/catch 守護，寫入失敗不影響主流程；console 麵包屑不受存儲失敗影響。
+> - `readLastDiagnostic()` / `formatDiagnostic()`：Popup 讀取並渲染「最近失敗」行。
+> 
+> content-script `onEvent` 在非 `segments-*` 分支 `void recordDiagnostic(e)`（異步不阻塞事件處理）。Popup 翻譯狀態行本地模式並顯示實際生效模型名，用於辨識「保存未生效 / 載入舊版插件」導致的舊配置殘留。
+> 
+> **Popup「最近失敗」行常駐顯示**（F-11 改進）：不再有記錄才顯示、無記錄整行隱藏——否則「看不到行」會被誤認為 bug。現常駐一行，無記錄顯示「最近失敗: 無」。
+> 
+> **Popup「測試連接」按鈕**（F-11 新增，`src/runtime/popup/connection-test.ts`）：一鍵向配置端點發最小 `POST /chat/completions`（`messages:[{role:'user',content:'ping'}]`、`max_tokens:1`、`temperature:0`），驗證三件事——端點可達（排除 mixed-content/端口/CORS/連接失敗）、模型存在（HTTP 200 vs 404 Model not found）、響應結構有效（含 `choices[].message.content`）。成功標綠、失敗標紅並顯示原因（含伺服器 error.message、超時、網絡錯誤）。與真實翻譯路徑共用 `normalizeEndpoint`，保證「測試的就是實際會發的請求」。popup 位於擴充上下文且有 `http://127.0.0.1/*`/`http://localhost/*` host_permissions，直接 fetch 即可（無需 SW 代理）。實作規範：`fetchFn = globalThis.fetch.bind(globalThis)`（§5.1 綁定）；超時用 `AbortController` + `finally` 清 timer（§5.4 無洩漏）。
+> 
+> **`normalizeEndpoint` 抽離為獨立模組**（`src/runtime/endpoint.ts`）：原位於 `composition.ts`（依賴整個 registry 組裝鏈），Popup bundle 引用會連帶打包 adapters/application，故抽為**零依賴純函數**——`composition.ts`（建構 LLM provider）與 `connection-test.ts`（驗證請求）共用，保持行為唯一來源。測試落點 `test/integration/composition.test.ts`（五態）與 `test/integration/connection-test.test.ts`。
 
 ---
 
@@ -666,7 +689,7 @@ export interface PerfSample {
 
 | 里程碑 | 落地的適配器/模塊 | 先定義後實現的接口 |
 |---|---|---|
-| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig` | 全部端口先定義 |
+| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容） | 全部端口先定義 |
 | M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD、`perf/metrics` | ASR 流式接口啟用 |
 | M3 預緩衝 | `BufferedAudioSource`、`LookAheadASRStrategy` | 復用 M2 管線，僅換音頻源 |
 | M4 優化 | 動態引擎選擇、性能檔位、樣式與多語言加固 | — |

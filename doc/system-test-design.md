@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-05（新增 TC-R 可靠性紅線回歸系列）
+> 最後更新：2026-08-05（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接；測試合計 88→94）
 
 ---
 
@@ -315,6 +315,33 @@ jobs:
 - 步驟：切換目標語言（如 zh→ja）。
 - 預期：後續翻譯請求 `targetLang` 更新；覆蓋層譯文語言隨之變化。
 
+#### TC-F10 本地 LLM 服務兼容（對應 F-10）
+- 前置：本地 OpenAI 兼容服務（或 stub）；配置 `type: 'local'`。
+- 步驟 A（端點規範化）：填 Base URL `http://127.0.0.1:8000/v1` → 實際請求發往 `/v1/chat/completions`；填完整路徑 → 原樣保留；填裸 host → 補 `/v1/chat/completions`；空值 → 回落 OpenAI 默認。
+- 步驟 B（reasoning 剝離）：stub 返回 `content` 含 `<think>...</think>` 思考塊 → 解析出的譯文行不含思考文本。
+- 步驟 C（超時降級）：stub 響應延遲超過 `timeoutMs`（如 30ms）→ `AbortController` 中止請求、provider 拋錯、pipeline 降級 MT 兜底（`degraded=true`）。
+- 預期：A 中請求 URL 正確（無 404）；B 中譯文不被思考塊污染；C 中字幕仍產出（降級），且無殘留定時器。
+
+#### TC-F11 翻譯失敗診斷可見性（對應 F-11，已實裝）
+- 前置：LLM 端點不可達或模型名不符（mock 宿主上無網/無 key，fetch 失敗或 404 觸發降級）。
+- 步驟 A（持久化）：content-script 收到 `engine-degraded`/`pipeline-error` → 寫入 `chrome.storage.local['lastDiagnostic']`（`{ kind, timestamp, message }`）並 `console.warn('[AI_Trans] translation degraded: …')`；`pipeline-error.cause` 為 `Error` 時保留 `name: message`（模型 404 表現為 `LLM translation failed: HTTP 404`）。
+- 步驟 B（Popup 顯示）：**常駐顯示**「最近失敗」行——有記錄顯示原因（警告色）；**無記錄顯示「最近失敗: 無」**（不整行隱藏，避免「看不到行」誤判為 bug）。本地模式翻譯狀態行顯示實際生效模型名（辨識保存未生效/載入舊版插件）。
+- 步驟 C（§5.7 守護）：`chrome.storage.set` 拋錯時 `recordDiagnostic` 不崩潰、console 麵包屑仍輸出。
+- 預期：E2E 中降級後 `lastDiagnostic` 被寫入（poll 可讀）；popup 有診斷行；策略級 `strategy-degraded` 不記錄（屬正常流轉）。
+- 落點：集成 `test/integration/diagnostics.test.ts`（7）+ `test/integration/popup.test.ts`（4：含常駐「無」+ 測試連接按鈕）；E2E `test/e2e/extension.spec.ts`（TC-F11 降級寫入）。
+
+#### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
+- 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
+- 步驟：
+  - A（端點可達+模型存在）：mock fetch 返回 200 + `choices[].message.content` → 返回 `ok:true`，請求 URL 經 `normalizeEndpoint` 補全為 `<endpoint>/chat/completions`。
+  - B（模型 404）：mock fetch 返回 404 + `{ error: { message: "Model 'x' not found" } }` → `ok:false` 且錯誤含 HTTP 狀態與伺服器原因。
+  - C（網絡失敗）：mock fetch 拋 `TypeError('Failed to fetch')` → `ok:false` 標記「網絡失敗」。
+  - D（前置校驗）：MT 引擎 / 缺端點 / 缺模型 → 快速失敗不發請求。
+  - E（響應結構異常）：200 但無 `choices` → `ok:false`。
+  - F（Popup 整合）：點擊 `#btn-test` → `#status-connection` 顯示結果（成功標綠 `.ok`）。
+- 預期：`ok`/`error` 分支覆蓋以上六類；fetch 永遠以 `globalThis.fetch.bind(globalThis)`（§5.1），超時 AbortController + finally 清 timer（§5.4）。
+- 落點：集成 `test/integration/connection-test.test.ts`（5）+ `test/integration/popup.test.ts`（1：點擊按鈕標綠）。
+
 #### TC-F06 實時擷取 ASR（對應 F-06）
 - 前置：打開 `no-captions.html`，注入音頻 fixture 與 `StubASR`。
 - 步驟：啟用擴充 → 授權音頻擷取（測試中自動放行）。
@@ -352,7 +379,7 @@ jobs:
 - 步驟：請求 `/timedtext`；讀取 `__mockState` 播放時鐘；暫停/播放控制。
 - 預期：timedtext 返回 4 行 events；時鐘推進/暫停/恢復符合預期（smoke + extension spec 共 5 個宿主基線用例）。
 
-> 已實裝 E2E 共 11 個用例（`test/e2e/smoke.spec.ts` 5 + `test/e2e/extension.spec.ts` 6，含 TC-R3 覆蓋層不累積），全綠。TC-E01/02 覆蓋擴充注入與渲染全鏈路，TC-E03 為宿主與端點基線。
+> 已實裝 E2E 共 12 個用例（`test/e2e/smoke.spec.ts` 5 + `test/e2e/extension.spec.ts` 7，含 TC-R3 覆蓋層不累積、TC-R8 storage.onChanged 熱重啟），全綠。TC-E01/02 覆蓋擴充注入與渲染全鏈路，TC-E03 為宿主與端點基線。
 
 #### TC-R 可靠性紅線回歸（對應 AGENTS.md §5 / architecture §7.1，已實裝）
 
@@ -370,8 +397,11 @@ jobs:
 | TC-R6 | R6 不掩蓋缺失 | 播放器缺失時 observePlayback 返回 noop 不拋錯 | `test/integration/platform-adapter.test.ts` |
 | TC-R7a | R7 選擇器精確 | 具名 `#ytInitialPlayerResponse` 優先，忽略其他內聯腳本 | `test/integration/platform-adapter.test.ts` |
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
+| TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 66（單元 25 + 契約 5 + 集成 25 + E2E 11）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。
+> 全部測試合計 94（單元 29 + 契約 5 + 集成 47 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。
+>
+> **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
 ### 7.2 非功能測試用例
 
@@ -408,6 +438,8 @@ jobs:
 | TC-F03 | F-03 | E2E |
 | TC-F04 | F-04 | E2E/集成 |
 | TC-F05 | F-05 | 集成 |
+| TC-F10 | F-10 | 單元/集成/E2E（已實裝） |
+| TC-F11 | F-11 | 集成/E2E（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |
@@ -416,7 +448,7 @@ jobs:
 | TC-E01 | F-01/F-02 | E2E（已實裝） |
 | TC-E02 | F-01/F-03 | E2E（已實裝） |
 | TC-E03 | 宿主基線 | E2E（已實裝） |
-| TC-R1~R7 | AGENTS.md §5 可靠性紅線 / architecture §7.1 | 單元/集成/E2E（已實裝） |
+| TC-R1~R8 | AGENTS.md §5 可靠性紅線 / architecture §7.1 | 單元/集成/E2E（已實裝） |
 | TC-NF-LATENCY | 非功能·延遲 | E2E |
 | TC-NF-ACCURACY | 非功能·準確率 | 單元 |
 | TC-NF-STABILITY | 非功能·穩定性 | 契約/E2E |

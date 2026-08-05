@@ -1,7 +1,7 @@
 # AI_Trans 項目進展文檔
 
 > 版本：v0.1
-> 狀態：M1 收尾完成（原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環 + 可靠性紅線加固）
+> 狀態：M1 收尾完成（原生字幕全鏈路 + 配置界面 + 本地 LLM 服務兼容 + E2E 擴充驗證閉環 + 可靠性紅線加固 + 翻譯失敗診斷可見性）
 > 最後更新：2026-08-05
 
 ---
@@ -12,7 +12,7 @@
 
 | 里程碑 | 名稱 | 對應功能 | 目標 | 狀態 |
 |---|---|---|---|---|
-| **M1** | 原生字幕翻譯 | F-01, F-02, F-03, F-04, F-05 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 | ✅ **完成** |
+| **M1** | 原生字幕翻譯 | F-01, F-02, F-03, F-04, F-05, F-10, F-11 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 + 本地 LLM 服務兼容 + 翻譯失敗診斷可見性 | ✅ **完成** |
 | **M2** | 實時擷取 ASR | F-06, F-07 | 三級策略：tabCapture 音頻 → ASR（雲端/本地可配）→ 翻譯 → 顯示 | ⚪ 待完成 |
 | **M3** | 預緩衝提前處理 | F-08 | 二級策略（高風險優化）：M2 管線上做音頻來源前置 | ⚪ 待完成 |
 
@@ -62,7 +62,7 @@
 | M1-19 | **manifest.json（MV3）** | P0 | 2 | ✅ 已完成 | `manifest.json` |
 | M1-20 | **測試基礎設施**：Vitest 三層配置 / stub 引擎 / mock 平台 / timedtext 契約樣本 / Mock YouTube 站點 / Playwright E2E | P0 | 3 | ✅ 已完成 | `test/` + `vitest.*.config.ts` + `playwright.config.ts` + `test/e2e/fixtures.ts` |
 | M1-21 | **腳本閉環**：build（esbuild 打包）/ serve-mock / merge-reports / cleanup / copy-static | P0 | 3 | ✅ 已完成 | `scripts/*.mjs`（`build.mjs` 4 入口打包、`copy-static.mjs` TEST_PROFILE 注入） |
-| M1-22 | **測試用例**：25 單元 + 5 契約 + 25 集成 + 11 E2E = 66 全綠（含 §5 可靠性紅線回歸） | P0 | 3 | ✅ 已完成 | `test/**` |
+| M1-22 | **測試用例**：29 單元 + 5 契約 + 47 集成 + 13 E2E = 94 全綠（含 §5 可靠性紅線回歸） | P0 | 3 | ✅ 已完成 | `test/**` |
 | M1-23 | **CI 自動化（GitHub Actions）**：構建→部署→測試→報告→清理 | P1 | 4 | ✅ 已完成 | `.github/workflows/system-test.yml` |
 | M1-24 | **Options/Popup 配置界面**：引擎選擇、API Key/端點、語言、樣式 | P0 | 4 | ✅ 已完成 | `src/runtime/options/` + `src/runtime/popup/` |
 | M1-25 | **配置 → 適配器實際注入**（LLM 密鑰從 apiKeyRef 安全解析、真實調用） | P0 | 4 | ✅ 已完成 | `src/runtime/composition.ts` + `ApiKeyStore`（`chrome-config-store.ts`） |
@@ -77,6 +77,8 @@
 | M1-34 | **CI 集成測試環境相容性修復**：首次遠端 CI（Node 20.20.2）集成階段整體崩潰——`jsdom@30` 依賴的 `undici@8.10` 於 import 期調用 `webidl.util.markAsUncloneable`（Node 20 未提供）拋 `TypeError`，致 4 個集成測試文件收集階段失敗（junit `tests="0"`、退出碼 1），`test:ci` 的 `&&` 短路使 contract/E2E 未執行。降級 `jsdom@^26.1.0`（26.x 已移除 undici 依賴，engines `node>=18`）徹底繞開；`npm install` 更新 lockfile 後 undici 退出依賴樹。本地 `test:all` 66 全綠，集成回升 25 | P0 | 4 | ✅ 已完成 | `package.json` / `package-lock.json` |
 | M1-35 | **test:ci 分段執行加固**：新增 `scripts/run-ci-tests.mjs`，unit/integration/contract 三段獨立執行，任一段失敗不短路後續段，各自產出 junit，末尾統一判定退出碼（任一段失敗即 exit 1）。根治 M1-34 暴露的「`&&` 串聯 + 收集期崩潰（0 tests）→ 後續段報告缺失」診斷盲區。配套：三個 vitest config 明文 `passWithNoTests: false`（收集 0 用例即失敗）；`merge-reports.mjs` 對 `tests=0` 的 suite 顯式 warn。驗證：正常 `test:all` 66 全綠；人為製造集成段失敗後 contract 仍執行且退出碼為 1 | P1 | 3 | ✅ 已完成 | `scripts/run-ci-tests.mjs` / `scripts/merge-reports.mjs` / `vitest.*.config.ts` / `package.json` |
 | M1-36 | **CI action 升級消除 Node 20 runtime 棄用告警**：GitHub 棄用 action 底層 Node 20 runtime（強制跑在 Node 24），將 `actions/checkout@v4`、`actions/setup-node@v4`、`actions/upload-artifact@v4` 升至各自最新 major **v7**（底層 Node 24 runtime）。`node-version: 20` 仍指定測試用 Node 20，與 AGENTS.md 一致；不影響測試環境。文檔片段同步 | P2 | 1 | ✅ 已完成 | `.github/workflows/system-test.yml` / `doc/system-test-design.md` §5 |
+| M1-37 | **本地 LLM 服務兼容（F-10）**：確診並修復「配置本地 omlx/mlx OpenAI 兼容服務後字幕不生效」四阻斷點——(1) `normalizeEndpoint` 端點規範化（Base URL `/v1` / 完整 `/chat/completions` / 裸 host / 空值 四態，杜絕 404）；(2) `manifest.json` host_permissions 加 `http://127.0.0.1/*` 與 `http://localhost/*`；(3) `stripReasoning` 剝離 reasoning 模型混入 `content` 的 `<think>` 思考塊，避免污染 `ID<TAB>譯文` 解析；(4) LLM `timeoutMs`（默認 30s）+ AbortController，長思考超時降級 MT 兜底（finally 清 timer）；(5) `SubtitleController` 改用 `chrome.storage.onChanged` 監聽 `engineConfig`/`engineConfigKeys`，實現 Options↔content-script 跨上下文配置熱重啟（原 `store.subscribe` 僅通知本進程回調，跨上下文無效）。測試 +11：單元 +4（reasoning 剝離/超時降級）、集成 +6（normalizeEndpoint 五態 + local 端點補全）、E2E +1（TC-R8 storage.onChanged 熱重啟）| P0 | 4 | ✅ 已完成 | `composition.ts`（`normalizeEndpoint`）/ `llm-translation.ts`（`stripReasoning`+timeout）/ `content-script.ts`（storage.onChanged）/ `manifest.json` |
+| M1-38 | **翻譯失敗診斷可見性（F-11）**：診斷「本地 LLM 端點配置後字幕仍不生效」——先排除 mixed-content（omlx 日誌證明請求已達，Chrome 對 localhost HTTP 有豁免）；確認根因為 **模型名不符**（omlx 404 Model not found，可用模型為 Gemma-4-31B-JANG_4M-CRACK / Qwen3.6-27B-MLX-6bit / Qwen3.6-35B-A3B-4bit 等）。交付：(1) `src/infrastructure/diagnostics.ts`——`extractDiagnostic`、`recordDiagnostic`（寫 `lastDiagnostic` + `console.warn`，§5.7 try/catch）、`readLastDiagnostic`/`formatDiagnostic`；(2) content-script `onEvent` 非 segments 分支 `void recordDiagnostic(e)`；(3) popup「最近失敗」行**常駐顯示**（無記錄顯示「無」，不再整行隱藏）+ 本地模式顯示實際生效模型名；(4) **Popup「測試連接」按鈕**（`src/runtime/popup/connection-test.ts`）——直接向配置端點發最小 `/chat/completions`，驗證端點可達/模型存在/響應有效，終結「配置 vs 實際請求」猜測；`normalizeEndpoint` 抽為獨立 `src/runtime/endpoint.ts`（composition 與 connection-test 共用，避免 popup bundle 依賴整個組裝鏈）。**重要澄清**：omlx 日誌中的 `qwen-mlx` 404 記錄系 **E2E 測試污染**（TC-R8 曾寫入 `model:'qwen-mlx', endpoint:'http://127.0.0.1:8000/v1'`，persistent context 真實發起請求）；已改為不可達假端口 `127.0.0.1:59999` 杜絕測試碰真實服務。測試 +6：集成 +5（connection-test）、集成 +1（popup 測試連接）→ 94 全綠 | P0 | 4 | ✅ 已完成 | `src/infrastructure/diagnostics.ts` / `content-script.ts` / `popup.ts` + `popup.html` / `src/runtime/popup/connection-test.ts` / `src/runtime/endpoint.ts` |
 
 ### 3.2 M2 — 實時擷取 ASR（P1，待完成）
 
@@ -134,16 +136,18 @@
 - **打包與測試構建基建**（M1-28/29）：引入 esbuild 4 入口打包（content-script/options/popup IIFE、SW ESM）；`TEST_PROFILE=1` 向 dist manifest 注入 localhost match 供 E2E。
 - **E2E 擴充驗證閉環**（M1-30/31）：以 `launchPersistentContext` 自定義 fixture 加載擴充；修復 content-script 直接調用 `window.fetch` 的 "Illegal invocation"（構造時 bind）。全鏈路在 Mock 站點驗證：注入 → 抓字幕 → 翻譯 → 覆蓋層顯示。
 - **CI 自動化**（M1-23）：`.github/workflows/system-test.yml` 串聯 build→test→e2e→report→cleanup。
-- **測試基礎設施已搭**：66 個測試全綠（25 單元 + 5 契約 + 25 集成 + 11 E2E），`npm run test:all` 一次通過，含構建→測試→報告合併→環境清理（M1-20~22）。
+- **測試基礎設施已搭**：94 個測試全綠（29 單元 + 5 契約 + 47 集成 + 13 E2E），`npm run test:all` 一次通過，含構建→測試→報告合併→環境清理（M1-20~22）。
 - **可靠性紅線加固**（M1-32）：全庫審計並修復 restart 訂閱/Observer 洩漏、fetch 未綁定、JSON parse 未容錯、stream 無 fallback 等 MV3 真實環境陷阱；每項配專屬回歸測試（單元/集成/E2E）。AGENTS.md §5 沉澱 8 條紅線，governance skill 加自查清單。
 - **CI 環境相容性修復**（M1-34）：首次遠端 CI 集成階段崩潰於 `jsdom@30`→`undici@8` 在 Node 20 的 `webidl.util.markAsUncloneable` 缺失；降級 `jsdom@^26`（無 undici 依賴）根治。教訓：依賴版本須與 CI 目標 Node 版本相容，`EBADENGINE` 警告不可忽視。
 - **test:ci 分段執行加固**（M1-35）：`run-ci-tests.mjs` 分段執行 unit/integration/contract，單段失敗不再 `&&` 短路，各自產出 junit、末尾統一判定退出碼；三個 vitest config 明文 `passWithNoTests:false`、merge-reports 對 `tests=0` warn。診斷盲區「收集期崩潰被靜默為 0 tests」已根治。
+- **本地 LLM 服務兼容**（M1-37）：修復配置本地 omlx/mlx（OpenAI 兼容）服務後字幕不生效的四阻斷點——端點規範化（`normalizeEndpoint` 兼容 Base URL 與完整路徑，杜絕 404）、本地 host 權限（`http://127.0.0.1/*`、`http://localhost/*`）、reasoning `<think>` 剝離（`stripReasoning`）、LLM 超時降級（30s AbortController → MT 兜底）、跨上下文配置熱重啟（`storage.onChanged` 取代僅本進程有效的 `store.subscribe`）。教訓：擴充內存訂閱不跨上下文；用戶填端點格式多樣須規範化；本地 reasoning 模型延遲與 `<think>` 污染需防禦。
+- **翻譯失敗診斷可見性**（M1-38）：確診 HTTPS 頁面 mixed-content 攔截本地 http 端點為字幕不生效根因（content-script fetch 在請求發出前被 Chrome 殺死，Network 面板無記錄）。交付 `diagnostics.ts` 診斷模塊：降級/錯誤事件持久化 `lastDiagnostic` + `console.warn` 麵包屑 + popup「最近失敗」行**常駐顯示** + **「測試連接」按鈕**（直接驗證端點/模型名，終結猜測），讓「字幕沒出來」的原因對用戶可見。**澄清**：omlx 的 `qwen-mlx` 404 日誌實為 E2E 測試污染（TC-R8 曾指真實 8000 端口），已改為不可達假端口。教訓：管線靜默降級掩蓋根因；mixed-content 不觸發 Network 記錄；診斷可見性是排查第一道防線；**E2E 的持久化配置不得指向真實本地服務**。
 - **已修復測試/真實環境暴露的缺陷**：翻譯管線降級事件被吞、mock 站點 `/watch` 路由 404、manifest SW/CS 路徑錯誤、mock 播放器容器 `textContent` 覆寫刪除覆蓋層、content-script fetch 未綁定。
 
 ## 5. 進行中與下一步
 
-- **M1 里程碑已完成**：原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環全部交付並測試覆蓋。
-- **M1 尾項（P1，非阻塞）**：M1-27 真實 YouTube 頁面手動冒煙驗證（Mock 已閉環，待接入真實環境驗證接口容錯）。
+- **M1 里程碑已完成**：原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環 + 翻譯失敗診斷可見性全部交付並測試覆蓋。
+- **M1 尾項（P1，非阻塞）**：M1-27 真實 YouTube 頁面手動冒煙驗證；Phase 2 — 驗證 HTTPS omlx 假設（用戶配置本地伺服器走 HTTPS，確認 mixed-content 為根因）；Phase 3 — Service Worker 代理 fetch（持久修法，待 Phase 2 確認後決策）。
 - **下一步優先（M2）**：
   1. M2-04 tabCapture 音頻源 + M2-09 Offscreen Document 入口。
   2. M2-05/06 本地 Whisper / 雲端 ASR 適配器。

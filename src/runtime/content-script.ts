@@ -3,6 +3,7 @@
 import { Orchestrator } from '../application';
 import { buildDefaultRegistry } from './composition';
 import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store';
+import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
@@ -32,10 +33,21 @@ class SubtitleController {
 
   constructor(private config: EngineConfig, url: string) {
     this.url = url;
-    // 配置變更（Options 保存）→ 熱重啟；保存 unsubscribe，dispose 時解除。
-    this.unsubscribeConfig = store.subscribe(() => {
-      void this.restart();
-    });
+    // 配置變更（Options 頁保存）→ 熱重啟。
+    // 注意：Options 與 content-script 是不同 JS 上下文，store.subscribe 的內存回調不跨上下文；
+    // 必須監聽 chrome.storage.onChanged 才能收到跨頁變更（engineConfig / engineConfigKeys 兩個 key）。
+    // R4：保存 unsubscribe，dispose 時解除。
+    const onStorageChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string
+    ): void => {
+      if (areaName !== 'local') return;
+      if ('engineConfig' in changes || 'engineConfigKeys' in changes) {
+        void this.restart();
+      }
+    };
+    chrome.storage.onChanged.addListener(onStorageChanged);
+    this.unsubscribeConfig = () => chrome.storage.onChanged.removeListener(onStorageChanged);
   }
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
@@ -125,7 +137,11 @@ class SubtitleController {
         end: s.end,
       }));
       this.scheduleDraw();
+      return;
     }
+    // 降級/錯誤事件：持久化診斷 + console 麵包屑，讓「字幕沒出來」的原因可被用戶查詢。
+    // 異步寫入不阻塞事件處理；recordDiagnostic 內部已 try/catch 守護（§5.7）。
+    void recordDiagnostic(e);
   }
 
   /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */

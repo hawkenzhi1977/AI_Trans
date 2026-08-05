@@ -52,6 +52,98 @@
     }
   };
 
+  // src/infrastructure/diagnostics.ts
+  var DIAGNOSTIC_KEY = "lastDiagnostic";
+  async function readLastDiagnostic() {
+    try {
+      const stored = await chrome.storage.local.get(DIAGNOSTIC_KEY);
+      const rec = stored[DIAGNOSTIC_KEY];
+      if (rec && typeof rec === "object" && typeof rec.message === "string") {
+        return rec;
+      }
+      return void 0;
+    } catch {
+      return void 0;
+    }
+  }
+  function formatDiagnostic(rec) {
+    if (!rec) return void 0;
+    const kind = rec.kind === "degraded" ? "\u964D\u7D1A" : "\u932F\u8AA4";
+    return `${kind}: ${rec.message} (${rec.timestamp})`;
+  }
+
+  // src/runtime/endpoint.ts
+  function normalizeEndpoint(raw) {
+    const trimmed = (raw ?? "").trim();
+    if (!trimmed) return "https://api.openai.com/v1/chat/completions";
+    const base = trimmed.replace(/\/+$/, "");
+    if (/\/chat\/completions$/i.test(base)) return base;
+    if (/\/v\d+$/i.test(base)) return `${base}/chat/completions`;
+    return `${base}/v1/chat/completions`;
+  }
+
+  // src/runtime/popup/connection-test.ts
+  async function testConnection(config, apiKey, fetchFn = globalThis.fetch.bind(globalThis), timeoutMs = 1e4) {
+    const tc = config.translation;
+    if (tc.type !== "cloud-llm" && tc.type !== "local") {
+      return { ok: false, error: "\u7576\u524D\u5F15\u64CE\u985E\u578B\u4E0D\u9700\u8981\u7DB2\u7D61\uFF08MT \u5B57\u5178\uFF09\u3002\u8ACB\u9078\u96F2\u7AEF LLM \u6216\u672C\u5730\u6A21\u578B\u3002" };
+    }
+    if (!tc.endpoint) {
+      return { ok: false, error: "\u672A\u586B\u5BEB\u7AEF\u9EDE\uFF08Endpoint\uFF09\u3002" };
+    }
+    const endpoint = normalizeEndpoint(tc.endpoint);
+    const model = tc.model ?? (tc.type === "cloud-llm" ? "gpt-4o-mini" : "");
+    if (!model) {
+      return { ok: false, error: "\u672A\u586B\u5BEB\u6A21\u578B ID\u3002" };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetchFn(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0,
+          messages: [
+            { role: "user", content: "ping" }
+          ],
+          max_tokens: 1
+        }),
+        signal: controller.signal
+      });
+      if (!res.ok) {
+        let serverMsg = "";
+        try {
+          const body = await res.json();
+          serverMsg = body.error?.message ?? "";
+        } catch {
+        }
+        return {
+          ok: false,
+          error: `HTTP ${res.status}${serverMsg ? ` \u2014 ${serverMsg}` : ""}`
+        };
+      }
+      const data = await res.json();
+      if (!Array.isArray(data.choices) || data.choices.length === 0) {
+        return { ok: false, error: "\u97FF\u61C9\u7D50\u69CB\u7570\u5E38\uFF1A\u7121 choices \u6578\u7D44\u3002" };
+      }
+      return { ok: true, detail: `\u7AEF\u9EDE\u53EF\u9054\uFF0C\u6A21\u578B ${model} \u56DE\u61C9\u6B63\u5E38\u3002` };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const timeoutHit = err instanceof DOMException && err.name === "AbortError";
+      return {
+        ok: false,
+        error: timeoutHit ? `\u8ACB\u6C42\u8D85\u6642\uFF08${timeoutMs / 1e3}s\uFF09\u3002\u6AA2\u67E5\u7AEF\u9EDE\u8207\u670D\u52D9\u72C0\u614B\u3002` : `\u7DB2\u7D61\u5931\u6557: ${reason}`
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // src/runtime/popup/popup.ts
   var store = new ChromeStorageConfigStore();
   function $(id) {
@@ -64,8 +156,31 @@
     $("status-translation").textContent = describeTranslation(config);
     $("status-asr").textContent = describeAsr(config);
     $("status-lang").textContent = `\u76EE\u6A19\u8A9E\u8A00: ${config.targetLang} \xB7 ${config.displayMode === "mono" ? "\u50C5\u8B6F\u6587" : "\u96D9\u8A9E"}`;
+    const diag = await readLastDiagnostic();
+    const diagEl = $("status-diagnostic");
+    const text = formatDiagnostic(diag);
+    if (text) {
+      diagEl.textContent = `\u6700\u8FD1\u5931\u6557: ${text}`;
+      diagEl.classList.add("warn");
+    } else {
+      diagEl.textContent = "\u6700\u8FD1\u5931\u6557: \u7121";
+    }
     $("btn-options").addEventListener("click", () => {
       void chrome.runtime.openOptionsPage();
+    });
+    $("btn-test").addEventListener("click", async () => {
+      const connEl = $("status-connection");
+      connEl.textContent = "\u9023\u63A5\u6E2C\u8A66: \u6E2C\u8A66\u4E2D\u2026";
+      connEl.classList.remove("warn", "ok");
+      const apiKey = await store.getApiKey("llm") ?? "";
+      const status = await testConnection(config, apiKey);
+      if (status.ok) {
+        connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.detail}`;
+        connEl.classList.add("ok");
+      } else {
+        connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.error}`;
+        connEl.classList.add("warn");
+      }
     });
     $("btn-reload").addEventListener("click", async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -79,7 +194,7 @@
       case "cloud-llm":
         return `\u7FFB\u8B6F: \u96F2\u7AEF LLM${model ? ` (${model})` : ""}`;
       case "local":
-        return "\u7FFB\u8B6F: \u672C\u5730\u6A21\u578B";
+        return `\u7FFB\u8B6F: \u672C\u5730\u6A21\u578B${model ? ` (${model})` : ""}`;
       case "mt":
         return "\u7FFB\u8B6F: \u50B3\u7D71 MT";
     }

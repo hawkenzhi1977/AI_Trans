@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildDefaultRegistry } from '../../src/runtime/composition';
+import { normalizeEndpoint } from '../../src/runtime/endpoint';
 import { DEFAULT_CONFIG, type EngineConfig } from '../../src/domain/models/config';
 import type { ApiKeyStore } from '../../src/domain/ports/config-store';
 import type { Registry } from '../../src/application/registry';
@@ -42,6 +43,58 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
       { apiKeyStore: new MemoryApiKeyStore() }
     );
     expect(registry.translation.get('local-llm')?.engineId).toBe('local-llm');
+  });
+
+  it('local 端點自動補全：填 Base URL /v1 時實際請求發往 /v1/chat/completions', async () => {
+    const captured: Array<RequestInfo | URL> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      captured.push(input);
+      return new Response(JSON.stringify({ choices: [{ message: { content: '0\t你好' } }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const registry = await buildDefaultRegistry(
+        CONFIG({ translation: { type: 'local', model: 'qwen-mlx', endpoint: 'http://127.0.0.1:8000/v1' } }),
+        { apiKeyStore: new MemoryApiKeyStore({ llm: '1108' }) }
+      );
+      await registry.translation.get('local-llm')?.translate({
+        segments: [{ id: '0', start: 0, end: 1000, sourceText: 'hi', origin: 'native', provisional: false, revision: 0 }],
+        targetLang: 'zh-Hant',
+      });
+      expect(String(captured[0])).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  describe('normalizeEndpoint 端點規範化（兩種填法兼容）', () => {
+    it('完整 /chat/completions 路徑原樣保留', () => {
+      expect(normalizeEndpoint('http://127.0.0.1:8000/v1/chat/completions')).toBe(
+        'http://127.0.0.1:8000/v1/chat/completions'
+      );
+    });
+    it('Base URL /v1 補全為 /v1/chat/completions', () => {
+      expect(normalizeEndpoint('http://127.0.0.1:8000/v1')).toBe(
+        'http://127.0.0.1:8000/v1/chat/completions'
+      );
+    });
+    it('裸 host 補全為 /v1/chat/completions', () => {
+      expect(normalizeEndpoint('http://127.0.0.1:8000')).toBe(
+        'http://127.0.0.1:8000/v1/chat/completions'
+      );
+    });
+    it('尾部斜杠被去除後再補全', () => {
+      expect(normalizeEndpoint('http://127.0.0.1:8000/v1/')).toBe(
+        'http://127.0.0.1:8000/v1/chat/completions'
+      );
+    });
+    it('空/undefined 回落 OpenAI 默認端點', () => {
+      expect(normalizeEndpoint(undefined)).toBe('https://api.openai.com/v1/chat/completions');
+      expect(normalizeEndpoint('   ')).toBe('https://api.openai.com/v1/chat/completions');
+    });
   });
 
   it('mt 類型僅註冊 mt，不註冊 llm', async () => {

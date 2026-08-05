@@ -77,4 +77,70 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     // 全程只應有單一覆蓋層節點。
     await expect(page.locator('.ai-trans-overlay')).toHaveCount(1);
   });
+
+  test('配置變更經 chrome.storage.onChanged 觸發熱重啟，覆蓋層不累積', async ({ page, context }) => {
+    // 模擬 Options 頁保存配置（寫 chrome.storage.local）。content-script 監聽 onChanged，
+    // 應觸發 restart 而非殘留多個覆蓋層或崩潰——驗證跨上下文熱重載鏈路。
+    // 注意：chrome.storage 僅在擴充上下文可用（頁面主世界無），故經 service worker 寫入。
+    await page.goto('/with-native-captions.html');
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+
+    // 取得擴充 service worker（MV3 background）。可能尚未啟動，等待其出現。
+    let [sw] = context.serviceWorkers();
+    if (!sw) sw = await context.waitForEvent('serviceworker');
+
+    // 在 service worker 上下文寫入 engineConfig（等價 Options 保存），觸發 storage.onChanged。
+    // 重要：端點必須是絕不可達的假端口，禁止指向真實本地服務（127.0.0.1:8000 等）——
+    // 否則測試會真實請求開發機上的 omlx 等服務，污染日誌與診斷。
+    await sw.evaluate(() => {
+      return new Promise<void>((resolve) => {
+        chrome.storage.local.set(
+          {
+            engineConfig: {
+              translation: { type: 'local', model: 'test-hot-reload', endpoint: 'http://127.0.0.1:59999/v1', fallbackType: 'mt' },
+              asr: { type: 'local-whisper', modelTier: 'base' },
+              targetLang: 'zh-Hant',
+              displayMode: 'bilingual',
+              performanceProfile: 'balanced',
+            },
+          },
+          () => resolve()
+        );
+      });
+    });
+
+    // 熱重啟後覆蓋層應重新掛載且仍恰好一個（restart 清理舊訂閱 + 複用渲染器）。
+    await page.waitForTimeout(1500);
+    await expect(page.locator('.ai-trans-overlay')).toHaveCount(1);
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached();
+  });
+
+  test('[TC-F11] 翻譯降級時寫入 lastDiagnostic 診斷記錄（用戶可查失敗原因）', async ({ page, context }) => {
+    // Mock 宿主上 LLM 端點不可達（無網/無 key）→ fetch 失敗 → 管線降級 MT →
+    // content-script.onEvent 應把降級原因持久化到 chrome.storage.local['lastDiagnostic']。
+    // 這是「字幕沒出來」時用戶能在 popup 看到具體原因的數據來源。
+    await page.goto('/with-native-captions.html');
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+
+    // 取得擴充 service worker，經其讀取 chrome.storage.local（頁面主世界無 chrome）。
+    let [sw] = context.serviceWorkers();
+    if (!sw) sw = await context.waitForEvent('serviceworker');
+
+    // 等待降級發生並輪詢診斷記錄寫入（翻譯在播放時鐘推進、字幕就緒後觸發）。
+    await expect
+      .poll(
+        async () =>
+          sw.evaluate(
+            () =>
+              new Promise<string | undefined>((resolve) => {
+                chrome.storage.local.get('lastDiagnostic', (r) => {
+                  const rec = r.lastDiagnostic as { message?: string } | undefined;
+                  resolve(rec?.message);
+                });
+              })
+          ),
+        { timeout: 10_000 }
+      )
+      .toBeTruthy();
+  });
 });

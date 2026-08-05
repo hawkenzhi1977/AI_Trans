@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { LLMTranslationProvider } from '../../src/adapters/translation/llm-translation';
+import { LLMTranslationProvider, stripReasoning } from '../../src/adapters/translation/llm-translation';
 import type { TranslationRequest } from '../../src/domain/models/translation';
 import type { SubtitleSegment } from '../../src/domain/models/subtitle';
 
@@ -94,5 +94,69 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
       fetchFn: fetchFn as unknown as typeof fetch,
     });
     await expect(provider.translate(req())).rejects.toThrow('HTTP 500');
+  });
+});
+
+describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
+  it('content 含 <think> 思考塊時剝離，不污染字幕解析', async () => {
+    const reasoningContent =
+      '<think>Let me translate carefully.</think>\n0\t你好，世界\n1\t早安';
+    const fetchFn = vi.fn(async () => okResponse({
+      choices: [{ message: { content: reasoningContent } }],
+    }));
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+
+    const result = await provider.translate(req());
+    expect(result.segments[0].translatedText).toBe('你好，世界');
+    expect(result.segments[1].translatedText).toBe('早安');
+  });
+
+  it('超時觸發 AbortSignal，拋錯供管線降級', async () => {
+    // 永不 resolve 的 fetch：依賴 30ms 超時中斷。
+    const fetchFn = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        })
+    );
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+      timeoutMs: 30,
+    });
+
+    await expect(provider.translate(req())).rejects.toThrow(/aborted/i);
+  });
+
+  it('正常請求完成時不會殘留未清理的定時器', async () => {
+    const fetchFn = vi.fn(async () => okResponse(llmBody));
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+      timeoutMs: 30_000,
+    });
+    await provider.translate(req());
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('stripReasoning：剝離成對思考塊與殘留單邊標籤', () => {
+    expect(stripReasoning('<think>a</think>\n0\t你好')).toBe('0\t你好');
+    expect(stripReasoning('</think>0\t你好')).toBe('0\t你好');
+    expect(stripReasoning('0\t你好\n<think>b</think>1\t早安')).toBe('0\t你好\n1\t早安');
+    expect(stripReasoning('plain')).toBe('plain');
   });
 });

@@ -16,9 +16,11 @@ English version: [README.md](./README.md).
 - **覆蓋層字幕渲染**——支持單語或雙語（原文＋譯文），渲染於獨立覆蓋層並對齊播放時間。
 - **播放狀態同步**——字幕隨當前時間、暫停、快進同步（媒體事件 + `requestAnimationFrame` 對齊）。
 - **可配置翻譯引擎**——雲端 LLM（OpenAI 兼容 `/chat/completions`）為主、傳統 MT 兜底；端點、模型、API Key 由用戶配置。API Key 與配置對象分離存儲。
+- **本地 LLM 服務支援**——可搭配本地 OpenAI 兼容服務（mlx / omlx / LM Studio / Ollama）：端點欄位接受「Base URL（如 `http://127.0.0.1:8000/v1`）」或「完整 `/chat/completions` 路徑」（自動規範化）；已授權 `http://127.0.0.1/*` 與 `http://localhost/*` 主機權限；reasoning 模型的 `<think>` 思考塊會自回覆中剝離；長思考請求超時（30s）後降級 MT 兜底；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效。
 - **目標語言與字幕樣式**——可選目標語言、顯示模式（單語/雙語）、字號、顏色、背景。
 - **Options 與 Popup 配置界面**——完整設定頁 + 快捷彈出頁（狀態顯示 + 重新載入）。
 - **可靠性加固的內容腳本**——宿主方法綁定（避免 "Illegal invocation"）、配置熱重載時無訂閱洩漏、外部 JSON 容錯解析（詳見 `AGENTS.md` §5）。
+- **翻譯失敗診斷可見性**——翻譯降級/錯誤不再被管線無聲吞掉：失敗原因持久化至 `chrome.storage.local`，並在 Popup 的「最近失敗」行**常駐顯示**（無記錄時顯示「無」，確保可見性）；同時輸出 `console.warn` 麵包屑。Popup 新增**「測試連接」按鈕**——一鍵向配置端點發最小實時請求，驗證端點可達/模型名/響應結構，直接終結「配置對不對」的猜測。Popup 的翻譯狀態行也會顯示**實際生效的模型名**（本地模式），便於確認保存後 storage 是否真正更新。
 
 ### 待實現（後續里程碑）
 
@@ -109,6 +111,17 @@ npm run test:e2e     # Playwright E2E（需先構建）
 - **字幕樣式**：字號、顏色、背景。
 
 API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
+
+### 使用本地 LLM（mlx / omlx / LM Studio / Ollama）
+
+1. 將**翻譯引擎**設為 `local`，填入伺服器提供的模型 ID。
+2. **端點**欄位兩種填法皆可：Base URL（`http://127.0.0.1:8000/v1`）或完整路徑（`http://127.0.0.1:8000/v1/chat/completions`）——會自動規範化。
+3. 若伺服器需要驗證，填入 API Key（不需要則任意非空字串）。
+4. 儲存。content script 會熱重啟配置；若 YouTube 分頁已開啟，無需手動重新整理即可生效。
+
+> **reasoning 模型提示**：會輸出長 `<think>` 思考的模型已支援（思考塊會被剝離），但單次翻譯可能耗時 30–40s，易命中 30s 請求超時而降級 MT 兜底。要即時字幕建議改用非推理（instruct）模型。
+
+> **排查提示 — 字幕不出現時**：先開 Popup 點**「測試連接」**——它會向配置端點發真實請求，直接告訴你失敗在哪一環（端點不可達/模型名不符/響應異常）。也可看**「最近失敗」**行（常駐顯示，如模型 404 `LLM translation failed: HTTP 404`）或 DevTools console 的 `[AI_Trans] translation degraded` 麵包屑。常見原因：模型 ID 與伺服器實際名稱不符（omlx 會回 404 Model not found）；端點格式（`http://127.0.0.1:8000/v1` 與 `http://127.0.0.1:8000/v1/chat/completions` 都會自動規範化）。**注意**：Chrome 對 `127.0.0.1`/`localhost` 的明文 HTTP 有 mixed-content 豁免，本地端點用 `http://127.0.0.1:PORT/v1` 即可，無需 HTTPS。
 
 ---
 

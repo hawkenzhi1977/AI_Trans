@@ -16,9 +16,11 @@ AI_Trans grabs a video's captions (or, later, transcribes its audio), translates
 - **Overlay subtitle rendering** — monolingual or bilingual (source + translation), rendered on a dedicated overlay layer aligned to playback time.
 - **Playback-synced subtitles** — subtitles follow current time, pause, and seek via media events + `requestAnimationFrame`.
 - **Configurable translation engine** — cloud LLM (OpenAI-compatible `/chat/completions`) as primary, traditional MT as fallback; endpoint, model, and API key are user-configured. API keys are stored separately from the config object.
+- **Local LLM service support** — works with local OpenAI-compatible servers (mlx / omlx / LM Studio / Ollama): the endpoint field accepts either a Base URL (`http://127.0.0.1:8000/v1`) or a full `/chat/completions` path (auto-normalized); `http://127.0.0.1/*` and `http://localhost/*` host permissions are granted; reasoning-model `<think>` blocks are stripped from the reply; long reasoning requests time out (30s) and degrade to the MT fallback; config changes hot-reload across contexts via `chrome.storage.onChanged`.
 - **Target language & subtitle style** — pick target language, display mode (mono/bilingual), font size, color, and background.
 - **Options & Popup UI** — full settings page plus a quick popup (status + reload).
 - **Reliability-hardened content script** — host-method binding (no "Illegal invocation"), leak-free subscriptions on config hot-reload, tolerant external JSON parsing (see `AGENTS.md` §5).
+- **Translation-failure diagnostics** — degrade/error events are no longer silently swallowed by the pipeline: the failure reason is persisted to `chrome.storage.local` and **always shown** on the Popup's "last failure" line (no record → shows "none", so you can always confirm it's working), plus a `console.warn` breadcrumb. A **"Test Connection" button** in the Popup sends a minimal live request to the configured endpoint — verifying reachability, model name, and response structure in one click, so you know exactly whether the endpoint is up and the model ID is correct. The Popup's translation status line also shows the **actual model name in effect** (local mode), making it easy to confirm whether a save actually updated storage.
 
 ### Planned (later milestones)
 
@@ -109,6 +111,17 @@ Open the extension's **Settings** (Options page) to set:
 - **Subtitle style**: font size, color, background.
 
 API keys are written to a separate secure storage slot and are never embedded into the plain config object.
+
+### Using a local LLM (mlx / omlx / LM Studio / Ollama)
+
+1. Set **Translation engine** to `local` and enter the model ID your server exposes.
+2. For **endpoint**, either the Base URL (`http://127.0.0.1:8000/v1`) or the full path (`http://127.0.0.1:8000/v1/chat/completions`) works — it is auto-normalized.
+3. Enter the API key if your server requires one (any non-empty string otherwise).
+4. Save. The content script hot-reloads the config; if a YouTube tab is already open, the change applies without a manual reload.
+
+> **Reasoning models**: models that emit long `<think>` reasoning are supported (the `<think>` block is stripped), but a single translation can take 30–40s and may hit the 30s request timeout, degrading to the MT fallback. For live subtitles prefer a non-reasoning (instruct) model.
+
+> **Troubleshooting — when subtitles don't appear**: open the Popup and click **"Test Connection"** — it sends a live request to your configured endpoint and tells you exactly what failed (unreachable, wrong model ID, bad response structure, etc.). You can also check the **"last failure"** line (always visible; shows the concrete reason, e.g. `LLM translation failed: HTTP 404`) or look for `[AI_Trans] translation degraded` in the DevTools console. Common causes: the model ID doesn't match the server's actual model name (omlx returns `404 Model not found`); wrong endpoint format (both `http://127.0.0.1:8000/v1` and `http://127.0.0.1:8000/v1/chat/completions` are auto-normalized). **Note**: Chrome exempts plain-HTTP `127.0.0.1`/`localhost` from mixed-content blocking, so a local endpoint like `http://127.0.0.1:PORT/v1` works as-is — no HTTPS needed.
 
 ---
 

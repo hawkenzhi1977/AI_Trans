@@ -1,4 +1,5 @@
 import type { Registry } from '../application/registry';
+import { normalizeEndpoint } from './endpoint';
 import {
   NativeCaptionStrategy,
   LookAheadASRStrategy,
@@ -70,6 +71,7 @@ async function buildTranslationProviders(
   return providers;
 }
 
+
 /** 依翻譯配置構建 LLM 適配器；無端點/密鑰時返回 undefined（改由 MT 兜底）。 */
 async function createLLM(
   tc: TranslationConfig,
@@ -77,7 +79,8 @@ async function createLLM(
 ): Promise<TranslationProvider | undefined> {
   if (tc.type !== 'cloud-llm' && tc.type !== 'local') return undefined;
 
-  const endpoint = tc.endpoint ?? 'https://api.openai.com/v1/chat/completions';
+  // 端點規範化：兼容 Base URL（/v1）與完整路徑（/v1/chat/completions）兩種填法。
+  const endpoint = normalizeEndpoint(tc.endpoint);
   const model = tc.model ?? 'gpt-4o-mini';
   // 密鑰始終從安全存儲解析（apiKeyRef 僅為存在性標記，實際值不入配置對象）。
   const apiKey = (await apiKeyStore.getApiKey('llm')) ?? '';
