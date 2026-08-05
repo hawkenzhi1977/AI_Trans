@@ -129,4 +129,4 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 
 ## 授權
 
-MIT。
+MIT — 見 [LICENSE](./LICENSE)。

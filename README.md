@@ -129,4 +129,4 @@ Engineering rules (including the content-script reliability red-lines) are in [`
 
 ## License
 
-MIT.
+MIT — see [LICENSE](./LICENSE).
