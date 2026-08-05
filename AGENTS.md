@@ -21,18 +21,24 @@
 | `doc/architecture-design.md` | 新增接口/數據結構/適配器/性能機制 |
 | `doc/system-test-design.md` | 新增測試用例（新 TC 編號）、測試策略變化 |
 | `doc/project-progress.md` | 每次代碼變更後（狀態/技術點/優先級） |
+| `README.md` / `README.zh-Hant.md` | 功能特性（已實現/待實現）、安裝/構建步驟、命令、配置項變化；兩份必須同步（內容等價，僅語言不同） |
+| `release/`（發布件） + `release/README.md` | 用戶可見行為/構建產物結構/加載步驟變化；發布件須用當前源碼重新生成（`npm run release`） |
 
 規則：
 1. 代碼與進展文檔**一一對應**：每項技術點有落點，每段代碼有條目。
 2. 標記 ✅ 前必須有測試覆蓋；部分實現標 🟡。
 3. 任何新增特性，先同步設計文檔，再進展文檔，最後才寫代碼（或同一變更內完成）。
+4. **README 一致性**：`README.md`（英文）與 `README.zh-Hant.md`（中文）內容等價，任一改動必同步另一份；README 描述的功能「已實現/待實現」狀態必須與 `doc/project-progress.md` 的里程碑狀態一致（不得把待實現說成已實現）。
+5. **發布件一致性**：改動影響用戶可見行為、manifest、runtime 產物或加載方式時，必須用當前源碼重新 `npm run release` 生成 `release/`，並核對 README 的安裝/構建步驟與命令仍準確；發布件不得落後於源碼版本（`package.json` 的 `version` 與 zip 名一致）。
 
 ## 3. 工程命令
 
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run lint        # ESLint flat config
-npm run test:all    # build → 31 tests → report merge → cleanup
+npm run build       # 生產構建到 dist/（typecheck + esbuild 打包 + copy-static）
+npm run release     # 生成用戶發布件 release/ai-trans-extension(+.zip)
+npm run test:all    # build → 66 tests → report merge → cleanup
 npm run test:ci     # unit + integration + contract
 npm run test:e2e    # Playwright E2E（需先 build 產出 dist/）
 ```

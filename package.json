@@ -11,6 +11,7 @@
   "scripts": {
     "build": "npm run typecheck && node scripts/build.mjs && node scripts/copy-static.mjs",
     "build:test": "TEST_PROFILE=1 npm run build && npm run test:cleanup",
+    "release": "node scripts/package-release.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test:unit": "vitest run --config vitest.unit.config.ts",

@@ -15,6 +15,20 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 | `doc/architecture-design.md` | 端口/適配器/數據結構/實時性/里程碑映射 | 新增代碼結構沒有對應章節落點 |
 | `doc/system-test-design.md` | 測試策略、分層、用例 TC-*、CI 閉環 | 新增測試沒有對應用例編號 |
 | `doc/project-progress.md` | 進度狀態（✅/🟡/⬜）、優先級、開發順序 | 代碼已存在但進度表未更新 |
+| `README.md` / `README.zh-Hant.md` | 功能特性（已實現/待實現）、安裝/構建步驟、命令、配置項 | README 描述與實際代碼/里程碑狀態不符 |
+| `release/`（發布件）+ `release/README.md` | 用戶可加載的擴充產物與快速安裝說明 | 發布件與源碼版本不一致 |
+
+### README 一致性規則
+
+- `README.md`（英文）與 `README.zh-Hant.md`（中文）內容等價，任一改動必同步另一份。
+- README 的「已實現」功能必須在 `doc/project-progress.md` 中標 ✅；「待實現」對應 🟡/⬜；不得超前聲稱。
+- 安裝/構建步驟中的命令（`npm run build`、`npm run release` 等）必須與 `package.json` scripts 一致。
+
+### 發布件一致性規則
+
+- 改動影響用戶可見行為（字幕邏輯、配置頁、popup）、manifest、runtime 產物或加載方式時，必須重新 `npm run release` 生成 `release/`，並提交更新的發布件。
+- 發布件版本（zip 名中的版本號）必須與 `package.json` 的 `version` 字段一致。
+- `release/README.md` 的加載步驟若有變化（目錄結構、manifest 路徑），需同步更新。
 
 ## 工作流（每個任務必做）
 
@@ -67,6 +81,7 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 - 確認進展文檔所有 ✅ 項都有對應代碼與測試，所有代碼都有對應條目。
 - 如果某項標記 ✅ 但實際是部分實現（如測試只有 3/5 用例），不要標 ✅，保持 🟡。
 - **三者一致性最終核對**：設計文檔的接口/行為 = 代碼實現 = 測試斷言，一一對應；新增測試在 system-test-design.md 有 TC 編號；§可靠性紅線涉及項有專屬回歸測試。
+- **README 與發布件核對**：若改動涉及用戶可見行為/命令/manifest → 同步 `README.md` + `README.zh-Hant.md`（兩份等價），重跑 `npm run release` 更新 `release/`，確認發布件版本與 `package.json` 一致、README 步驟仍可行。
 
 ## 狀態語義
 
@@ -94,6 +109,12 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 3. architecture-design.md §7.1「content-script 運行時約束」補記該陷阱與規範。
 4. system-test-design.md 給新 TC 編號；project-progress.md 加技術點條目（含落點）。
 5. AGENTS.md §5 可靠性紅線若出現新類型，補一條。
+
+**場景 E：改動用戶可見行為 / 發布相關**（如新增配置項、改 manifest、改 popup）
+1. 更新代碼 + 對應測試。
+2. 同步 `README.md` 與 `README.zh-Hant.md`（功能特性、配置說明、命令；兩份等價）。
+3. 重跑 `npm run release` 生成最新 `release/`，核對版本號與 `release/README.md` 步驟。
+4. 若屬新特性 → 同步四份設計/進展文檔（走場景 A 流程）。
 
 **場景 C：新增性能優化**（如 WebGPU 加速）
 1. architecture-design.md §11.5 已是設計內容 → 在進展文檔 X-02 標記進度即可。

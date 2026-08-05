@@ -174,6 +174,8 @@ src/
 ```
 
 > **構建打包**：`scripts/build.mjs` 用 esbuild 對 4 個 runtime 入口 bundle。MV3 content script 不支持 `import` 語句，故 content-script/options/popup 打包為 **IIFE**；service-worker 聲明為 module 型（manifest `"type":"module"`），打包為 **ESM**。`scripts/copy-static.mjs` 拷貝 manifest 與頁面 HTML；`TEST_PROFILE=1` 時向 dist manifest 追加 `localhost` match 供 E2E 加載擴充（生產構建保持乾淨）。
+>
+> **發布件**：`scripts/package-release.mjs`（`npm run release`）在生產構建基礎上，把 `dist/` 中運行必需文件拷入 `release/ai-trans-extension/`（剔除 `.js.map` 與 `.d.ts`、移除 sourcemap 引用註釋），並生成 `release/ai-trans-extension-v<version>.zip`。用戶通過瀏覽器「加載已解壓的擴充程序」選擇該目錄即可使用（三平台一致）。發布件版本須與 `package.json` 的 `version` 一致，改動用戶可見行為後須重新生成——見 AGENTS.md §2 一致性規則。
 
 ### 5.2 模塊職責與依賴方向
 

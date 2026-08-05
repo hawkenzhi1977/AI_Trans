@@ -73,6 +73,7 @@
 | M1-30 | **E2E 擴充加載範式**：Playwright `launchPersistentContext` + `ignoreDefaultArgs:['--disable-extensions']` + `channel:'chromium'` 自定義 fixture（chromium.launch 不注入擴充） | P0 | 3 | ✅ 已完成 | `test/e2e/fixtures.ts` |
 | M1-31 | **content-script fetch 綁定修復**：`FetchCaptionSource` 直接調用 `window.fetch` 拋 "Illegal invocation"，構造時 `bind(globalThis)`；baseUrl 相對路徑統一解析絕對 URL | P0 | 4 | ✅ 已完成 | `src/adapters/platform/youtube/platform-adapter.ts` |
 | M1-32 | **可靠性紅線全庫審計與加固**：修復 restart 訂閱洩漏（observePlayback unsubscribe 未保存）、ensureMounted MutationObserver 洩漏+永久懸掛（加 handle+15s 超時）、`platforms[0]?` 靜默失敗改顯式判空發降級、LLM 默認 fetch 綁定 globalThis、YT `script:not([src])` 誤匹配+JSON.parse 未捕獲、translateStream 無 fallback、overlay cssText 改 setProperty、escapeHtml 補單引號、options showStatus 去抖 | P0 | 5 | ✅ 已完成 | `content-script.ts` / `platform-adapter.ts` / `llm-translation.ts` / `translation-pipeline.ts` / `overlay-renderer.ts` / `options.ts` |
+| M1-33 | **發布件與雙語 README**：`npm run release` 生成乾淨未打包擴充 + zip（剔除 sourcemap/.d.ts）；`README.md`/`README.zh-Hant.md` 描述功能特性（已實現/待實現）與三平台安裝/源碼構建步驟；`release/README.md` 快速安裝說明。文檔一致性規則納入 README/發布件 | P1 | 5 | ✅ 已完成 | `scripts/package-release.mjs` / `release/` / `README*.md` / `AGENTS.md` §2 |
 
 ### 3.2 M2 — 實時擷取 ASR（P1，待完成）
 
