@@ -56,9 +56,30 @@
 
   window.__mockState = () => ({ playing, t });
 
+  // 模擬真實播放器：視頻開始播放時，用 XHR 主動請求字幕軌（與 YouTube 播放器一致）。
+  // 供擴充 MAIN world 攔截器捕獲（M1-43：捕獲 → 複用，擴充自身不再 fetch）。
+  // 註：XHR 請求 /timedtext 由 serve-mock 端點響應（請求計數由服務端暴露）。
+  let captionsRequested = false;
+  function requestCaptions() {
+    if (captionsRequested) return;
+    captionsRequested = true;
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/timedtext?lang=en&v=abc123');
+      xhr.send();
+    } catch (err) {
+      // 請求失敗不影響 mock 播放器本身（僅影響擴充捕獲）。
+      window.__mockCaptionRequestError = String(err);
+    }
+  }
+
   setInterval(() => {
+    const prev = playing;
     if (playing) t += 100;
     render();
+    // 進入播放態時觸發字幕請求（模擬播放器行為）。
+    // 首次（captionsRequested=false）即使一直在播放也觸發，保證 E2E 捕獲鏈路可測。
+    if (playing && (!prev || !captionsRequested)) requestCaptions();
   }, 100);
 
   document.getElementById('btn-play')?.addEventListener('click', () => { playing = true; });

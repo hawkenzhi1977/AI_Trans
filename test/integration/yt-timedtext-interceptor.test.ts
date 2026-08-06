@@ -97,4 +97,88 @@ describe('yt-timedtext-interceptor — XHR 攔截', () => {
     xhr.dispatchEvent(new Event('load'));
     expect(postMessageSpy).not.toHaveBeenCalled();
   });
+
+  it('[M1-43] 匹配 localhost timedtext URL（E2E mock 宿主）', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/timedtext?lang=en&v=abc123');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    expect(postMessageSpy).toHaveBeenCalled();
+    const msg = postMessageSpy.mock.calls[0][0] as { type: string; payload: { url: string } };
+    expect(msg.type).toBe('ai-trans:timedtext-capture');
+    expect(msg.payload.url).toContain('/timedtext');
+  });
+});
+
+describe('yt-timedtext-interceptor — fetch hook（M1-43）', () => {
+  let origFetch: typeof globalThis.fetch;
+  let origOpen: typeof XMLHttpRequest.prototype.open;
+  let origSend: typeof XMLHttpRequest.prototype.send;
+  let postMessageSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    origFetch = globalThis.fetch;
+    origOpen = XMLHttpRequest.prototype.open;
+    origSend = XMLHttpRequest.prototype.send;
+    Reflect.deleteProperty(globalThis, '__aiTransTimedtextInterceptorInstalled');
+    postMessageSpy = vi.spyOn(window, 'postMessage').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+    XMLHttpRequest.prototype.open = origOpen;
+    XMLHttpRequest.prototype.send = origSend;
+    Reflect.deleteProperty(globalThis, '__aiTransTimedtextInterceptorInstalled');
+    postMessageSpy.mockRestore();
+    vi.resetModules();
+  });
+
+  async function loadInterceptor(): Promise<void> {
+    await import('../../src/runtime/yt-timedtext-interceptor?t=' + Date.now());
+  }
+
+  it('hook 後 timedtext fetch 捕獲響應並透傳原響應（不阻塞播放器）', async () => {
+    const bodyText = '{"events":[{"tStartMs":0,"dDurationMs":1000,"segs":[{"utf8":"hi"}]}]}';
+    const fakeRes = {
+      clone: () => fakeRes,
+      text: async () => bodyText,
+      headers: { get: (h: string) => (h === 'content-type' ? 'application/json' : null) },
+    };
+    // 攔截器 install() 時把當前的 globalThis.fetch 綁定為原 fetch；
+    // 因此 install 前先 mock 底層，讓攔截器包裝到它。
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(fakeRes as unknown as Response) as unknown as typeof fetch;
+    await loadInterceptor();
+    const wrapped = globalThis.fetch;
+    // wrapped 應已替換為攔截器包裝（非原 mock）。
+    const result = await wrapped('https://www.youtube.com/api/timedtext?v=abc', {});
+    expect(result).toBe(fakeRes); // 透傳原響應（不阻塞播放器）
+    await vi.waitFor(() => {
+      expect(postMessageSpy).toHaveBeenCalled();
+    });
+    const msg = postMessageSpy.mock.calls[0][0] as { type: string; payload: { url: string; responseText: string } };
+    expect(msg.type).toBe('ai-trans:timedtext-capture');
+    expect(msg.payload.url).toContain('timedtext');
+    expect(msg.payload.responseText).toBe(bodyText);
+  });
+
+  it('非 timedtext fetch 不攔截（原樣透傳）', async () => {
+    const fakeRes = { clone: () => fakeRes, text: async () => 'x', headers: { get: () => null } };
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(fakeRes as unknown as Response) as unknown as typeof fetch;
+    await loadInterceptor();
+    const wrapped = globalThis.fetch;
+    const result = await wrapped('https://www.youtube.com/api/stats/watchtime', {});
+    expect(result).toBe(fakeRes);
+    expect(postMessageSpy).not.toHaveBeenCalled();
+  });
 });

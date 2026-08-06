@@ -56,6 +56,32 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     expect((res.events as unknown[]).length).toBe(4);
   });
 
+  test('[M1-43] 捕獲鏈路：播放器請求被攔截複用，擴充自身不 fetch（pot 繞過）', async ({ page }) => {
+    // 背景：真實 YouTube 的 timedtext 帶 pot 防護，擴充直接 fetch 拿不到字幕。
+    // 修復：MAIN world 攔截器捕獲播放器自身（XHR）的字幕請求，擴充複用該響應。
+    // 驗證：(1) 播放器 XHR 發起的 /timedtext 請求計數 = 1（僅播放器自己發）；
+    //        (2) 擴充字幕正常顯示（說明複用了捕獲響應而非自己 fetch——若擴充也 fetch，
+    //            計數會 ≥ 2）。
+    await page.goto('/with-native-captions.html');
+
+    // 清零計數，避免前序測試（smoke/其他用例）的 timedtext 請求累計干擾。
+    await page.evaluate(() =>
+      fetch('/__mock-caption-request-count/reset').then((r) => r.json())
+    );
+
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+
+    // 字幕文本出現（複用捕獲響應後管線成功）。
+    await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 8_000 });
+
+    // 讀取服務端 timedtext 請求計數：應恰好 1（僅 mock 播放器的 XHR）。
+    // 若擴充自己 fetch，計數會是 2。
+    const { count } = await page.evaluate(() =>
+      fetch('/__mock-caption-request-count').then((r) => r.json() as Promise<{ count: number }>)
+    );
+    expect(count).toBe(1);
+  });
+
   test('暫停後字幕覆蓋層仍掛載', async ({ page }) => {
     await page.goto('/with-native-captions.html');
     await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });

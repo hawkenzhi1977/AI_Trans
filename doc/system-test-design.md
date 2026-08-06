@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用；測試合計 113→139→153）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）；測試合計 113→139→153→164）
 
 ---
 
@@ -383,10 +383,19 @@ jobs:
 - 步驟：
   - A（MAIN world 攔截器 hook）：`open` 匹配 `youtube.com/timedtext` 的 XHR 被打標記；`send` 後 `load` 事件（HTTP 200 + 非空 body）→ `postMessage` 發 `ai-trans:timedtext-capture`；空 body / 非 200 不轉發。hook 用 `apply(this)` 保留實例接收者（§5.1 brand check）；load 監聽器用完自除（§5.4）。
   - B（URL 絕對化）：`open` 收到相對 URL（Mock 站點）時以 `new URL(arg, location.href)` 解析後匹配（§5.2）。
-  - C（消息橋注入/生命周期）：`inject()` 冪等（重複調用只注入一次）且以 `chrome.runtime.getURL('src/runtime/yt-timedtext-interceptor.js')` 創建 `<script data-ai-trans>`；`start()` 註冊 `window.message` 監聽並以 `__aiTrans` 標記過濾外部消息（§5.7）；`getLatest()` 返回最新捕獲；`dispose()` 移除監聽 + 清緩存（§5.4，重複 dispose 安全）。
-  - D（捕獲複用/回退）：`FetchCaptionSource` 注入 `CaptionCaptureProvider` 後，`fetchTracks` **優先複用**捕獲響應（不發網絡請求；srv3/json3 自動識別）；無捕獲值 → 直接 fetch（原有行為）；捕獲為空/解析失敗 → 記 `lastTrackDiagnostic`（§5.6 留痕）並回退 fetch。
-- 預期：捕獲響應優先、無捕獲不變、失敗留痕；攔截器/消息橋無洩漏（dispose 後監聽器清零）。
-- 落點：集成 `test/integration/timedtext-bridge.test.ts`（5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收）、新增 `test/integration/yt-timedtext-interceptor.test.ts`（4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發）、`test/integration/platform-adapter.test.ts`（+5：捕獲複用不發 fetch / 無捕獲回退 fetch / srv3 捕獲 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷）、`test/support/setup-dom.ts`（+`chrome.runtime.getURL` mock）。
+  - C（消息橋注入/生命周期）：`inject()` 冪等（重複調用只注入一次）且以 `chrome.runtime.getURL('src/runtime/yt-timedtext-interceptor.js')` 創建 `<script data-ai-trans>`；`start()` 冪等（先 remove 再 add）註冊 `window.message` 監聽並以 `__aiTrans` 標記過濾外部消息（§5.7）；`getLatest()` 返回最新捕獲；**`stop()` 移除監聽 + 停輪詢但保留 latest（restart 熱重啟用，M1-43）**；`dispose()` 移除監聽 + 清緩存 + resolve 掛起 waiters（§5.4，重複 dispose 安全）。
+  - D（捕獲複用/回退/等待窗口）：`FetchCaptionSource` 注入 `CaptionCaptureProvider` 後，`fetchTracks` **優先複用**捕獲響應（不發網絡請求；srv3/json3 自動識別）；無捕獲值 → **`waitForCapture(timeoutMs)` 等待捕獲窗口（默認 15,000ms，M1-43）**，捕獲到達直接解析、超時 → 直接 fetch（原有行為）；捕獲為空/解析失敗 → 記 `lastTrackDiagnostic`（§5.6 留痕）並回退 fetch；無 `waitForCapture` 的舊 provider → 直接 fetch。
+- 預期：捕獲響應優先、無捕獲走等待窗口、超時回退不變、失敗留痕；攔截器/消息橋無洩漏（stop/dispose 後監聽器清零、超時 timer 清理）。
+- 落點：集成 `test/integration/timedtext-bridge.test.ts`（11：inject/start 冪等 + getLatest + stop 保留 latest + dispose 清理 + 外部消息過濾 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval）、`test/integration/yt-timedtext-interceptor.test.ts`（7：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發 + **localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截**）、`test/integration/platform-adapter.test.ts`（+8：捕獲複用不發 fetch / 無捕獲回退 fetch / srv3 捕獲 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷 / **等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch**）、`test/support/setup-dom.ts`（+`chrome.runtime.getURL` mock）。
+
+#### TC-F19 捕獲鏈路 E2E（對應 F-01/M1-43，已實裝）
+- 前置：E2E 測試構建（`npm run build:test`，`TEST_PROFILE=1`）向 dist manifest 的 `content_scripts`、`host_permissions`、**`web_accessible_resources.matches`** 追加 `http://localhost:8721/*`（M1-43 修復：WAR 未含 localhost 時 Chrome 拒絕載入 MAIN world 攔截器——"Resources must be listed in the web_accessible_resources manifest key"，捕獲鏈路在 E2E 從未真正運行過）。mock 頁 `with-native-captions.html` 的播放器 `app.js` 用 **XMLHttpRequest**（真實瀏覽器環境）請求 `/timedtext?lang=en&v=abc123`；服務端 `serve-mock.mjs` 提供計數端點 `/__mock-caption-request-count` 與 `/reset`。
+- 步驟：
+  - A：`page.goto('/with-native-captions.html')`；先 `/reset` 清零計數（避免前序測試累計）。
+  - B：覆蓋層 `.ai-trans-overlay` attached 且非空（字幕經捕獲響應 → 解析 → 翻譯 → 渲染全鏈路成功）。
+  - C：讀 `/__mock-caption-request-count` 斷言 `count === 1`——**恰好 1 次**（僅 mock 播放器 XHR）；若擴充自己 fetch `/timedtext`（未複用捕獲），計數會 ≥ 2。
+- 預期：字幕顯示 + 計數 = 1（擴充零 fetch，捕獲複用成立，pot 繞過在真實瀏覽器環境首次被驗證）。
+- 落點：`test/e2e/extension.spec.ts`（+1 捕獲鏈路用例）；配套 `scripts/serve-mock.mjs`（計數/重置端點）、`scripts/copy-static.mjs`（TEST_PROFILE WAR 追加）、`test/fixtures/mock-youtube/app.js`（`requestCaptions()` XHR，首次播放即觸發）。
 
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
@@ -437,7 +446,7 @@ jobs:
 - 步驟：請求 `/timedtext`；讀取 `__mockState` 播放時鐘；暫停/播放控制。
 - 預期：timedtext 返回 4 行 events；時鐘推進/暫停/恢復符合預期（smoke + extension spec 共 5 個宿主基線用例）。
 
-> 已實裝 E2E 共 13 個用例（`test/e2e/smoke.spec.ts` 5 + `test/e2e/extension.spec.ts` 8，含 TC-R3 覆蓋層不累積、TC-R8 storage.onChanged 熱重啟、TC-F11 降級診斷寫入），全綠。TC-E01/02 覆蓋擴充注入與渲染全鏈路，TC-E03 為宿主與端點基線。pot 攔截器（M1-42）的 manifest/web_accessible_resources 完整性由集成測試 `timedtext-bridge.test.ts`（`inject()` 用 `chrome.runtime.getURL` 解析路徑）間接驗證，真實播放器攔截行為待真實 YouTube 登錄環境手動冒煙（M1-27）。
+> 已實裝 E2E 共 14 個用例（`test/e2e/smoke.spec.ts` 5 + `test/e2e/extension.spec.ts` 9，含 TC-R3 覆蓋層不累積、TC-R8 storage.onChanged 熱重啟、TC-F11 降級診斷寫入、**TC-F19 捕獲鏈路**），全綠。TC-E01/02 覆蓋擴充注入與渲染全鏈路，TC-E03 為宿主與端點基線。pot 攔截器（M1-42/43）的 manifest/web_accessible_resources 完整性由集成測試 `timedtext-bridge.test.ts`（`inject()` 用 `chrome.runtime.getURL` 解析路徑）+ **TC-F19 捕獲鏈路 E2E**（WAR 追加 localhost 後，MAIN world 攔截器在真實瀏覽器首次真正運行，請求計數 = 1）驗證；真實播放器攔截行為待真實 YouTube 登錄環境手動冒煙（M1-27）。
 
 #### TC-R 可靠性紅線回歸（對應 AGENTS.md §5 / architecture §7.1，已實裝）
 
@@ -457,7 +466,7 @@ jobs:
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
 | TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 153（單元 51 + 契約 11 + 集成 78 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。
+> 全部測試合計 164（單元 51 + 契約 11 + 集成 90 + E2E 14）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。新增（TC-F19 捕獲鏈路 + M1-43 捕獲時序修復）：集成 +11（`timedtext-bridge.test.ts` +6：stop 保留 latest + start 冪等 + inject 冪等 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval；`yt-timedtext-interceptor.test.ts` +2：localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截；`platform-adapter.test.ts` +3：等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch）、E2E +1（TC-F19 捕獲鏈路：WAR 追加 localhost 後斷言 mock 播放器請求計數 = 1、擴充零 fetch）。
 >
 > **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
@@ -503,6 +512,8 @@ jobs:
 | TC-F15 | F-11 | 單元（已實裝） |
 | TC-F16 | F-01 | 契約/集成（已實裝） |
 | TC-F17 | F-11 | 單元/集成/契約（已實裝） |
+| TC-F18 | F-01 | 集成（已實裝） |
+| TC-F19 | F-01 | 集成/E2E（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |

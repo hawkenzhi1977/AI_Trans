@@ -16,12 +16,33 @@ const MIME = {
 
 const PORT = Number(process.env.MOCK_PORT ?? 8721);
 
+// timedtext 請求計數：供 E2E 斷言「播放器請求 1 次、擴充未再 fetch」（M1-43 捕獲複用）。
+let timedtextRequestCount = 0;
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
   let pathname = url.pathname;
 
+  // 請求計數端點：返回 timedtext 請求總次數（供 E2E 讀取）。
+  if (pathname === '/__mock-caption-request-count') {
+    const body = JSON.stringify({ count: timedtextRequestCount });
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+
+  // 計數重置端點：供 E2E 在斷言前清零，避免跨測試累計干擾。
+  if (pathname === '/__mock-caption-request-count/reset') {
+    timedtextRequestCount = 0;
+    const body = JSON.stringify({ count: 0 });
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+
   // timedtext 字幕端點：返回固定 JSON 字幕（與 app.js LINES 一致，供擴充抓取）。
   if (pathname === '/timedtext') {
+    timedtextRequestCount += 1;
     const lines = [
       'Hello and welcome',
       'This is the second line',

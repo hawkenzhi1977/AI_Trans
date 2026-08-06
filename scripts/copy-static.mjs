@@ -33,6 +33,14 @@ if (process.env.TEST_PROFILE === '1') {
     ...new Set([...(manifest.host_permissions ?? []), TEST_MATCH]),
   ];
 
+  // M1-43：MAIN world 攔截器腳本（web_accessible_resources）在 mock 頁面
+  // 也需可加載，否則 E2E 中 content-script 注入 <script> 被 Chrome 拒絕
+  // （"Resources must be listed in the web_accessible_resources manifest key"），
+  // 捕獲鏈路在 E2E 從未真正工作過（測試盲區）。向每個 WAR 條目的 matches 追加 mock 匹配。
+  for (const war of manifest.web_accessible_resources ?? []) {
+    war.matches = [...new Set([...(war.matches ?? []), TEST_MATCH])];
+  }
+
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
   console.log('[build] TEST_PROFILE=1: injected localhost mock match into dist/manifest.json');
 }

@@ -27,9 +27,22 @@ export interface CaptionSource {
  * fetch 無 pot 的 baseUrl 只拿到空響應。播放器自身的 XHR 帶 pot 能成功——本接口讓
  * FetchCaptionSource 優先複用播放器已成功的響應，繞過 pot 生成。
  */
+/** 捕獲響應的結構（供複用解析）。 */
+export interface CapturedTimedText {
+  url: string;
+  responseText: string;
+  contentType: string;
+}
+
 export interface CaptionCaptureProvider {
   /** 最近一次捕獲的 timedtext 響應；無捕獲時返回 null（回退到直接 fetch）。 */
-  getLatest(): { url: string; responseText: string; contentType: string } | null;
+  getLatest(): CapturedTimedText | null;
+  /**
+   * 等待捕獲值就緒（M1-43）。播放器的 timedtext 請求在「視頻已播放」時才發出，
+   * fetchTracks 可能早於播放器請求運行——此時等待播放器發請求並捕獲。
+   * 超時返回 null（由調用方回退直接 fetch）。
+   */
+  waitForCapture?(timeoutMs: number): Promise<CapturedTimedText | null>;
 }
 
 /** 基於 fetch 的默認字幕數據源。 */
@@ -37,18 +50,22 @@ export class FetchCaptionSource implements CaptionSource {
   private readonly doc: Document;
   private readonly fetchFn: typeof fetch;
   private readonly captureProvider: CaptionCaptureProvider | undefined;
+  /** 等待播放器捕獲響應的超時（毫秒）：視頻播放後播放器才發 timedtext 請求（M1-43）。 */
+  private readonly waitForCaptureTimeoutMs: number;
   private lastTrackDiagnostic: string | undefined;
 
   constructor(
     doc: Document = globalThis.document,
     fetchFn: typeof fetch = globalThis.fetch,
-    captureProvider?: CaptionCaptureProvider
+    captureProvider?: CaptionCaptureProvider,
+    waitForCaptureTimeoutMs: number = 15_000
   ) {
     this.doc = doc;
     // 綁定至 window：content-script 中直接調用未綁定的 window.fetch 會拋
     // "Illegal invocation"（fetch 需以 window 為接收者）。
     this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
     this.captureProvider = captureProvider;
+    this.waitForCaptureTimeoutMs = waitForCaptureTimeoutMs;
   }
 
   getLastTrackDiagnostic(): string | undefined {
@@ -128,6 +145,13 @@ export class FetchCaptionSource implements CaptionSource {
     // §5.6：複用失敗（解析出錯）不靜默——記診斷後仍回退到直接 fetch，兩條路徑都留痕。
     const reused = this.tryReuseCapture(lang);
     if (reused) return reused;
+
+    // M1-43：無捕獲值時，等待播放器發出 timedtext 請求並被攔截器捕獲。
+    // 播放器在「視頻已播放」時才發字幕請求，而 fetchTracks 可能在播放前運行——
+    // 給播放器一個窗口（waitForCaptureTimeoutMs）等待捕獲，命中則複用（繞過 pot），
+    // 超時才回退直接 fetch（保留原有行為與診斷）。
+    const waited = await this.waitForCaptureReuse(lang);
+    if (waited) return waited;
 
     // §5.6：網絡層失敗（DNS/CORS/mixed-content/斷網）與 HTTP 非 2xx、body 解析失敗
     // 要**可區分**——統一記入 lastTrackDiagnostic 並攜帶實際證據（status/content-type/片段），
@@ -210,6 +234,43 @@ export class FetchCaptionSource implements CaptionSource {
       this.lastTrackDiagnostic =
         `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)}` +
         ` (content-type: ${contentType}, url: ${url})`;
+      return undefined;
+    }
+  }
+
+  /**
+   * 等待播放器捕獲響應後複用（M1-43）。
+   * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
+   */
+  private async waitForCaptureReuse(lang: string): Promise<SubtitleSegment[] | undefined> {
+    if (!this.captureProvider?.waitForCapture) return undefined;
+    let capture;
+    try {
+      capture = await this.captureProvider.waitForCapture(this.waitForCaptureTimeoutMs);
+    } catch {
+      // §5.6：等待過程異常不靜默——記診斷後回退直接 fetch。
+      this.lastTrackDiagnostic = `timedtext capture wait failed`;
+      return undefined;
+    }
+    if (!capture || !capture.responseText) {
+      // §5.6：等待窗口內未捕獲到（播放器未發請求/請求未命中）不靜默——記診斷後回退直接 fetch，
+      // 與「捕獲解析失敗」可區分。
+      this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) — fall back to direct fetch`;
+      return undefined;
+    }
+    // 用等待到的捕獲值直接解析（不依賴 getLatest——waitForCapture 的返回值即捕獲）。
+    try {
+      const segments = parseTimedText(capture.responseText, lang);
+      if (segments.length > 0) {
+        this.lastTrackDiagnostic = `reused player timedtext capture after wait (url: ${capture.url})`;
+        return segments;
+      }
+      this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${capture.contentType}, url: ${capture.url})`;
+      return undefined;
+    } catch (err) {
+      this.lastTrackDiagnostic =
+        `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)}` +
+        ` (content-type: ${capture.contentType}, url: ${capture.url})`;
       return undefined;
     }
   }

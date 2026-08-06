@@ -66,12 +66,13 @@ class SubtitleController {
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
   async start(): Promise<void> {
-    await this.ensureMounted();
-
-    // MAIN world 攔截器：hook 播放器 XHR 捕獲 timedtext 響應（含 pot）。
-    // 必須在字幕管線請求前注入並啟動監聽，否則播放器先發請求時捕獲會漏。
+    // MAIN world 攔截器：hook 播放器 XHR/fetch 捕獲 timedtext 響應（含 pot）。
+    // 必須在字幕管線請求前注入並啟動監聽，否則播放器先發請求時捕獲會漏；
+    // 提前到 ensureMounted 之前，讓攔截器儘早安裝（M1-43）。
     this.bridge.inject();
     this.bridge.start();
+
+    await this.ensureMounted();
 
     // 測試環境（localhost Mock 站點）放寬平台匹配規則，使 YouTube 適配器接管 mock 頁。
     const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
@@ -132,8 +133,9 @@ class SubtitleController {
     // R4：解除本控制器持有的 observePlayback 訂閱（Orchestrator 內另有一份自行清理）。
     this.unsubscribePlayback?.();
     this.unsubscribePlayback = null;
-    // R4：解除 MAIN world 攔截橋的消息監聽，清空捕獲緩存（restart/SPA 導航防累積）。
-    this.bridge.dispose();
+    // R4：暫停 MAIN world 攔截橋的消息監聽與輪詢，但**保留 latest 捕獲緩存**
+    // （restart 熱重載後字幕已加載的播放器不會再發請求，丟緩存會永久回退 fetch）。
+    this.bridge.stop();
     this.orchestrator?.stop();
     this.orchestrator = null;
     this.renderer.unmount();
@@ -144,6 +146,8 @@ class SubtitleController {
   /** 徹底銷毀：解除配置訂閱（頁面卸載/SPA 導航離開時調用）。 */
   dispose(): void {
     this.stop();
+    // R4：真正銷毀時才清空捕獲緩存（stop 保留，dispose 清空）。
+    this.bridge.dispose();
     this.unsubscribeConfig?.();
     this.unsubscribeConfig = null;
   }

@@ -178,7 +178,17 @@
 - **根因**: 捕獲的響應非字幕內容（可能是其他 timedtext 請求的響應，如自動翻譯軌/預覽）；pot 防護對「捕獲響應複用」不適用但響應本身異常
 - **用戶響應**: 無需操作——擴充已自動回退直接 fetch（若直接 fetch 亦被 pot 攔截，診斷會轉為 timedtext XML: parse error）
 - **開發者響應**: 檢查捕獲內容為何解析失敗；確認攔截器是否過濾了非目標字幕響應
-- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`tryReuseCapture`）;src/runtime/timedtext-bridge.ts;src/runtime/yt-timedtext-interceptor.ts
+- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`tryReuseCapture`/`waitForCaptureReuse`）;src/runtime/timedtext-bridge.ts;src/runtime/yt-timedtext-interceptor.ts
+
+### 2.13 Timedtext 捕獲等待超時回退（M1-43）
+
+- **診斷碼**: timedtext capture wait timeout (<<ms>> ms) — fall back to direct fetch
+- **用戶可見消息**: 最近失敗: 錯誤: Error: timedtext capture wait timeout (15000 ms) — fall back to direct fetch (<timestamp>)
+- **觸發條件**: `FetchCaptionSource.fetchTracks` 進入 `waitForCapture` 等待窗口（默認 15,000ms）但播放器始終未發出可捕獲的 timedtext 請求（或請求未帶 pot/未成功），超時後回退直接 fetch
+- **根因**: 攔截器注入時序錯誤（播放器請求早於注入被漏）；播放器未開字幕（無 timedtext 請求）；`isTimedText` 未匹配播放器實際請求 URL；播放器使用未被 hook 的請求路徑
+- **用戶響應**: 無需操作——擴充自動回退直接 fetch（無 pot 時極可能再現 `timedtext XML: parse error` 空 body 診斷，說明 pot 防護仍在生效）
+- **開發者響應**: 確認 content-script `start()` 第一行已 `bridge.inject()`（早於任何 await）；`waitForCapture` 超時 timer 是否被清理（§5.4）；播放器實際請求的 timedtext URL 是否命中 `isTimedText`（XHR + fetch 雙 hook 均裝）
+- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`waitForCaptureReuse`/`waitForCaptureTimeoutMs`）;src/runtime/timedtext-bridge.ts（`waitForCapture`）;src/runtime/yt-timedtext-interceptor.ts（`isTimedText`）;src/runtime/content-script.ts（inject 提前）
 
 
 ---

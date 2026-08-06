@@ -357,4 +357,54 @@ describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
     const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
     expect(segs[0].sourceText).toBe('fetched');
   });
+
+  it('[M1-43] 無捕獲值 → 等待播放器捕獲後複用（不發 fetch）', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"events":[]}',
+    }) as Response);
+    const captured = { url: 'https://www.youtube.com/api/timedtext?v=abc', responseText: validJson, contentType: 'application/json' };
+    const provider = {
+      getLatest: vi.fn(() => null), // 首次無捕獲
+      waitForCapture: vi.fn(async () => captured), // 等待後捕獲到
+    };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs).toHaveLength(2);
+    expect(segs[0].sourceText).toBe('captured');
+    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000);
+    expect(fetchFn).not.toHaveBeenCalled(); // 複用捕獲，未直接 fetch
+  });
+
+  it('[M1-43] 等待超時（播放器無字幕/未播放）→ 回退直接 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    const provider = {
+      getLatest: vi.fn(() => null),
+      waitForCapture: vi.fn(async () => null), // 超時無捕獲
+    };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('fetched');
+    expect(fetchFn).toHaveBeenCalledOnce();
+    // §5.6：等待超時必須留痕（與「捕獲解析失敗」可區分），回退原因對用戶可見。
+    expect(src.getLastTrackDiagnostic()).toContain('timedtext capture wait timeout');
+  });
+
+  it('[M1-43] provider 無 waitForCapture（舊實現）→ 不等待直接 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    const provider = { getLatest: vi.fn(() => null) }; // 僅 getLatest，無 waitForCapture
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('fetched');
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
 });

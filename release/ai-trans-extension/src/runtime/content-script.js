@@ -449,11 +449,14 @@
     doc;
     fetchFn;
     captureProvider;
+    /** 等待播放器捕獲響應的超時（毫秒）：視頻播放後播放器才發 timedtext 請求（M1-43）。 */
+    waitForCaptureTimeoutMs;
     lastTrackDiagnostic;
-    constructor(doc = globalThis.document, fetchFn = globalThis.fetch, captureProvider) {
+    constructor(doc = globalThis.document, fetchFn = globalThis.fetch, captureProvider, waitForCaptureTimeoutMs = 15e3) {
       this.doc = doc;
       this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
       this.captureProvider = captureProvider;
+      this.waitForCaptureTimeoutMs = waitForCaptureTimeoutMs;
     }
     getLastTrackDiagnostic() {
       return this.lastTrackDiagnostic;
@@ -509,6 +512,8 @@
       const finalUrl = this.withJson3Format(url);
       const reused = this.tryReuseCapture(lang);
       if (reused) return reused;
+      const waited = await this.waitForCaptureReuse(lang);
+      if (waited) return waited;
       let res;
       try {
         res = await this.fetchFn(finalUrl, { credentials: "include" });
@@ -573,6 +578,36 @@
         return void 0;
       } catch (err) {
         this.lastTrackDiagnostic = `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)} (content-type: ${contentType}, url: ${url})`;
+        return void 0;
+      }
+    }
+    /**
+     * 等待播放器捕獲響應後複用（M1-43）。
+     * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
+     */
+    async waitForCaptureReuse(lang) {
+      if (!this.captureProvider?.waitForCapture) return void 0;
+      let capture;
+      try {
+        capture = await this.captureProvider.waitForCapture(this.waitForCaptureTimeoutMs);
+      } catch {
+        this.lastTrackDiagnostic = `timedtext capture wait failed`;
+        return void 0;
+      }
+      if (!capture || !capture.responseText) {
+        this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) \u2014 fall back to direct fetch`;
+        return void 0;
+      }
+      try {
+        const segments = parseTimedText(capture.responseText, lang);
+        if (segments.length > 0) {
+          this.lastTrackDiagnostic = `reused player timedtext capture after wait (url: ${capture.url})`;
+          return segments;
+        }
+        this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${capture.contentType}, url: ${capture.url})`;
+        return void 0;
+      } catch (err) {
+        this.lastTrackDiagnostic = `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)} (content-type: ${capture.contentType}, url: ${capture.url})`;
         return void 0;
       }
     }
@@ -993,10 +1028,15 @@
   // src/runtime/timedtext-bridge.ts
   var INTERCEPTOR_SCRIPT_URL = "src/runtime/yt-timedtext-interceptor.js";
   var CAPTURE_EVENT = "ai-trans:timedtext-capture";
+  var POLL_INTERVAL_MS = 2e3;
+  var VIDEO_SELECTOR = "video.html5-main-video, #mock-player video";
   var TimedTextBridge = class {
     latest = null;
     onMessageBound;
     injected = false;
+    pollTimer = null;
+    /** 等待捕獲的 Promise 解析器隊列（waitForCapture 多路等待）。 */
+    waiters = /* @__PURE__ */ new Set();
     constructor() {
       this.onMessageBound = this.onMessage.bind(this);
     }
@@ -1010,18 +1050,74 @@
       script.dataset.aiTrans = "timedtext-interceptor";
       (document.head ?? document.documentElement).appendChild(script);
     }
-    /** 啟動監聽；在 content-script 註冊消息接收（與注入配合）。 */
+    /** 啟動監聽 + 輪詢器；重複調用安全（先清理再重建）。 */
     start() {
+      globalThis.removeEventListener("message", this.onMessageBound);
       globalThis.addEventListener("message", this.onMessageBound);
+      this.ensurePolling();
+    }
+    /**
+     * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
+     * 已在途的捕獲（latest 就緒）立即返回；否則掛起等待 message 事件或輪詢通知。
+     * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
+     */
+    waitForCapture(timeoutMs) {
+      const current = this.latest;
+      if (current) return Promise.resolve(current);
+      return new Promise((resolve) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          this.waiters.delete(onCapture);
+          this.pollTimer = null;
+          resolve(null);
+        }, timeoutMs);
+        const onCapture = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.waiters.delete(onCapture);
+          resolve(this.latest);
+        };
+        this.waiters.add(onCapture);
+        if (this.latest) onCapture();
+      });
     }
     /** 最新捕獲的 timedtext 響應；無則 null。 */
     getLatest() {
       return this.latest;
     }
-    /** 移除監聽（R4：註冊必配解除）。 */
-    dispose() {
+    /** 停止監聽與輪詢，但保留 latest 緩存（restart 熱重載時不丟已捕獲響應）。 */
+    stop() {
       globalThis.removeEventListener("message", this.onMessageBound);
+      if (this.pollTimer !== null) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = null;
+      }
+    }
+    /** 徹底銷毀：移除監聽 + 停輪詢 + 清空 latest 與等待者。 */
+    dispose() {
+      this.stop();
       this.latest = null;
+      for (const w of this.waiters) w();
+      this.waiters.clear();
+    }
+    /** 啟動 2s 輪詢（僅一份；探查播放狀態以維持捕獲通道活性）。 */
+    ensurePolling() {
+      if (this.pollTimer !== null) return;
+      this.pollTimer = setInterval(() => {
+        const video = document.querySelector(VIDEO_SELECTOR);
+        const isPlaying = !!video && !video.paused && !video.ended && video.currentTime > 0;
+        void isPlaying;
+        this.notifyWaiters();
+      }, POLL_INTERVAL_MS);
+    }
+    /** 通知所有 waitForCapture 等待者檢查最新值。 */
+    notifyWaiters() {
+      if (this.latest) {
+        for (const w of Array.from(this.waiters)) w();
+      }
     }
     onMessage(event) {
       const data = event.data;
@@ -1030,6 +1126,7 @@
         const payload = data.payload;
         if (!payload || typeof payload.url !== "string" || typeof payload.responseText !== "string") return;
         this.latest = payload;
+        this.notifyWaiters();
       }
     }
   };
@@ -1078,9 +1175,9 @@
     mountWaitTimer = null;
     /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
     async start() {
-      await this.ensureMounted();
       this.bridge.inject();
       this.bridge.start();
+      await this.ensureMounted();
       const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
       const platformWatchRe = isMockHost ? /^https?:\/\/localhost(:\d+)?\// : void 0;
       const registry = await buildDefaultRegistry(this.config, {
@@ -1127,7 +1224,7 @@
       }
       this.unsubscribePlayback?.();
       this.unsubscribePlayback = null;
-      this.bridge.dispose();
+      this.bridge.stop();
       this.orchestrator?.stop();
       this.orchestrator = null;
       this.renderer.unmount();
@@ -1137,6 +1234,7 @@
     /** 徹底銷毀：解除配置訂閱（頁面卸載/SPA 導航離開時調用）。 */
     dispose() {
       this.stop();
+      this.bridge.dispose();
       this.unsubscribeConfig?.();
       this.unsubscribeConfig = null;
     }
