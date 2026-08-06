@@ -89,8 +89,18 @@ export class LLMTranslationProvider implements TranslationProvider {
         choices?: Array<{ message?: { content?: string } }>;
       };
     } catch (err) {
+      // §5.6：body 讀取失敗與 JSON 解析失敗是兩種不同的失敗，必須區分——
+      // 連接中斷（`Failed to fetch`，HTTP 頭已收到但 body 流被中止，常見於本地
+      // 服務發 200 後即斷連/推理異常）與「響應非 JSON」（真正返回了 HTML/文本）。
+      // 誤報「not valid JSON」會誤導用戶去查模型/格式，實際是網絡層問題。
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/Failed to fetch|NetworkError|network error/i.test(msg)) {
+        throw new Error(
+          `LLM translation response body read failed (connection lost): ${msg}`
+        );
+      }
       throw new Error(
-        `LLM translation response is not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+        `LLM translation response is not valid JSON: ${msg}`
       );
     }
     const choice = data.choices?.[0];

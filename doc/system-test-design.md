@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）；測試合計 113→139→153→164）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）；測試合計 113→139→153→164→168）
 
 ---
 
@@ -397,6 +397,14 @@ jobs:
 - 預期：字幕顯示 + 計數 = 1（擴充零 fetch，捕獲複用成立，pot 繞過在真實瀏覽器環境首次被驗證）。
 - 落點：`test/e2e/extension.spec.ts`（+1 捕獲鏈路用例）；配套 `scripts/serve-mock.mjs`（計數/重置端點）、`scripts/copy-static.mjs`（TEST_PROFILE WAR 追加）、`test/fixtures/mock-youtube/app.js`（`requestCaptions()` XHR，首次播放即觸發）。
 
+#### TC-F20 LLM body 讀取失敗與非 JSON 區分（對應 F-11/M1-44，已實裝）
+- 前置：真實環境中 `LLMTranslationProvider.translate` 的 `res.json()` 在 body 流讀取階段拋 `TypeError: Failed to fetch`（HTTP 200 頭已收到、body 傳輸被中止，常見於本地模型服務推理異常/超時後斷連），原誤報「response is not valid JSON」誤導用戶排查格式。
+- 步驟：
+  - A（連接中斷）：mock fetch 返回 `{ok:true, status:200}`，`res.json()` 拋 `TypeError('Failed to fetch')` → 錯誤含「response body read failed (connection lost)」，且**不含**「not valid JSON」。
+  - B（真解析失敗）：`res.json()` 拋 `SyntaxError('Unexpected token <…')` → 錯誤仍含「response is not valid JSON」，且**不含**「connection lost」（兩種失敗互不誤報）。
+- 預期：網絡層連接中斷與格式層解析失敗可區分，popup「最近失敗」能告訴用戶正確原因。
+- 落點：單元 `test/unit/llm-translation.test.ts`（+2）。
+
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
 - 步驟：
@@ -466,7 +474,7 @@ jobs:
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
 | TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 164（單元 51 + 契約 11 + 集成 90 + E2E 14）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。新增（TC-F19 捕獲鏈路 + M1-43 捕獲時序修復）：集成 +11（`timedtext-bridge.test.ts` +6：stop 保留 latest + start 冪等 + inject 冪等 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval；`yt-timedtext-interceptor.test.ts` +2：localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截；`platform-adapter.test.ts` +3：等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch）、E2E +1（TC-F19 捕獲鏈路：WAR 追加 localhost 後斷言 mock 播放器請求計數 = 1、擴充零 fetch）。
+> 全部測試合計 168（單元 53 + 契約 11 + 集成 90 + E2E 14）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。新增（TC-F19 捕獲鏈路 + M1-43 捕獲時序修復）：集成 +11（`timedtext-bridge.test.ts` +6：stop 保留 latest + start 冪等 + inject 冪等 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval；`yt-timedtext-interceptor.test.ts` +2：localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截；`platform-adapter.test.ts` +3：等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch）、E2E +1（TC-F19 捕獲鏈路：WAR 追加 localhost 後斷言 mock 播放器請求計數 = 1、擴充零 fetch）。新增（TC-F20 LLM body 讀取失敗與非 JSON 區分，M1-44）：單元 +2（`llm-translation.test.ts`：res.json() 拋 `TypeError('Failed to fetch')` → 「connection lost」且不含 not-valid-JSON；拋 `SyntaxError` → 仍報 not-valid-JSON 且不含 connection lost）。
 >
 > **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
@@ -514,6 +522,7 @@ jobs:
 | TC-F17 | F-11 | 單元/集成/契約（已實裝） |
 | TC-F18 | F-01 | 集成（已實裝） |
 | TC-F19 | F-01 | 集成/E2E（已實裝） |
+| TC-F20 | F-11 | 單元（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |

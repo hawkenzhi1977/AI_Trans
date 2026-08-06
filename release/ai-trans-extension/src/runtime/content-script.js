@@ -749,8 +749,14 @@
       try {
         data = await res.json();
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/Failed to fetch|NetworkError|network error/i.test(msg)) {
+          throw new Error(
+            `LLM translation response body read failed (connection lost): ${msg}`
+          );
+        }
         throw new Error(
-          `LLM translation response is not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+          `LLM translation response is not valid JSON: ${msg}`
         );
       }
       const choice = data.choices?.[0];

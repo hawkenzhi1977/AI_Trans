@@ -293,11 +293,21 @@
 
 - **診斷碼**: LLM translation response is not valid JSON: <錯誤>
 - **用戶可見消息**: 最近失敗: 錯誤: Error: LLM translation response is not valid JSON: <錯誤> (<timestamp>)
-- **觸發條件**: res.json() 拋錯(響應為 HTML 錯誤頁或純文本)
+- **觸發條件**: res.json() 拋出**語法錯誤**（`SyntaxError`，響應為 HTML 錯誤頁或純文本）
 - **根因**: 本地服務返回 HTML 錯誤頁;代理返回非 JSON 響應
 - **用戶響應**: 檢查端點是否正確;確認服務器狀態
 - **開發者響應**: 檢查響應內容;確認端點正規化
-- **代碼落點**: src/adapters/translation/llm-translation.ts:87-95
+- **代碼落點**: src/adapters/translation/llm-translation.ts:87-107
+
+### 4.7.1 LLM 翻譯響應 body 讀取失敗（連接中斷）
+
+- **診斷碼**: LLM translation response body read failed (connection lost): <錯誤>
+- **用戶可見消息**: 最近失敗: 錯誤: Error: LLM translation response body read failed (connection lost): <錯誤> (<timestamp>)
+- **觸發條件**: res.json() 拋出 `TypeError: Failed to fetch`（HTTP 響應頭已收到、200 已返回，但 body 流在傳輸中被中止/重置）
+- **根因**: 本地模型服務在發送 200 響應頭後、body 傳輸中途斷連（推理異常/超時關閉連接）；代理/VPN 中斷；服務器主動重置
+- **用戶響應**: 檢查本地模型服務進程是否正常、是否超時；重試；考慮調大 timeoutMs
+- **開發者響應**: 與「響應非 JSON」區分——`Failed to fetch` 是網絡層連接中斷，非格式問題；檢查服務端日誌的推理/斷連原因
+- **代碼落點**: src/adapters/translation/llm-translation.ts:87-107
 
 ### 4.8 LLM 翻譯響應無有效 choices
 

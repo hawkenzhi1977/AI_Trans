@@ -180,6 +180,49 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
     await expect(provider.translate(req())).rejects.toThrow(/response is not valid JSON/);
   });
 
+  it('HTTP 200 但 body 讀取拋 Failed to fetch（連接中斷）→ 拋「connection lost」而非誤報「not valid JSON」', async () => {
+    // 真實場景：本地模型服務發完 200 響應頭後連接被重置/中斷，res.json() 讀 body 流時
+    // 拋 TypeError: Failed to fetch——這與「響應非 JSON」是不同失敗，必須區分診斷，
+    // 否則用戶會誤以為是格式問題（§5.6 證據化 + 不誤導）。
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new TypeError('Failed to fetch');
+      },
+    }) as Response);
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await expect(provider.translate(req())).rejects.toThrow(
+      /response body read failed \(connection lost\): Failed to fetch/
+    );
+    await expect(provider.translate(req())).rejects.not.toThrow(/not valid JSON/);
+  });
+
+  it('HTTP 200 但 body 讀取拋非 JSON 語法錯誤 → 仍報「not valid JSON」', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError('Unexpected token < in JSON at position 0');
+      },
+    }) as Response);
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await expect(provider.translate(req())).rejects.toThrow(/response is not valid JSON/);
+    await expect(provider.translate(req())).rejects.not.toThrow(/connection lost/);
+  });
+
   it('HTTP 200 但 choices 缺失（限流返回 {error}）→ 拋錯走降級而非靜默回退原文', async () => {
     const fetchFn = vi.fn(async () => okResponse({ error: { message: 'rate limited' } }));
     const provider = new LLMTranslationProvider({
