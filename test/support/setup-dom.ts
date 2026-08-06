@@ -26,6 +26,7 @@ const chromeMock = {
     },
   },
   runtime: {
+    getURL: vi.fn((path: string) => `chrome-extension://fake/${path}`),
     onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
     sendMessage: vi.fn(),
     lastError: undefined,

@@ -5,6 +5,7 @@ import { buildDefaultRegistry } from './composition';
 import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store';
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
+import { TimedTextBridge } from './timedtext-bridge';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
 import type { EngineConfig } from '../domain/models/config';
@@ -25,6 +26,8 @@ class SubtitleController {
   private orchestrator: Orchestrator | null = null;
   private rafId = 0;
   private readonly url: string;
+  // MAIN world 播放器 timedtext 響應攔截橋：捕獲播放器真實請求（含 pot），供字幕管線複用。
+  private readonly bridge = new TimedTextBridge();
   // R4：所有需解除的訂閱句柄，restart/stop 前必須全部清理，避免線性累積。
   private unsubscribePlayback: (() => void) | null = null;
   private unsubscribeConfig: (() => void) | null = null;
@@ -65,6 +68,11 @@ class SubtitleController {
   async start(): Promise<void> {
     await this.ensureMounted();
 
+    // MAIN world 攔截器：hook 播放器 XHR 捕獲 timedtext 響應（含 pot）。
+    // 必須在字幕管線請求前注入並啟動監聽，否則播放器先發請求時捕獲會漏。
+    this.bridge.inject();
+    this.bridge.start();
+
     // 測試環境（localhost Mock 站點）放寬平台匹配規則，使 YouTube 適配器接管 mock 頁。
     const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
     const platformWatchRe = isMockHost
@@ -74,6 +82,7 @@ class SubtitleController {
     const registry = await buildDefaultRegistry(this.config, {
       apiKeyStore: store,
       platformWatchRe,
+      captionCaptureProvider: this.bridge,
     });
     this.orchestrator = new Orchestrator(
       { registry, getConfig: () => store.get(), enableAsr: false },
@@ -123,6 +132,8 @@ class SubtitleController {
     // R4：解除本控制器持有的 observePlayback 訂閱（Orchestrator 內另有一份自行清理）。
     this.unsubscribePlayback?.();
     this.unsubscribePlayback = null;
+    // R4：解除 MAIN world 攔截橋的消息監聽，清空捕獲緩存（restart/SPA 導航防累積）。
+    this.bridge.dispose();
     this.orchestrator?.stop();
     this.orchestrator = null;
     this.renderer.unmount();

@@ -448,10 +448,12 @@
   var FetchCaptionSource = class {
     doc;
     fetchFn;
+    captureProvider;
     lastTrackDiagnostic;
-    constructor(doc = globalThis.document, fetchFn = globalThis.fetch) {
+    constructor(doc = globalThis.document, fetchFn = globalThis.fetch, captureProvider) {
       this.doc = doc;
       this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
+      this.captureProvider = captureProvider;
     }
     getLastTrackDiagnostic() {
       return this.lastTrackDiagnostic;
@@ -505,6 +507,8 @@
         );
       }
       const finalUrl = this.withJson3Format(url);
+      const reused = this.tryReuseCapture(lang);
+      if (reused) return reused;
       let res;
       try {
         res = await this.fetchFn(finalUrl, { credentials: "include" });
@@ -547,6 +551,29 @@
         throw new Error(
           `timedtext URL parse failed in withJson3Format: ${err instanceof Error ? err.message : String(err)}`
         );
+      }
+    }
+    /**
+     * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
+     * - 有捕獲值且響應非空 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
+     * - 無捕獲值 → 返回 undefined（走直接 fetch）。
+     */
+    tryReuseCapture(lang) {
+      if (!this.captureProvider) return void 0;
+      const capture = this.captureProvider.getLatest();
+      if (!capture || !capture.responseText) return void 0;
+      const { url, responseText, contentType } = capture;
+      try {
+        const segments = parseTimedText(responseText, lang);
+        if (segments.length > 0) {
+          this.lastTrackDiagnostic = `reused player timedtext capture (url: ${url})`;
+          return segments;
+        }
+        this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${contentType}, url: ${url})`;
+        return void 0;
+      } catch (err) {
+        this.lastTrackDiagnostic = `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)} (content-type: ${contentType}, url: ${url})`;
+        return void 0;
       }
     }
   };
@@ -827,7 +854,11 @@
   // src/runtime/composition.ts
   async function buildDefaultRegistry(config, opts) {
     const youtube = new YouTubePlatformAdapter({
-      captionSource: new FetchCaptionSource(),
+      captionSource: new FetchCaptionSource(
+        globalThis.document,
+        globalThis.fetch,
+        opts.captionCaptureProvider
+      ),
       watchUrlRe: opts.platformWatchRe
     });
     const translation = await buildTranslationProviders(config, opts.apiKeyStore);
@@ -959,6 +990,50 @@
     }
   }
 
+  // src/runtime/timedtext-bridge.ts
+  var INTERCEPTOR_SCRIPT_URL = "src/runtime/yt-timedtext-interceptor.js";
+  var CAPTURE_EVENT = "ai-trans:timedtext-capture";
+  var TimedTextBridge = class {
+    latest = null;
+    onMessageBound;
+    injected = false;
+    constructor() {
+      this.onMessageBound = this.onMessage.bind(this);
+    }
+    /** 注入 MAIN world 攔截腳本；重複調用安全（腳本內部有冪等標記）。 */
+    inject() {
+      if (this.injected) return;
+      this.injected = true;
+      const url = chrome.runtime.getURL(INTERCEPTOR_SCRIPT_URL);
+      const script = document.createElement("script");
+      script.src = url;
+      script.dataset.aiTrans = "timedtext-interceptor";
+      (document.head ?? document.documentElement).appendChild(script);
+    }
+    /** 啟動監聽；在 content-script 註冊消息接收（與注入配合）。 */
+    start() {
+      globalThis.addEventListener("message", this.onMessageBound);
+    }
+    /** 最新捕獲的 timedtext 響應；無則 null。 */
+    getLatest() {
+      return this.latest;
+    }
+    /** 移除監聽（R4：註冊必配解除）。 */
+    dispose() {
+      globalThis.removeEventListener("message", this.onMessageBound);
+      this.latest = null;
+    }
+    onMessage(event) {
+      const data = event.data;
+      if (!data || typeof data !== "object" || !data.__aiTrans) return;
+      if (data.type === CAPTURE_EVENT) {
+        const payload = data.payload;
+        if (!payload || typeof payload.url !== "string" || typeof payload.responseText !== "string") return;
+        this.latest = payload;
+      }
+    }
+  };
+
   // src/runtime/content-script.ts
   var PLAYER_SELECTOR = "div#movie_player, .html5-video-player, #mock-player";
   var MOUNT_WAIT_TIMEOUT_MS = 15e3;
@@ -994,6 +1069,8 @@
     orchestrator = null;
     rafId = 0;
     url;
+    // MAIN world 播放器 timedtext 響應攔截橋：捕獲播放器真實請求（含 pot），供字幕管線複用。
+    bridge = new TimedTextBridge();
     // R4：所有需解除的訂閱句柄，restart/stop 前必須全部清理，避免線性累積。
     unsubscribePlayback = null;
     unsubscribeConfig = null;
@@ -1002,11 +1079,14 @@
     /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
     async start() {
       await this.ensureMounted();
+      this.bridge.inject();
+      this.bridge.start();
       const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
       const platformWatchRe = isMockHost ? /^https?:\/\/localhost(:\d+)?\// : void 0;
       const registry = await buildDefaultRegistry(this.config, {
         apiKeyStore: store,
-        platformWatchRe
+        platformWatchRe,
+        captionCaptureProvider: this.bridge
       });
       this.orchestrator = new Orchestrator(
         { registry, getConfig: () => store.get(), enableAsr: false },
@@ -1047,6 +1127,7 @@
       }
       this.unsubscribePlayback?.();
       this.unsubscribePlayback = null;
+      this.bridge.dispose();
       this.orchestrator?.stop();
       this.orchestrator = null;
       this.renderer.unmount();

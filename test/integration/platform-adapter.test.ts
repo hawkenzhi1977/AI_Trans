@@ -287,3 +287,74 @@ describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {
     warnSpy.mockRestore();
   });
 });
+
+describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
+  const validJson = JSON.stringify({
+    events: [
+      { tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'captured' }] },
+      { tStartMs: 1000, dDurationMs: 1000, segs: [{ utf8: 'second' }] },
+    ],
+  });
+
+  it('有捕獲值 → 優先複用捕獲響應，不發 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: true, status: 200, text: async () => '' }) as Response);
+    const provider = {
+      getLatest: vi.fn(() => ({ url: 'https://www.youtube.com/api/timedtext?v=abc', responseText: validJson, contentType: 'application/json' })),
+    };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs).toHaveLength(2);
+    expect(segs[0].sourceText).toBe('captured');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('無捕獲值 → 回退直接 fetch（原有行為不變）', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    const provider = { getLatest: vi.fn(() => null) };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('fetched');
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('捕獲響應解析失敗（非字幕內容）→ 記診斷並回退 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    const provider = {
+      getLatest: vi.fn(() => ({ url: 'u', responseText: '<html>error</html>', contentType: 'text/html' })),
+    };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('fetched');
+    expect(src.getLastTrackDiagnostic()).toContain('capture parse failed');
+  });
+
+  it('捕獲值為 srv3 XML 也能解析（播放器無 fmt 時的默認格式）', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: true, status: 200, text: async () => '' }) as Response);
+    const srv3 = `<?xml version="1.0" encoding="utf-8"?><timedtext format="3"><body><p t="0" d="1500"><s>Hello</s> <s>world</s></p></body></timedtext>`;
+    const provider = { getLatest: vi.fn(() => ({ url: 'u', responseText: srv3, contentType: 'text/xml' })) };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('Hello world');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('捕獲值為空字符串 → 忽略，走 fetch', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    const provider = { getLatest: vi.fn(() => ({ url: 'u', responseText: '', contentType: 'text/html' })) };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs[0].sourceText).toBe('fetched');
+  });
+});

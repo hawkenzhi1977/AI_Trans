@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性）
+> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制）
 
 ---
 
@@ -169,6 +169,8 @@ src/
     ├── content-script.ts        # SubtitleController：自動掛載 + rAF 渲染 + 熱重啟（IIFE 打包）
     ├── composition.ts           # buildDefaultRegistry（async，依配置選引擎 + 解析 apiKey）
     ├── endpoint.ts              # normalizeEndpoint：端點規範化純函數（零依賴，composition/connection-test 共用）
+    ├── timedtext-bridge.ts      # TimedTextBridge：接收 MAIN world 攔截的 timedtext 捕獲（isolated world 側消息橋）
+    ├── yt-timedtext-interceptor.ts # M1-42：MAIN world XHR hook，捕獲播放器 pot 化 timedtext 響應（web_accessible_resources 放行，IIFE 打包）
     ├── offscreen.ts             # M2：音頻/推理
     ├── options/                 # 配置頁（options.ts/html，IIFE）
     └── popup/                   # 彈出頁（popup.ts/html + connection-test.ts 連接測試，IIFE）
@@ -353,6 +355,14 @@ export interface PlatformAdapter {
 > **content-script 運行時約束（實裝經驗）**：`FetchCaptionSource` 在 content script（isolated world）中拉取 timedtext。直接調用 `window.fetch`（未綁定接收者）會拋 `TypeError: Illegal invocation`——`fetch` 必須以 `window` 為接收者。因此默認 fetch 在構造時 `bind(globalThis)`（LLM 適配器同理）。此外字幕 `baseUrl` 可能為相對路徑（如 Mock 站點），統一以 `new URL(baseUrl, location.href)` 解析為絕對 URL。
 >
 > **timedtext 格式兼容（M1-40，真實 YouTube 實裝經驗）**：`captionTracks[].baseUrl` 的真實行為與舊測試契約不一致——默認（無 `fmt`）返回 **srv3 XML**（`<timedtext format="3"><body><p t="毫秒" d="毫秒"><s>text</s></p></body>`，子節點為 `p` 非 `text`），也可能是非字幕 HTML（登錄/錯誤/驗證頁）。為兼容，`fetchTracks` 經 `withJson3Format(url)` 對 **YouTube 域名**的 timedtext URL 追加/覆寫 `fmt=json3` 取穩定 JSON（`{"events":[…]}`）；非 YouTube 域名（Mock 站點）原樣不動。JSON 分支優先；若仍回退 XML，`parseXml` 需：① DOMParser 產 `parsererror`（HTML 錯誤頁）→ 拋「parse error (not valid XML…)」**而非誤判「無字幕根」**；② 識別 `<timedtext>` 根含 `<p>` 子節點 → `parseSrv3`（毫秒軸、多 `<s>` 拼接、`decodeEntities` 解 `&#\d+;`/`&amp;`/`&lt;`/`&gt;`/`&quot;`/`&#39;`）；③ 傳統 `<transcript><text>` 秒級軸照舊。
+>
+> **pot token 防護與 MAIN world 攔截複用（M1-42，真實 YouTube 根因修復）**：真實 YouTube 2024+ 對 `/api/timedtext` 引入 `pot`（proof-of-origin token）防護——content-script（isolated world）用無 pot 的 `captionTracks[].baseUrl` 直接 fetch 一律返回 **HTTP 200 + text/html + 空 body**（被 M1-40 的解析器誤判為「HTML 錯誤頁」）。pot 非靜態數據（不在 `ytInitialPlayerResponse`/`ytcfg`）、由 MAIN world 播放器 JS 動態生成且**綁定請求上下文**（複製完整 URL 再 fetch 仍空）；播放器**自身**的 timedtext 請求帶 `&potc=1&pot=…&c=WEB&cver=…`，且用 **XMLHttpRequest**（非 fetch）發出。方案（「攔截播放器自身請求複用響應」，繞過 pot 生成）：
+>
+> - **`yt-timedtext-interceptor.ts`（MAIN world，新增）**：IIFE、import 時自裝。hook `XMLHttpRequest.prototype.open` 與 `send`——`open` 時解析 URL（`new URL(arg, location.href)` 絕對化，§5.2）精確匹配 `youtube.com/timedtext` 的實例打 `__aiTransUrl` 標記；`send` 後掛 `load` 監聽器：HTTP 200 且 body 非空（含 pot、已過 pot 驗證的字幕響應）→ `window.postMessage({ __aiTrans: 'timedtext-capture', payload }, '*')`；監聽器**用完自除**（§5.4）。`window.__aiTransTimedtextInterceptorInstalled` 冪等標記防重裝。**§5.1 綁定關鍵**：hook 必須 `origOpen.apply(this, args)` 保留實例接收者——`boundOpen.call(xhr)` 在 jsdom 拋 `'open' called on an object that is not a valid instance of XMLHttpRequest`（brand check 失敗）。
+> - **`timedtext-bridge.ts`（isolated world，新增）**：content-script 側消息橋。`inject()`（冪等）用 `chrome.runtime.getURL('src/runtime/yt-timedtext-interceptor.js')` 動態創建 `<script>` 注入（`data-ai-trans` 標記、`remove()` 自清理），並在 manifest `web_accessible_resources` 放行該路徑（MAIN world 腳本需顯式聲明才可被 `<script src>` 加載）；`start()` 註冊 `window.message` 監聽（`__aiTrans` 標記過濾外部消息，§5.7）存最新捕獲響應；`dispose()` 移除監聽 + 清緩存（§5.4）。
+> - **`CaptionCaptureProvider` 端口（`src/domain/ports/`，新增）**：`{ getLatest(): string | undefined }`。`FetchCaptionSource` 構造增加第三參數 `capture?: CaptionCaptureProvider`；`fetchTracks` **優先複用捕獲響應**——`getLatest()` 有值且非空 → 直接 `parseTimedText`（srv3/json3 自動識別），**不發網絡請求**（繞過 pot）；捕獲解析失敗/空響應時寫 `lastTrackDiagnostic`（§5.6 留痕）並回退直接 fetch（原有行為不變）。`buildDefaultRegistry` 在 content-script 環境把 bridge 作為 `captionCaptureProvider` 注入（見第 5 章目錄樹）。
+>
+> 測試落點：集成 `test/integration/timedtext-bridge.test.ts`（inject/start/dispose/getLatest/外部消息過濾 5）、`yt-timedtext-interceptor.test.ts`（open/send hook/URL 匹配/load 轉發/無響應不轉發 4）、`platform-adapter.test.ts`（+5：捕獲複用不發 fetch/無捕獲回退/捕獲解析失敗回退 + 診斷/srv3 捕獲/空捕獲走 fetch）、`setup-dom.ts` 補 `runtime.getURL` mock。對應 TC-F17/TC-F18/TC-R9（system-test-design §4）。
 >
 > **訂閱/Observer 洩漏**（restart 路徑）：`SubtitleController` 的 `observePlayback` 返回 unsubscribe 必須保存為實例字段並在 `stop()` 調用；`MutationObserver` 等待播放器就緒時須保存 handle 供 stop 中斷，並加 15s 超時避免 Promise 永久懸掛（SPA 導航離開 watch 頁時播放器永不出現）。每次 restart（配置變更）前必須完整清理上一輪全部訂閱/Observer/rAF，否則監聽器線性累積 → 內存洩漏 + CPU 空轉。
 >

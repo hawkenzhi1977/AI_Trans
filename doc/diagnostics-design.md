@@ -155,10 +155,10 @@
 - **診斷碼**: timedtext XML: parse error (not valid XML) — root <<tag>>, body snippet: "<片段>"
 - **用戶可見消息**: 最近失敗: 錯誤: Error: timedtext XML: parse error (not valid XML) — root <<tag>>, body snippet: "<片段>" (<timestamp>)
 - **觸發條件**: DOMParser 解析 XML 時發現 <parsererror>
-- **根因**: 響應為 HTML 錯誤頁/登錄頁而非 XML;XML 格式損壞
-- **用戶響應**: 刷新頁面;確認已登錄 YouTube
-- **開發者響應**: 檢查 root tag 和 body snippet;確認是否為登錄重定向
-- **代碼落點**: src/adapters/platform/youtube/timedtext.ts:67-73
+- **根因**: 響應為 HTML 錯誤頁/登錄頁而非 XML;XML 格式損壞;**YouTube pot token 防護導致無 pot 請求返回空 body（root <html>, empty body）——已由 M1-42 MAIN world 攔截複用機制繞過（優先複用播放器帶 pot 的成功響應）**
+- **用戶響應**: 刷新頁面;確認已登錄 YouTube;**若持續出現 root <html> + 空 body，確認擴充的 MAIN world 攔截器已注入（web_accessible_resources 放行）且播放器已實際請求過字幕**
+- **開發者響應**: 檢查 root tag 和 body snippet;確認是否為登錄重定向;**root <html> + 空 body 特徵指向 pot 防護——檢查 `timedtext-bridge` 是否收到 `ai-trans:timedtext-capture` 捕獲（`CaptionCaptureProvider.getLatest()` 是否有值）**
+- **代碼落點**: src/adapters/platform/youtube/timedtext.ts:67-73;src/runtime/yt-timedtext-interceptor.ts;src/runtime/timedtext-bridge.ts
 
 ### 2.11 Timedtext XML 缺少 transcript 根
 
@@ -169,6 +169,16 @@
 - **用戶響應**: 刷新頁面;報告問題
 - **開發者響應**: 檢查 actual root tag;確認是否需要支持新格式
 - **代碼落點**: src/adapters/platform/youtube/timedtext.ts:88-93
+
+### 2.12 Timedtext 捕獲複用失敗回退（M1-42）
+
+- **診斷碼**: timedtext capture parse failed: <錯誤> — fall back to direct fetch
+- **用戶可見消息**: 最近失敗: 錯誤: Error: timedtext capture parse failed: <錯誤> — fall back to direct fetch (<timestamp>)
+- **觸發條件**: MAIN world 攔截器捕獲的播放器 timedtext 響應存在，但 content-script 側 `parseTimedText` 解析失敗（非字幕內容/空響應）——捕獲值被忽略，回退直接 fetch
+- **根因**: 捕獲的響應非字幕內容（可能是其他 timedtext 請求的響應，如自動翻譯軌/預覽）；pot 防護對「捕獲響應複用」不適用但響應本身異常
+- **用戶響應**: 無需操作——擴充已自動回退直接 fetch（若直接 fetch 亦被 pot 攔截，診斷會轉為 timedtext XML: parse error）
+- **開發者響應**: 檢查捕獲內容為何解析失敗；確認攔截器是否過濾了非目標字幕響應
+- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`tryReuseCapture`）;src/runtime/timedtext-bridge.ts;src/runtime/yt-timedtext-interceptor.ts
 
 
 ---

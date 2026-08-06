@@ -2,7 +2,7 @@
 
 > 版本：v0.1（草案）
 > 狀態：需求與可行性方案討論結論
-> 最後更新：2026-08-06（F-11 範圍擴展：外部接口調用節點診斷全掃描——LLM 響應結構不靜默回退原文、timedtext 拉取證據化、播放器節點超時/缺失診斷、popup/options/service-worker storage 失敗可見、message-bus 異常留痕）
+> 最後更新：2026-08-06（F-01 補 YouTube pot token 防護兼容：MAIN world 攔截播放器 timedtext 響應複用——真實 YouTube 對 timedtext 引入 pot 防護後，content-script 直接 fetch 無 pot 的 baseUrl 一律空響應；F-11 範圍擴展：外部接口調用節點診斷全掃描——LLM 響應結構不靜默回退原文、timedtext 拉取證據化、播放器節點超時/缺失診斷、popup/options/service-worker storage 失敗可見、message-bus 異常留痕）
 
 ---
 
@@ -43,7 +43,7 @@ AI_Trans 是一款 **Chrome 瀏覽器擴充（Manifest V3）**，為在線視頻
 
 | 編號 | 功能 | 描述 | 優先級 |
 |---|---|---|---|
-| F-01 | 原生字幕翻譯 | 檢測並抓取 YouTube 原生字幕軌，翻譯後以覆蓋層顯示 | P0 |
+| F-01 | 原生字幕翻譯 | 檢測並抓取 YouTube 原生字幕軌，翻譯後以覆蓋層顯示。**pot token 防護兼容（M1-42）**：真實 YouTube 對 `/api/timedtext` 引入 `pot`（proof-of-origin token）防護後，content-script（isolated world）直接用無 pot 的 `captionTracks[].baseUrl` fetch 一律返回空 body（HTTP 200 + text/html），M1-40 的格式兼容被誤判為「HTML 錯誤頁」。方案：向 MAIN world 注入 `yt-timedtext-interceptor` hook 播放器 `XMLHttpRequest`，捕獲播放器**已成功**（含 pot、已過驗證）的 timedtext 響應，經 `window.postMessage` 橋回 content-script（`timedtext-bridge`），`FetchCaptionSource` 優先複用捕獲響應（解析 srv3/json3），無捕獲/解析失敗時回退直接 fetch。繞過 pot 生成——不重新請求，直接使用播放器響應 | P0 |
 | F-02 | 覆蓋層字幕渲染 | 在播放器上方渲染字幕，支持單語/雙語（原文+譯文） | P0 |
 | F-03 | 播放狀態同步 | 字幕隨播放進度、暫停、快進、倍速同步 | P0 |
 | F-04 | 翻譯引擎配置 | 用戶可選擇雲端 LLM / 本地模型，並填寫端點與密鑰（Options 頁詳配 + Popup 快捷開關；密鑰以獨立安全存儲，不明文入配置）。端點兼容「Base URL（如 `/v1`）」與「完整 `/chat/completions` 路徑」兩種填法；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效（見 F-10） | P0 |

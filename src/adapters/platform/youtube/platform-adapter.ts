@@ -21,17 +21,34 @@ export interface CaptionSource {
   getLastTrackDiagnostic?(): string | undefined;
 }
 
+/**
+ * 播放器 timedtext 響應複用來源（由 MAIN world 攔截器經消息橋提供）。
+ * YouTube 2024+ 對 timedtext 加了 pot（proof-of-origin token）防護，content-script 直接
+ * fetch 無 pot 的 baseUrl 只拿到空響應。播放器自身的 XHR 帶 pot 能成功——本接口讓
+ * FetchCaptionSource 優先複用播放器已成功的響應，繞過 pot 生成。
+ */
+export interface CaptionCaptureProvider {
+  /** 最近一次捕獲的 timedtext 響應；無捕獲時返回 null（回退到直接 fetch）。 */
+  getLatest(): { url: string; responseText: string; contentType: string } | null;
+}
+
 /** 基於 fetch 的默認字幕數據源。 */
 export class FetchCaptionSource implements CaptionSource {
   private readonly doc: Document;
   private readonly fetchFn: typeof fetch;
+  private readonly captureProvider: CaptionCaptureProvider | undefined;
   private lastTrackDiagnostic: string | undefined;
 
-  constructor(doc: Document = globalThis.document, fetchFn: typeof fetch = globalThis.fetch) {
+  constructor(
+    doc: Document = globalThis.document,
+    fetchFn: typeof fetch = globalThis.fetch,
+    captureProvider?: CaptionCaptureProvider
+  ) {
     this.doc = doc;
     // 綁定至 window：content-script 中直接調用未綁定的 window.fetch 會拋
     // "Illegal invocation"（fetch 需以 window 為接收者）。
     this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
+    this.captureProvider = captureProvider;
   }
 
   getLastTrackDiagnostic(): string | undefined {
@@ -106,6 +123,12 @@ export class FetchCaptionSource implements CaptionSource {
     // （{"events":[{tStartMs,dDurationMs,segs:[{utf8}]}]}），與解析器 JSON 分支對齊。
     // Mock 站點的相對 URL（無 host）不加 fmt，避免破壞既有契約。
     const finalUrl = this.withJson3Format(url);
+
+    // 優先複用 MAIN world 攔截器捕獲的播放器響應（帶 pot，已成功）。
+    // §5.6：複用失敗（解析出錯）不靜默——記診斷後仍回退到直接 fetch，兩條路徑都留痕。
+    const reused = this.tryReuseCapture(lang);
+    if (reused) return reused;
+
     // §5.6：網絡層失敗（DNS/CORS/mixed-content/斷網）與 HTTP 非 2xx、body 解析失敗
     // 要**可區分**——統一記入 lastTrackDiagnostic 並攜帶實際證據（status/content-type/片段），
     // 避免「fetch 失敗」與「parse 失敗」混在同一條 run failed 裡無法定位。
@@ -158,6 +181,36 @@ export class FetchCaptionSource implements CaptionSource {
       throw new Error(
         `timedtext URL parse failed in withJson3Format: ${err instanceof Error ? err.message : String(err)}`
       );
+    }
+  }
+
+  /**
+   * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
+   * - 有捕獲值且響應非空 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
+   * - 無捕獲值 → 返回 undefined（走直接 fetch）。
+   */
+  private tryReuseCapture(lang: string): SubtitleSegment[] | undefined {
+    if (!this.captureProvider) return undefined;
+    const capture = this.captureProvider.getLatest();
+    if (!capture || !capture.responseText) return undefined;
+    const { url, responseText, contentType } = capture;
+    try {
+      // 捕獲的響應可能為 srv3 XML（播放器請求無 fmt）或 json3（帶 fmt），
+      // parseTimedText 自動按根識別，兩種都能解析。
+      const segments = parseTimedText(responseText, lang);
+      if (segments.length > 0) {
+        this.lastTrackDiagnostic = `reused player timedtext capture (url: ${url})`;
+        return segments;
+      }
+      // 捕獲值非空但解析出 0 段：可能不是字幕響應（如錯誤頁），記診斷並回退。
+      this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${contentType}, url: ${url})`;
+      return undefined;
+    } catch (err) {
+      // §5.6：捕獲響應解析失敗不靜默——記診斷（含 URL 證據），回退到直接 fetch。
+      this.lastTrackDiagnostic =
+        `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)}` +
+        ` (content-type: ${contentType}, url: ${url})`;
+      return undefined;
     }
   }
 }

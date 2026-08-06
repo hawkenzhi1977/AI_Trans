@@ -25,6 +25,9 @@ const ENTRY_POINTS = [
   ['src/runtime/service-worker.ts', 'src/runtime/service-worker.js', 'esm'],
   ['src/runtime/options/options.ts', 'src/runtime/options/options.js', 'iife'],
   ['src/runtime/popup/popup.ts', 'src/runtime/popup/popup.js', 'iife'],
+  // MAIN world 攔截腳本：獨立打包（被 content-script 以 <script src> 注入頁面，
+  // 不能與 content-script 共用 bundle，也必須是 IIFE 以在非 module 上下文執行）。
+  ['src/runtime/yt-timedtext-interceptor.ts', 'src/runtime/yt-timedtext-interceptor.js', 'iife'],
 ];
 
 mkdirSync(outdir, { recursive: true });

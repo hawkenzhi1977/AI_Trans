@@ -9,6 +9,7 @@ import { YouTubePlatformAdapter, FetchCaptionSource } from '../adapters';
 import { LLMTranslationProvider } from '../adapters/translation/llm-translation';
 import { MTTranslationProvider } from '../adapters/translation/mt-translation';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
+import type { CaptionCaptureProvider } from '../adapters/platform/youtube/platform-adapter';
 import type { EngineConfig, TranslationConfig } from '../domain/models/config';
 import type { TranslationProvider } from '../domain/ports/translation-provider';
 import type { ApiKeyStore } from '../domain/ports/config-store';
@@ -18,6 +19,8 @@ export interface BuildRegistryOptions {
   apiKeyStore: ApiKeyStore;
   /** 平台 URL 匹配規則覆蓋（測試環境用於匹配 Mock 站點）。 */
   platformWatchRe?: RegExp;
+  /** MAIN world 播放器 timedtext 響應捕獲提供者（注入給 FetchCaptionSource 優先複用）。 */
+  captionCaptureProvider?: CaptionCaptureProvider;
 }
 
 /**
@@ -29,7 +32,11 @@ export async function buildDefaultRegistry(
   opts: BuildRegistryOptions
 ): Promise<Registry> {
   const youtube = new YouTubePlatformAdapter({
-    captionSource: new FetchCaptionSource(),
+    captionSource: new FetchCaptionSource(
+      globalThis.document,
+      globalThis.fetch,
+      opts.captionCaptureProvider
+    ),
     watchUrlRe: opts.platformWatchRe,
   });
 
