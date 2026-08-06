@@ -458,6 +458,19 @@
       this.captureProvider = captureProvider;
       this.waitForCaptureTimeoutMs = waitForCaptureTimeoutMs;
     }
+    /**
+     * 當前頁面 URL 中的視頻 ID（從 `/watch?v=` 提取；SPA 換視頻後 location.href 會更新）。
+     * 用於跨視頻捕獲失效校驗：capture.videoId 與之不一致即視為 stale。
+     */
+    currentVideoId() {
+      try {
+        const href = this.doc.location?.href;
+        if (!href) return "";
+        return new URL(href).searchParams.get("v") ?? "";
+      } catch {
+        return "";
+      }
+    }
     getLastTrackDiagnostic() {
       return this.lastTrackDiagnostic;
     }
@@ -560,13 +573,17 @@
     }
     /**
      * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
-     * - 有捕獲值且響應非空 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
-     * - 無捕獲值 → 返回 undefined（走直接 fetch）。
+     * - 有捕獲值、響應非空且屬於當前視頻 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
+     * - 無捕獲值 / 捕獲屬於其他視頻（stale）→ 返回 undefined（走等待或直接 fetch）。
      */
     tryReuseCapture(lang) {
       if (!this.captureProvider) return void 0;
       const capture = this.captureProvider.getLatest();
       if (!capture || !capture.responseText) return void 0;
+      if (!this.captureMatchesCurrentVideo(capture)) {
+        this.lastTrackDiagnostic = `timedtext capture is for another video (capture videoId: ${capture.videoId ?? "(unknown)"}, current: ${this.currentVideoId()}) \u2014 skip reuse`;
+        return void 0;
+      }
       const { url, responseText, contentType } = capture;
       try {
         const segments = parseTimedText(responseText, lang);
@@ -581,6 +598,13 @@
         return void 0;
       }
     }
+    /** 捕獲是否屬於當前視頻（無視頻 ID 上下文時保守接受；明確不同才拒絕）。 */
+    captureMatchesCurrentVideo(capture) {
+      const current = this.currentVideoId();
+      if (!current) return true;
+      if (!capture.videoId) return true;
+      return capture.videoId === current;
+    }
     /**
      * 等待播放器捕獲響應後複用（M1-43）。
      * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
@@ -589,13 +613,16 @@
       if (!this.captureProvider?.waitForCapture) return void 0;
       let capture;
       try {
-        capture = await this.captureProvider.waitForCapture(this.waitForCaptureTimeoutMs);
+        capture = await this.captureProvider.waitForCapture(
+          this.waitForCaptureTimeoutMs,
+          this.currentVideoId()
+        );
       } catch {
         this.lastTrackDiagnostic = `timedtext capture wait failed`;
         return void 0;
       }
       if (!capture || !capture.responseText) {
-        this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) \u2014 fall back to direct fetch`;
+        this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) \u2014 fall back to direct fetch` + (this.lastTrackDiagnostic?.includes("capture is for another video") ? ` (prior: ${this.lastTrackDiagnostic})` : "");
         return void 0;
       }
       try {
@@ -1064,31 +1091,42 @@
     }
     /**
      * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
-     * 已在途的捕獲（latest 就緒）立即返回；否則掛起等待 message 事件或輪詢通知。
+     * 已在途的捕獲（latest 就緒且匹配）立即返回；否則掛起等待 message 事件或輪詢通知。
      * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
+     * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲——避免換視頻（SPA 導航）後
+     * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
      */
-    waitForCapture(timeoutMs) {
+    waitForCapture(timeoutMs, expectedVideoId) {
       const current = this.latest;
-      if (current) return Promise.resolve(current);
+      if (current && this.matchesVideo(current, expectedVideoId)) {
+        return Promise.resolve(current);
+      }
       return new Promise((resolve) => {
         let settled = false;
         const timer = setTimeout(() => {
           if (settled) return;
           settled = true;
           this.waiters.delete(onCapture);
-          this.pollTimer = null;
           resolve(null);
         }, timeoutMs);
         const onCapture = () => {
           if (settled) return;
+          const latest = this.latest;
+          if (!latest || !this.matchesVideo(latest, expectedVideoId)) return;
           settled = true;
           clearTimeout(timer);
           this.waiters.delete(onCapture);
-          resolve(this.latest);
+          resolve(latest);
         };
         this.waiters.add(onCapture);
-        if (this.latest) onCapture();
+        if (this.latest && this.matchesVideo(this.latest, expectedVideoId)) onCapture();
       });
+    }
+    /** 捕獲是否屬於指定視頻（無 expectedVideoId 或捕獲無 videoId 時視為可接受）。 */
+    matchesVideo(capture, expectedVideoId) {
+      if (!expectedVideoId) return true;
+      if (!capture.videoId) return true;
+      return capture.videoId === expectedVideoId;
     }
     /** 最新捕獲的 timedtext 響應；無則 null。 */
     getLatest() {
@@ -1139,12 +1177,26 @@
 
   // src/runtime/content-script.ts
   var PLAYER_SELECTOR = "div#movie_player, .html5-video-player, #mock-player";
+  function extractVideoId(url) {
+    try {
+      return new URL(url).searchParams.get("v") ?? "";
+    } catch {
+      return "";
+    }
+  }
   var MOUNT_WAIT_TIMEOUT_MS = 15e3;
   var store = new ChromeStorageConfigStore();
   var SubtitleController = class {
     constructor(config, url) {
       this.config = config;
       this.url = url;
+      this.lastVideoId = extractVideoId(url);
+      this.onUrlChangedBound = this.onUrlChanged.bind(this);
+      globalThis.addEventListener("popstate", this.onUrlChangedBound);
+      this.origPushState = history.pushState;
+      this.origReplaceState = history.replaceState;
+      this.patchedHistory = this.patchHistoryApi();
+      this.urlChangeTimer = null;
       const onStorageChanged = (changes, areaName) => {
         if (areaName !== "local") return;
         if ("engineConfig" in changes || "engineConfigKeys" in changes) {
@@ -1179,6 +1231,14 @@
     unsubscribeConfig = null;
     pendingMountObserver = null;
     mountWaitTimer = null;
+    // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
+    // 偵測 URL 的 v 參數變化後熱重啟字幕管線。dispose 時必須解除/恢復（R4）。
+    onUrlChangedBound;
+    origPushState;
+    origReplaceState;
+    patchedHistory;
+    lastVideoId;
+    urlChangeTimer = null;
     /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
     async start() {
       this.bridge.inject();
@@ -1243,6 +1303,52 @@
       this.bridge.dispose();
       this.unsubscribeConfig?.();
       this.unsubscribeConfig = null;
+      globalThis.removeEventListener("popstate", this.onUrlChangedBound);
+      if (this.patchedHistory) {
+        history.pushState = this.origPushState;
+        history.replaceState = this.origReplaceState;
+      }
+    }
+    /** 偵測 URL 的 v 參數變化（SPA 換視頻）→ 熱重啟字幕管線（M1-45）。 */
+    onUrlChanged() {
+      if (this.urlChangeTimer !== null) return;
+      const videoId = extractVideoId(window.location.href);
+      if (videoId === this.lastVideoId) return;
+      this.lastVideoId = videoId;
+      this.urlChangeTimer = setTimeout(() => {
+        this.urlChangeTimer = null;
+        void this.restart().catch((err) => {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "platform",
+              code: "spa-navigation-restart-failed",
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err))
+            }
+          });
+        });
+      }, 300);
+    }
+    /**
+     * Patch history.pushState/replaceState，捕獲 SPA 換視頻導航（R4 需可解除）。
+     * 返回是否成功 patch（patch 失敗時僅靠 popstate 兜底）。
+     */
+    patchHistoryApi() {
+      try {
+        history.pushState = ((data, unused, url) => {
+          this.origPushState.call(history, data, unused, url);
+          this.onUrlChanged();
+        });
+        history.replaceState = ((data, unused, url) => {
+          this.origReplaceState.call(history, data, unused, url);
+          this.onUrlChanged();
+        });
+        return true;
+      } catch (err) {
+        console.warn("[AI_Trans] SPA navigation patch failed, falling back to popstate only:", err);
+        return false;
+      }
     }
     onEvent(e) {
       if (e.type === "segments-ready" || e.type === "segments-updated") {

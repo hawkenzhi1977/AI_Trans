@@ -32,6 +32,8 @@ export interface CapturedTimedText {
   url: string;
   responseText: string;
   contentType: string;
+  /** 該捕獲所屬視頻 ID（從 timedtext URL `v` 提取）；用於跨視頻失效校驗。 */
+  videoId?: string;
 }
 
 export interface CaptionCaptureProvider {
@@ -41,8 +43,9 @@ export interface CaptionCaptureProvider {
    * 等待捕獲值就緒（M1-43）。播放器的 timedtext 請求在「視頻已播放」時才發出，
    * fetchTracks 可能早於播放器請求運行——此時等待播放器發請求並捕獲。
    * 超時返回 null（由調用方回退直接 fetch）。
+   * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲，避免複用上一個視頻的 stale 捕獲。
    */
-  waitForCapture?(timeoutMs: number): Promise<CapturedTimedText | null>;
+  waitForCapture?(timeoutMs: number, expectedVideoId?: string): Promise<CapturedTimedText | null>;
 }
 
 /** 基於 fetch 的默認字幕數據源。 */
@@ -66,6 +69,20 @@ export class FetchCaptionSource implements CaptionSource {
     this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
     this.captureProvider = captureProvider;
     this.waitForCaptureTimeoutMs = waitForCaptureTimeoutMs;
+  }
+
+  /**
+   * 當前頁面 URL 中的視頻 ID（從 `/watch?v=` 提取；SPA 換視頻後 location.href 會更新）。
+   * 用於跨視頻捕獲失效校驗：capture.videoId 與之不一致即視為 stale。
+   */
+  private currentVideoId(): string {
+    try {
+      const href = this.doc.location?.href;
+      if (!href) return '';
+      return new URL(href).searchParams.get('v') ?? '';
+    } catch {
+      return '';
+    }
   }
 
   getLastTrackDiagnostic(): string | undefined {
@@ -150,6 +167,7 @@ export class FetchCaptionSource implements CaptionSource {
     // 播放器在「視頻已播放」時才發字幕請求，而 fetchTracks 可能在播放前運行——
     // 給播放器一個窗口（waitForCaptureTimeoutMs）等待捕獲，命中則複用（繞過 pot），
     // 超時才回退直接 fetch（保留原有行為與診斷）。
+    // M1-45：等待僅接受屬於當前視頻（expectedVideoId）的捕獲，避免換視頻後複用 stale 捕獲。
     const waited = await this.waitForCaptureReuse(lang);
     if (waited) return waited;
 
@@ -210,13 +228,20 @@ export class FetchCaptionSource implements CaptionSource {
 
   /**
    * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
-   * - 有捕獲值且響應非空 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
-   * - 無捕獲值 → 返回 undefined（走直接 fetch）。
+   * - 有捕獲值、響應非空且屬於當前視頻 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
+   * - 無捕獲值 / 捕獲屬於其他視頻（stale）→ 返回 undefined（走等待或直接 fetch）。
    */
   private tryReuseCapture(lang: string): SubtitleSegment[] | undefined {
     if (!this.captureProvider) return undefined;
     const capture = this.captureProvider.getLatest();
     if (!capture || !capture.responseText) return undefined;
+    // M1-45：捕獲屬於其他視頻（SPA 換視頻後 latest 仍是上一個視頻）→ 跳過複用，
+    // 記診斷後交由等待邏輯拿新視頻的捕獲（防止把舊字幕貼到新視頻上）。
+    if (!this.captureMatchesCurrentVideo(capture)) {
+      this.lastTrackDiagnostic =
+        `timedtext capture is for another video (capture videoId: ${capture.videoId ?? '(unknown)'}, current: ${this.currentVideoId()}) — skip reuse`;
+      return undefined;
+    }
     const { url, responseText, contentType } = capture;
     try {
       // 捕獲的響應可能為 srv3 XML（播放器請求無 fmt）或 json3（帶 fmt），
@@ -238,6 +263,14 @@ export class FetchCaptionSource implements CaptionSource {
     }
   }
 
+  /** 捕獲是否屬於當前視頻（無視頻 ID 上下文時保守接受；明確不同才拒絕）。 */
+  private captureMatchesCurrentVideo(capture: CapturedTimedText): boolean {
+    const current = this.currentVideoId();
+    if (!current) return true;
+    if (!capture.videoId) return true;
+    return capture.videoId === current;
+  }
+
   /**
    * 等待播放器捕獲響應後複用（M1-43）。
    * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
@@ -246,7 +279,10 @@ export class FetchCaptionSource implements CaptionSource {
     if (!this.captureProvider?.waitForCapture) return undefined;
     let capture;
     try {
-      capture = await this.captureProvider.waitForCapture(this.waitForCaptureTimeoutMs);
+      capture = await this.captureProvider.waitForCapture(
+        this.waitForCaptureTimeoutMs,
+        this.currentVideoId()
+      );
     } catch {
       // §5.6：等待過程異常不靜默——記診斷後回退直接 fetch。
       this.lastTrackDiagnostic = `timedtext capture wait failed`;
@@ -255,7 +291,12 @@ export class FetchCaptionSource implements CaptionSource {
     if (!capture || !capture.responseText) {
       // §5.6：等待窗口內未捕獲到（播放器未發請求/請求未命中）不靜默——記診斷後回退直接 fetch，
       // 與「捕獲解析失敗」可區分。
-      this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) — fall back to direct fetch`;
+      // M1-45：若此前 tryReuseCapture 已跳過 stale 捕獲（換視頻），把該上文拼進超時診斷，
+      // 讓「為何跳過已有捕獲卻仍失敗」的原因鏈完整（§5.6 不靜默）。
+      this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) — fall back to direct fetch` +
+        (this.lastTrackDiagnostic?.includes('capture is for another video')
+          ? ` (prior: ${this.lastTrackDiagnostic})`
+          : '');
       return undefined;
     }
     // 用等待到的捕獲值直接解析（不依賴 getLatest——waitForCapture 的返回值即捕獲）。

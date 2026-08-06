@@ -131,6 +131,62 @@ describe('TimedTextBridge — 消息接收與存儲', () => {
     await expect(p).resolves.toBeNull();
   });
 
+  it('[M1-45] waitForCapture 指定期望 videoId：最新值不匹配則等待匹配的捕獲', async () => {
+    vi.useFakeTimers();
+    bridge.start();
+    const p = bridge.waitForCapture(5000, 'bbb');
+    let resolved: unknown = 'pending';
+    void p.then((v) => { resolved = v; });
+    // 先到的是視頻 A 的捕獲（不匹配 bbb）→ 不應 resolve
+    const captureA = { url: 'u-a', responseText: 'r', contentType: 'c', capturedAt: 1, videoId: 'aaa' };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: captureA } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolved).toBe('pending');
+    // 視頻 B 的捕獲到達 → resolve
+    const captureB = { url: 'u-b', responseText: 'r', contentType: 'c', capturedAt: 2, videoId: 'bbb' };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: captureB } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolved).toEqual(captureB);
+  });
+
+  it('[M1-45] waitForCapture 指定期望 videoId：latest 已匹配則立即返回', async () => {
+    bridge.start();
+    const captureB = { url: 'u-b', responseText: 'r', contentType: 'c', capturedAt: 2, videoId: 'bbb' };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: captureB } }));
+    const result = await bridge.waitForCapture(100, 'bbb');
+    expect(result).toEqual(captureB);
+  });
+
+  it('[M1-45] waitForCapture 超時後輪詢器仍可被 stop 清理（R4 pollTimer 引用不丟失）', async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval');
+    bridge.start();
+    const p = bridge.waitForCapture(500);
+    await vi.advanceTimersByTimeAsync(600);
+    await expect(p).resolves.toBeNull();
+    // 超時後 stop：若 pollTimer 引用被錯誤置 null，stop 不會調用 clearInterval（洩漏）。
+    const before = clearSpy.mock.calls.length;
+    bridge.stop();
+    expect(clearSpy.mock.calls.length).toBeGreaterThan(before);
+    clearSpy.mockRestore();
+  });
+
+  it('[M1-45] SPA 換視頻後 latest 保留但等待側以期望 videoId 過濾（不誤用舊視頻捕獲）', async () => {
+    bridge.start();
+    // 視頻 A 的捕獲已入 latest
+    const captureA = { url: 'u-a', responseText: 'r', contentType: 'c', capturedAt: 1, videoId: 'aaa' };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: captureA } }));
+    // 等待視頻 B（期望 bbb）→ 不立即返回 stale 的 A，需等 B 到來
+    let resolved: unknown = 'pending';
+    void bridge.waitForCapture(1000, 'bbb').then((v) => { resolved = v; });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolved).toBe('pending');
+    const captureB = { url: 'u-b', responseText: 'r', contentType: 'c', capturedAt: 2, videoId: 'bbb' };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: captureB } }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolved).toEqual(captureB);
+  });
+
   it('輪詢器按 POLL_INTERVAL_MS 啟動（M1-43 探查節奏）', () => {
     vi.useFakeTimers();
     const setSpy = vi.spyOn(globalThis, 'setInterval');

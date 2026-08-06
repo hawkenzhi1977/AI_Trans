@@ -12,7 +12,7 @@ English version: [README.md](./README.md).
 
 ### 已實現（里程碑 M1）
 
-- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。兼容 YouTube timedtext 全部真實格式：優先請求穩定 JSON（`fmt=json3`），回退可解析 `srv3` XML（`<timedtext><p t d><s>`）或傳統 `<transcript><text>` XML；非法 HTML（登錄/錯誤頁）被識別為解析錯誤，不再誤報「無字幕」。**兼容 YouTube 對 `/api/timedtext` 的 `pot`（proof-of-origin token）防護**：當播放器自身發起帶 token 驗證的字幕請求（擴充無法自行複製該請求）時，擴充在頁面 MAIN world 捕獲該響應並複用，token 防護下字幕仍能正常載入。
+- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。兼容 YouTube timedtext 全部真實格式：優先請求穩定 JSON（`fmt=json3`），回退可解析 `srv3` XML（`<timedtext><p t d><s>`）或傳統 `<transcript><text>` XML；非法 HTML（登錄/錯誤頁）被識別為解析錯誤，不再誤報「無字幕」。**兼容 YouTube 對 `/api/timedtext` 的 `pot`（proof-of-origin token）防護**：當播放器自身發起帶 token 驗證的字幕請求（擴充無法自行複製該請求）時，擴充在頁面 MAIN world 捕獲該響應並複用，token 防護下字幕仍能正常載入。攔截器以 manifest 聲明在 `document_start` 的 MAIN world 注入，**頁面最早階段、播放器首次字幕請求前**就已就位（含帶緩存的二次加載/重載）。**SPA 換視頻**——不重載頁面切換視頻（播放清單/側欄導航）經 URL 變化偵測，字幕管線自動熱重啟載入新視頻字幕；舊視頻的殘留字幕捕獲不會被誤用到新視頻。
 - **覆蓋層字幕渲染**——支持單語或雙語（原文＋譯文），渲染於獨立覆蓋層並對齊播放時間。
 - **播放狀態同步**——字幕隨當前時間、暫停、快進同步（媒體事件 + `requestAnimationFrame` 對齊）。
 - **可配置翻譯引擎**——雲端 LLM（OpenAI 兼容 `/chat/completions`）為主、傳統 MT 兜底；端點、模型、API Key 由用戶配置。API Key 與配置對象分離存儲。

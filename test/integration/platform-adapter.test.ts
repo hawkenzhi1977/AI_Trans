@@ -373,7 +373,8 @@ describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
     const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
     expect(segs).toHaveLength(2);
     expect(segs[0].sourceText).toBe('captured');
-    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000);
+    // M1-45：等待會帶上當前視頻 ID（jsdom location 無 v → 空串，與測試兼容）。
+    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000, '');
     expect(fetchFn).not.toHaveBeenCalled(); // 複用捕獲，未直接 fetch
   });
 
@@ -406,5 +407,43 @@ describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
     const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
     expect(segs[0].sourceText).toBe('fetched');
     expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('[M1-45] 捕獲屬於其他視頻（SPA 換視頻後 stale）→ 跳過複用，等待新視頻捕獲', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
+    }) as Response);
+    // 當前頁面 URL 為視頻 B（v=bbb），捕獲是視頻 A（v=aaa）的 → stale。
+    window.history.replaceState({}, '', '/watch?v=bbb');
+    const capturedA = { url: 'https://www.youtube.com/api/timedtext?v=aaa', responseText: validJson, contentType: 'application/json', videoId: 'aaa' };
+    const provider = {
+      getLatest: vi.fn(() => capturedA), // latest 是舊視頻 A 的捕獲
+      waitForCapture: vi.fn(async () => null), // 等待新視頻 B 捕獲（此測試中超時）
+    };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    // stale 捕獲不被複用 → 回退（等待超時後）直接 fetch
+    expect(segs[0].sourceText).toBe('fetched');
+    expect(fetchFn).toHaveBeenCalledOnce();
+    // §5.6：stale 跳過與超時原因鏈完整（超時診斷帶上 stale 上文）
+    expect(src.getLastTrackDiagnostic()).toContain('capture is for another video');
+    expect(src.getLastTrackDiagnostic()).toContain('wait timeout');
+    // 等待必須以當前視頻 B 的 videoId 為期望值
+    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000, 'bbb');
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('[M1-45] 捕獲屬於當前視頻 → 正常複用（不誤傷）', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: true, status: 200, text: async () => '' }) as Response);
+    window.history.replaceState({}, '', '/watch?v=bbb');
+    const capturedB = { url: 'https://www.youtube.com/api/timedtext?v=bbb', responseText: validJson, contentType: 'application/json', videoId: 'bbb' };
+    const provider = { getLatest: vi.fn(() => capturedB) };
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
+    const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
+    expect(segs).toHaveLength(2);
+    expect(fetchFn).not.toHaveBeenCalled(); // 複用當前視頻捕獲，不發 fetch
+    window.history.replaceState({}, '', '/');
   });
 });

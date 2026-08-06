@@ -13,13 +13,22 @@
       return false;
     }
   }
+  function extractVideoId(url) {
+    try {
+      const u = new URL(url, globalThis.location?.href ?? url);
+      return u.searchParams.get("v") ?? "";
+    } catch {
+      return "";
+    }
+  }
   function emitCapture(url, responseText, contentType, location) {
     if (!responseText) return;
     const capture = {
       url,
       responseText,
       contentType: contentType || "unknown",
-      capturedAt: Date.now()
+      capturedAt: Date.now(),
+      videoId: extractVideoId(url)
     };
     const postMsg = globalThis.postMessage.bind(globalThis);
     postMsg(

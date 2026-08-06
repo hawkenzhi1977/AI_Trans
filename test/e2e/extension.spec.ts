@@ -108,7 +108,7 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     // 模擬 Options 頁保存配置（寫 chrome.storage.local）。content-script 監聽 onChanged，
     // 應觸發 restart 而非殘留多個覆蓋層或崩潰——驗證跨上下文熱重載鏈路。
     // 注意：chrome.storage 僅在擴充上下文可用（頁面主世界無），故經 service worker 寫入。
-    await page.goto('/with-native-captions.html');
+    await page.goto('/with-native-captions.html?v=abc123');
     await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
 
     // 取得擴充 service worker（MV3 background）。可能尚未啟動，等待其出現。
@@ -139,6 +139,33 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     await page.waitForTimeout(1500);
     await expect(page.locator('.ai-trans-overlay')).toHaveCount(1);
     await expect(page.locator('.ai-trans-overlay')).toBeAttached();
+  });
+
+  test('[M1-45] SPA 換視頻後字幕重新出現（舊視頻捕獲不誤用，新捕獲生效）', async ({ page }) => {
+    // 場景重現：用戶反饋「首次成功一次，換視頻後永久失敗」。
+    // 機制：YouTube 換視頻為 SPA（pushState），content-script 不重載——
+    // 修復後 content-script 偵測 URL v 參數變化 → 熱重啟字幕管線 → 新播放器發新請求
+    // → 捕獲（含新 videoId）→ 複用成功。
+    await page.goto('/with-native-captions.html?v=abc123');
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+    await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 8_000 });
+
+    // 清零計數：記錄換視頻後新播放器的請求次數。
+    await page.evaluate(() =>
+      fetch('/__mock-caption-request-count/reset').then((r) => r.json())
+    );
+
+    // 模擬 SPA 換視頻：pushState 到新 v，並派發 popstate 兜底。
+    await page.evaluate(() => {
+      history.pushState({}, '', '/with-native-captions.html?v=videoB');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+
+    // content-script 偵測 v 變化 → restart → 新播放器請求 → 字幕重新出現。
+    await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 10_000 });
+
+    // 覆蓋層不累積（restart 清理舊訂閱）。
+    await expect(page.locator('.ai-trans-overlay')).toHaveCount(1);
   });
 
   test('[TC-F11] 翻譯降級時寫入 lastDiagnostic 診斷記錄（用戶可查失敗原因）', async ({ page, context }) => {

@@ -60,18 +60,38 @@
   // 供擴充 MAIN world 攔截器捕獲（M1-43：捕獲 → 複用，擴充自身不再 fetch）。
   // 註：XHR 請求 /timedtext 由 serve-mock 端點響應（請求計數由服務端暴露）。
   let captionsRequested = false;
+  function currentVideoId() {
+    const m = /[?&]v=([^&]+)/.exec(window.location.search);
+    return m ? m[1] : '';
+  }
   function requestCaptions() {
     if (captionsRequested) return;
     captionsRequested = true;
     try {
       const xhr = new XMLHttpRequest();
-      xhr.open('GET', '/timedtext?lang=en&v=abc123');
+      // M1-45：URL 帶當前 v 參數（換視頻後播放器以新 v 重新請求）。
+      xhr.open('GET', '/timedtext?lang=en&v=' + encodeURIComponent(currentVideoId()));
       xhr.send();
     } catch (err) {
       // 請求失敗不影響 mock 播放器本身（僅影響擴充捕獲）。
       window.__mockCaptionRequestError = String(err);
     }
   }
+
+  // SPA 換視頻：偵測 URL 的 v 參數變化後重置「已請求」標記，讓播放器重新發請求。
+  // 與 YouTube 換視頻行為一致（content-script 不重載，僅 URL 變化）。
+  let lastVideoId = currentVideoId();
+  setInterval(() => {
+    const v = currentVideoId();
+    if (v && v !== lastVideoId) {
+      lastVideoId = v;
+      captionsRequested = false;
+      playing = true;
+      t = 0;
+      render();
+      requestCaptions();
+    }
+  }, 200);
 
   setInterval(() => {
     const prev = playing;

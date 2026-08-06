@@ -13,6 +13,15 @@ import type { EngineConfig } from '../domain/models/config';
 /** 內容腳本側的播放器容器選擇器（YouTube + Mock 站點）。 */
 const PLAYER_SELECTOR = 'div#movie_player, .html5-video-player, #mock-player';
 
+/** 從 watch URL 提取視頻 ID（`/watch?v=` 的 v 參數）；非 watch 頁或無參數返回空串。 */
+function extractVideoId(url: string): string {
+  try {
+    return new URL(url).searchParams.get('v') ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /** 等待播放器出現的超時（毫秒）：超時放棄等待，避免 Promise 永久懸掛。 */
 const MOUNT_WAIT_TIMEOUT_MS = 15_000;
 
@@ -33,9 +42,27 @@ class SubtitleController {
   private unsubscribeConfig: (() => void) | null = null;
   private pendingMountObserver: MutationObserver | null = null;
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
+  // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
+  // 偵測 URL 的 v 參數變化後熱重啟字幕管線。dispose 時必須解除/恢復（R4）。
+  private readonly onUrlChangedBound: () => void;
+  private readonly origPushState: typeof history.pushState;
+  private readonly origReplaceState: typeof history.replaceState;
+  private readonly patchedHistory: boolean;
+  private lastVideoId: string;
+  private urlChangeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private config: EngineConfig, url: string) {
     this.url = url;
+    this.lastVideoId = extractVideoId(url);
+    this.onUrlChangedBound = this.onUrlChanged.bind(this);
+    // SPA 導航監聽：popstate 捕獲後退/前進；pushState/replaceState 捕獲
+    // YouTube 前進式換視頻（標準事件不觸發，需 patch 攔截）。M1-45。
+    globalThis.addEventListener('popstate', this.onUrlChangedBound);
+    this.origPushState = history.pushState;
+    this.origReplaceState = history.replaceState;
+    // §5.7：patch 是替換宿主方法——必須保留原始引用並在 dispose 恢復，防止洩漏/疊加。
+    this.patchedHistory = this.patchHistoryApi();
+    this.urlChangeTimer = null;
     // 配置變更（Options 頁保存）→ 熱重啟。
     // 注意：Options 與 content-script 是不同 JS 上下文，store.subscribe 的內存回調不跨上下文；
     // 必須監聽 chrome.storage.onChanged 才能收到跨頁變更（engineConfig / engineConfigKeys 兩個 key）。
@@ -150,6 +177,61 @@ class SubtitleController {
     this.bridge.dispose();
     this.unsubscribeConfig?.();
     this.unsubscribeConfig = null;
+    // R4：解除 SPA 導航監聽並恢復被 patch 的 history API（防止疊加/洩漏）。
+    globalThis.removeEventListener('popstate', this.onUrlChangedBound);
+    if (this.patchedHistory) {
+      // §5.7/R2：恢復原始引用，禁止被多次 patch 後嵌套疊加。
+      history.pushState = this.origPushState;
+      history.replaceState = this.origReplaceState;
+    }
+  }
+
+  /** 偵測 URL 的 v 參數變化（SPA 換視頻）→ 熱重啟字幕管線（M1-45）。 */
+  private onUrlChanged(): void {
+    // debounce：同一導航可能 popstate 與 pushState 各觸發一次，避免重複 restart。
+    if (this.urlChangeTimer !== null) return;
+    const videoId = extractVideoId(window.location.href);
+    if (videoId === this.lastVideoId) return; // 同一視頻（如僅參數調整），不重啟。
+    this.lastVideoId = videoId;
+    this.urlChangeTimer = setTimeout(() => {
+      this.urlChangeTimer = null;
+      // §5.5/R6：SPA 換視頻後重啟失敗必須落診斷，不許靜默。
+      void this.restart().catch((err) => {
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'platform',
+            code: 'spa-navigation-restart-failed',
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err)),
+          },
+        });
+      });
+    }, 300);
+  }
+
+  /**
+   * Patch history.pushState/replaceState，捕獲 SPA 換視頻導航（R4 需可解除）。
+   * 返回是否成功 patch（patch 失敗時僅靠 popstate 兜底）。
+   */
+  private patchHistoryApi(): boolean {
+    try {
+      // R1：宿主方法必須綁定接收者——調用原始 pushState 需以 history 為接收者。
+      history.pushState = ((data: unknown, unused: string, url?: string | URL | null) => {
+        this.origPushState.call(history, data, unused, url);
+        // 同步觸發 URL 變化檢查（YouTube pushState 後 location.href 已更新）。
+        this.onUrlChanged();
+      }) as typeof history.pushState;
+      history.replaceState = ((data: unknown, unused: string, url?: string | URL | null) => {
+        this.origReplaceState.call(history, data, unused, url);
+        this.onUrlChanged();
+      }) as typeof history.replaceState;
+      return true;
+    } catch (err) {
+      // §5.6：patch 失敗（嚴格模式拒絕改只讀屬性等）不靜默——留麵包屑，popstate 仍兜底。
+      console.warn('[AI_Trans] SPA navigation patch failed, falling back to popstate only:', err);
+      return false;
+    }
   }
 
   private onEvent(e: PipelineEvent): void {

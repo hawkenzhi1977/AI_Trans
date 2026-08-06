@@ -25,21 +25,28 @@
   </div>
 
   <!-- 模擬 YouTube 內嵌的 ytInitialPlayerResponse（純 JSON，供 FetchCaptionSource 解析）。
-       baseUrl 指向同源 /timedtext 端點，由 app.js 的 fetch 攔截返回字幕。 -->
-  <script id="ytInitialPlayerResponse" type="application/json">
-  {
-    "captions": {
-      "playerCaptionsTracklistRenderer": {
-        "captionTracks": [
-          {
-            "baseUrl": "/timedtext?lang=en&v=abc123",
-            "languageCode": "en",
-            "kind": "standard"
-          }
-        ]
-      }
-    }
-  }
+       baseUrl 指向同源 /timedtext 端點，由 app.js 的 fetch 攔截返回字幕。
+       M1-45：baseUrl 的 v 由 JS 按當前 URL 動態注入，支持 SPA 換視頻場景。 -->
+  <script>
+    const _m = /[?&]v=([^&]+)/.exec(window.location.search);
+    const _v = _m ? _m[1] : 'abc123';
+    const _script = document.createElement('script');
+    _script.id = 'ytInitialPlayerResponse';
+    _script.type = 'application/json';
+    _script.textContent = JSON.stringify({
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [
+            {
+              baseUrl: '/timedtext?lang=en&v=' + encodeURIComponent(_v),
+              languageCode: 'en',
+              kind: 'standard',
+            },
+          ],
+        },
+      },
+    });
+    document.body.appendChild(_script);
   </script>
 
   <script src="app.js"></script>

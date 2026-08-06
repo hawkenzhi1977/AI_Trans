@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制與 M1-43 捕獲時序修復：注入提前/等待捕獲窗口/雙 hook/stop 保留緩存）
+> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制與 M1-43 捕獲時序修復：注入提前/等待捕獲窗口/雙 hook/stop 保留緩存；**M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗**）
 
 ---
 
@@ -170,7 +170,7 @@ src/
     ├── composition.ts           # buildDefaultRegistry（async，依配置選引擎 + 解析 apiKey）
     ├── endpoint.ts              # normalizeEndpoint：端點規範化純函數（零依賴，composition/connection-test 共用）
     ├── timedtext-bridge.ts      # TimedTextBridge：接收 MAIN world 攔截的 timedtext 捕獲（isolated world 側消息橋）
-    ├── yt-timedtext-interceptor.ts # M1-42：MAIN world XHR hook，捕獲播放器 pot 化 timedtext 響應（web_accessible_resources 放行，IIFE 打包）
+    ├── yt-timedtext-interceptor.ts # M1-42/45：MAIN world XHR+fetch hook，捕獲播放器 pot 化 timedtext 響應（manifest `world:"MAIN"`+`document_start` 注入 + 動態注入兜底，IIFE 打包）
     ├── offscreen.ts             # M2：音頻/推理
     ├── options/                 # 配置頁（options.ts/html，IIFE）
     └── popup/                   # 彈出頁（popup.ts/html + connection-test.ts 連接測試，IIFE）
@@ -374,6 +374,14 @@ export interface PlatformAdapter {
 > `TimedTextBridge` 另新增 **2s 輪詢器**（`POLL_INTERVAL_MS = 2000`，`setInterval`）：僅探查 `document.querySelector('video')` 的播放狀態（不主動請求任何 timedtext URL），配合 `waitForCapture` 的 message 事件 + 輪詢通知雙通道（message 未達時輪詢補上）；interval handle 存字段、`stop()/dispose()` 清除（§5.4/R4）。`isTimedText` 的 hostname 匹配放寬為 `hostname.endsWith('youtube.com') || hostname === 'localhost'`（後者供 E2E mock；生產僅 youtube.com 注入可控）。
 >
 > **E2E 測試盲區根因（重要）**：`web_accessible_resources` 的 `matches` 原只含 `https://www.youtube.com/*`，E2E mock 頁（`http://localhost:8721/*`）**未被放行** → Chrome 拒絕載入 MAIN world 腳本（"Resources must be listed in the web_accessible_resources manifest key"）→ **M1-42 的「捕獲鏈路」在 E2E 從未真正運行過**（E2E 只驗證了「無捕獲回退」路徑，死碼通過）。M1-43 修復：`scripts/copy-static.mjs` 在 `TEST_PROFILE=1` 構建時向 `web_accessible_resources` 各條目的 `matches` **追加** `http://localhost:8721/*`（生產 manifest 保持乾淨）；新增 mock 服務端計數端點 `/__mock-caption-request-count`（+`/reset`），E2E 斷言播放器 XHR 請求計數 = 1（擴充零 fetch，捕獲複用成立）。測試落點：集成 +11（timedtext-bridge +6：stop 保留 latest/start 冪等/inject 冪等/dispose 後不接收/waitForCapture 立即-到達-超時三分支/輪詢器 interval；interceptor +2：localhost 匹配 + fetch hook 兩分支；platform-adapter +3：等待捕獲後複用不發 fetch/超時回退 fetch/無 waitForCapture 舊實現直接 fetch）；E2E +1（TC-F19 捕獲鏈路）。對應 TC-F17/TC-F18/TC-F19/TC-R9。
+>
+> **注入時序終極修復 + SPA 換視頻 + 跨視頻捕獲失效（M1-45，「成功一次→換視頻永久失敗」根因修復）**：M1-43 落地後真實環境仍現「首次成功、換視頻/切回/重載永久失敗」。三層根因與修改：
+>
+> - **(1) 注入時序（核心）**：content-script 的 `run_at` 是 **`document_idle`**——即使 M1-43 把 `bridge.inject()` 提到 `start()` 第一行，**整段 content-script 也在頁面加載完成後（document_idle）才運行**。首次加載（網絡/DOM 慢）攔截器碰巧趕在播放器 timedtext 請求前裝好 → 成功；帶緩存二次加載/SPA 導航（播放器初始化極快）**timedtext 請求在 document_idle 前已發出並完成** → 攔截器永遠錯過 → `getLatest()` 恆 null → `waitForCapture(15s)` 超時 → 直接 fetch（無 pot）→ 空 body → 永久失敗（`INSTALL_FLAG` 在 MAIN world 殘留使重裝也不重 hook）。**修復：manifest 新增獨立 content_scripts 條目 `{ world: "MAIN", run_at: "document_start", js: [interceptor], all_frames: true }` 直接聲明注入攔截器**（頁面最早階段、播放器請求前 hook 就位）；content-script 動態 `<script src>` 注入**保留為兜底**（`INSTALL_FLAG` 冪等共用，manifest 注入先跑 → 動態注入被跳過，二者不衝突）。`copy-static.mjs` 的 `TEST_PROFILE` 已對**所有** content_scripts 追加 localhost match，新條目自動覆蓋 E2E。
+> - **(2) SPA 換視頻無重新觸發**：YouTube 換視頻為 pushState（SPA），content-script 不重載、orchestrator 不重跑 → 換視頻後**根本不會重新 fetchTracks**。**修復：`SubtitleController` 監聽 `popstate` + patch `history.pushState/replaceState`**（§5.1 綁定：調原始方法用 `.call(history, …)`；§5.7/R2：保存原始引用，`dispose()` 恢復，防疊加洩漏），偵測 URL `v` 參數變化 → debounce（300ms）後 `restart()` 重跑字幕管線；失敗落診斷 `spa-navigation-restart-failed`（§5.6）。
+> - **(3) 跨視頻捕獲誤用**：`TimedTextBridge.latest` 是上一視頻的捕獲，`tryReuseCapture` 會把舊字幕貼到新視頻。**修復：interceptor 捕獲時從 timedtext URL 提取 `videoId`**（`TimedTextCapture.videoId`）；`waitForCapture(timeoutMs, expectedVideoId?)` 僅接受匹配當前視頻的捕獲（`matchesVideo`：無 `expectedVideoId` 或捕獲無 `videoId` 時**保守接受**，明確不同才拒絕）；`FetchCaptionSource.currentVideoId()`（從 `doc.location.href` 的 `v` 提取）供 `tryReuseCapture`/`waitForCaptureReuse` 校驗，stale 跳過寫診斷 `timedtext capture is for another video …`，併入超時診斷形成完整原因鏈（§5.6）。另修 `timedtext-bridge.ts` `waitForCapture` 超時分支原 `this.pollTimer = null`（未 clearInterval）導致 `stop()` 無法清理輪詢器的洩漏——超時只解除本次等待、**不釋放輪詢器引用**（輪詢器由 `ensurePolling`/`stop` 統一管理）。
+>
+> 測試落點：集成 +4（`timedtext-bridge.test.ts` +2：waitForCapture 期望 videoId 過濾 [latest 不匹配則等待/已匹配立即返回] + 超時後 stop 仍 clearInterval；`platform-adapter.test.ts` +2：stale 跳過複用+診斷原因鏈、同視頻正常複用）+ `yt-timedtext-interceptor.test.ts` +2（videoId 提取 / URL 無 v 為空串）；E2E +1（TC-F21 SPA 換視頻後字幕重新出現）。對應 TC-F21（system-test-design §4）。
 >
 > **訂閱/Observer 洩漏**（restart 路徑）：`SubtitleController` 的 `observePlayback` 返回 unsubscribe 必須保存為實例字段並在 `stop()` 調用；`MutationObserver` 等待播放器就緒時須保存 handle 供 stop 中斷，並加 15s 超時避免 Promise 永久懸掛（SPA 導航離開 watch 頁時播放器永不出現）。每次 restart（配置變更）前必須完整清理上一輪全部訂閱/Observer/rAF，否則監聽器線性累積 → 內存洩漏 + CPU 空轉。
 >

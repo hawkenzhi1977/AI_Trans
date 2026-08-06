@@ -70,6 +70,43 @@ describe('yt-timedtext-interceptor — XHR 攔截', () => {
     expect(msg.payload.responseText).toBe('{"events":[]}');
   });
 
+  it('[M1-45] 捕獲攜帶 videoId（從 timedtext URL v 參數提取）', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    const url = 'https://www.youtube.com/api/timedtext?v=abc123&lang=en&fmt=json3';
+    xhr.open('GET', url);
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    const msg = postMessageSpy.mock.calls[0][0] as {
+      payload: { videoId?: string };
+    };
+    expect(msg.payload.videoId).toBe('abc123');
+  });
+
+  it('[M1-45] timedtext URL 無 v 參數時 videoId 為空串（不誤提取）', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?lang=en&fmt=json3');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    const msg = postMessageSpy.mock.calls[0][0] as {
+      payload: { videoId?: string };
+    };
+    expect(msg.payload.videoId).toBe('');
+  });
+
   it('[R7] 非 timedtext 請求不觸發 postMessage', async () => {
     await loadInterceptor();
     const xhr = new XMLHttpRequest();

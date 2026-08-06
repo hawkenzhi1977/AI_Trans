@@ -49,6 +49,8 @@ const server = createServer((req, res) => {
       'We are testing subtitles',
       'Translation should appear below',
     ];
+    // M1-45：videoId 反映請求的 v 參數（供 SPA 換視頻 E2E 驗證跨視頻捕獲校驗）。
+    const videoId = url.searchParams.get('v') ?? 'unknown';
     const body = JSON.stringify({
       events: lines.map((text, i) => ({
         tStartMs: i * 2000,
@@ -56,7 +58,7 @@ const server = createServer((req, res) => {
         segs: [{ utf8: text }],
       })),
       lang: 'en',
-      videoId: 'abc123',
+      videoId,
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     res.end(body);

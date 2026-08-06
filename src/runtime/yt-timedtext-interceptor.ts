@@ -27,6 +27,8 @@ export interface TimedTextCapture {
   contentType: string;
   /** 捕獲時間戳（供最新優先）。 */
   capturedAt: number;
+  /** 該 timedtext 請求所屬的視頻 ID（從 URL `v` 參數提取）；無法判定時為空串。 */
+  videoId?: string;
 }
 
 /** 注入標記：防止 content-script 重複注入本腳本（SPA 導航/restart 場景）。 */
@@ -45,6 +47,16 @@ function isTimedText(url: string): boolean {
   }
 }
 
+/** 從 timedtext URL 的 `v` query 參數提取視頻 ID；無則返回空串。 */
+function extractVideoId(url: string): string {
+  try {
+    const u = new URL(url, globalThis.location?.href ?? url);
+    return u.searchParams.get('v') ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /** 捕獲並 postMessage 一份響應（非空才轉發，避免污染最新值）。 */
 function emitCapture(
   url: string,
@@ -58,6 +70,7 @@ function emitCapture(
     responseText,
     contentType: contentType || 'unknown',
     capturedAt: Date.now(),
+    videoId: extractVideoId(url),
   };
   const postMsg = globalThis.postMessage.bind(globalThis);
   postMsg(
