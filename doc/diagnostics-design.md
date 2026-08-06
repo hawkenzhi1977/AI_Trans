@@ -185,10 +185,22 @@
 - **診斷碼**: timedtext capture wait timeout (<<ms>> ms) — fall back to direct fetch
 - **用戶可見消息**: 最近失敗: 錯誤: Error: timedtext capture wait timeout (15000 ms) — fall back to direct fetch (<timestamp>)
 - **觸發條件**: `FetchCaptionSource.fetchTracks` 進入 `waitForCapture` 等待窗口（默認 15,000ms）但播放器始終未發出可捕獲的 timedtext 請求（或請求未帶 pot/未成功），超時後回退直接 fetch
-- **根因**: 攔截器注入時序錯誤（播放器請求早於注入被漏）；播放器未開字幕（無 timedtext 請求）；`isTimedText` 未匹配播放器實際請求 URL；播放器使用未被 hook 的請求路徑
+- **根因**: 攔截器注入時序錯誤（播放器請求早於注入被漏）；播放器未開字幕（無 timedtext 請求）；`isTimedText` 未匹配播放器實際請求 URL；播放器使用未被 hook 的請求路徑；**捕獲早於 `TimedTextBridge` 監聽器註冊，`postMessage` 無接收者而丟失（M1-46 已由 1.5s `lastCapture` 重播修復）**
 - **用戶響應**: 無需操作——擴充自動回退直接 fetch（無 pot 時極可能再現 `timedtext XML: parse error` 空 body 診斷，說明 pot 防護仍在生效）
-- **開發者響應**: 確認 content-script `start()` 第一行已 `bridge.inject()`（早於任何 await）；`waitForCapture` 超時 timer 是否被清理（§5.4）；播放器實際請求的 timedtext URL 是否命中 `isTimedText`（XHR + fetch 雙 hook 均裝）
-- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`waitForCaptureReuse`/`waitForCaptureTimeoutMs`）;src/runtime/timedtext-bridge.ts（`waitForCapture`）;src/runtime/yt-timedtext-interceptor.ts（`isTimedText`）;src/runtime/content-script.ts（inject 提前）
+- **開發者響應**: 確認 content-script `start()` 第一行已 `bridge.inject()`（早於任何 await）；`waitForCapture` 超時 timer 是否被清理（§5.4）；播放器實際請求的 timedtext URL 是否命中 `isTimedText`（XHR + fetch 雙 hook 均裝）；**用 §2.14 調試輔助分流：`window.__aiTransTimedtextRequests === 0` → hook 未觸發（isTimedText 沒匹配/播放器未請求）；有值但字幕不顯示 → 捕獲成功但解析/複用斷**
+- **代碼落點**: src/adapters/platform/youtube/platform-adapter.ts（`waitForCaptureReuse`/`waitForCaptureTimeoutMs`）;src/runtime/timedtext-bridge.ts（`waitForCapture`）;src/runtime/yt-timedtext-interceptor.ts（`isTimedText`/`startReplay`）;src/runtime/content-script.ts（inject 提前）
+
+### 2.14 攔截器捕獲調試輔助（M1-46，非診斷碼，控制台一鍵分流）
+
+- **輔助全局變量**（MAIN world，`window` 上）:
+  - `window.__aiTransTimedtextInterceptorInstalled`（boolean）：攔截器是否已在 MAIN world 裝載（hook 就位）。
+  - `window.__aiTransTimedtextRequests`（number）：命中 `isTimedText` 且成功捕獲（HTTP 200 + 非空 body）的請求計數。
+  - `window.__aiTransTimedtextLastCapture`（object|null）：最近一次捕獲對象（含 `videoId`、`text`、`url` 等），供比對當前視頻。
+- **用途**: 真實 YouTube 登錄環境（M1-27）手動冒煙時，於頁面 DevTools Console 讀取三值一鍵分流故障——
+  - `Installed !== true` → MAIN world 腳本未載入（檢查 manifest `world:"MAIN"` 條目與 `web_accessible_resources` 放行）。
+  - `Installed === true` 但 `__aiTransTimedtextRequests === 0` → hook 已裝但從未捕獲：`isTimedText` 未匹配播放器實際 URL，或播放器未發字幕請求（未開字幕）。
+  - `__aiTransTimedtextRequests > 0` 但字幕仍不顯示 → 捕獲成功但下游斷：對照 `__aiTransTimedtextLastCapture.videoId` 是否為當前視頻（跨視頻 stale），或 content-script `parseTimedText` 解析失敗（見 §2.12），或消息未達 bridge（M1-46 前的競態，已由重播修復）。
+- **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`install`/`emitCapture`/`startReplay`）
 
 
 ---

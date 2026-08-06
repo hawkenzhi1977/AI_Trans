@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45 注入時序 document_start + 跨視頻捕獲失效）；測試合計 113→139→153→164→168→175）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45 注入時序 document_start + 跨視頻捕獲失效）、**TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）**；測試合計 113→139→153→164→168→175→182）
 
 ---
 
@@ -415,6 +415,18 @@ jobs:
 - 預期：SPA 導航換視頻後字幕自動重新出現；跨視頻捕獲不誤用。
 - 落點：E2E `test/e2e/extension.spec.ts`（+1）；配套 `test/fixtures/mock-youtube/app.js`（v 動態 + 換視頻重發）、`with-native-captions.html`（ytInitialPlayerResponse 動態注入，baseUrl 按當前 v）、`scripts/serve-mock.mjs`（videoId 動態）；集成 `test/integration/timedtext-bridge.test.ts`（+2：waitForCapture 期望 videoId 過濾 + 超時後 stop 仍 clearInterval）、`test/integration/platform-adapter.test.ts`（+2：stale 跳過+診斷原因鏈、同視頻正常複用）、`test/integration/yt-timedtext-interceptor.test.ts`（+2：videoId 提取、URL 無 v 為空串）。
 
+#### TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（對應 F-01/M1-46，已實裝）
+- 前置：M1-45 把攔截器以 `document_start`（MAIN world）注入後，引入新競態——攔截器捕獲響應並 `postMessage`，但 `TimedTextBridge` 的 `message` 監聽器在 content-script（`document_idle`）才註冊；帶緩存二次加載時播放器 timedtext 請求在 document_idle 前發出，捕獲消息發在監聽器就位前永久丟失 → `waitForCapture(15s)` 超時 → pot 空響應失敗。修復：攔截器維護模塊級 `lastCapture`，`install()` 啟 1.5s 定時器周期重播，晚註冊的監聽器最遲 1.5s 內收到。
+- 步驟（集成測試覆蓋）：
+  - A（重播晚註冊監聽器收到）：`loadInterceptor` → 捕獲一次（XHR/fetch 命中 timedtext）→ 斷言即時 postMessage + 推進 fake timer 1.5s → 斷言第二次 postMessage 重播 payload 相同。
+  - B（新捕獲覆蓋重播）：捕獲 `v=abc` 後捕獲 `v=xyz` → 推進 1.5s → 重播為 `v=xyz`（不發舊捕獲）。
+  - C（空響應不重播）：捕獲非空響應後捕獲空響應（`emitCapture` return）→ 重播仍發非空捕獲、不發空。
+  - D（放寬匹配）：`video.google.com/timedtext` URL 被 `isTimedText` 匹配並捕獲。
+  - E（調試輔助）：捕獲後 `window.__aiTransTimedtextRequests` 計數遞增、`__aiTransTimedtextLastCapture` 更新為當前捕獲對象（含 `videoId`）。
+  - F（bridge 晚註冊收到重播）：`TimedTextBridge` 在捕獲已發生後才 `start()`，重播消息送達 → `getLatest()` 就緒 → `waitForCapture` 立即命中。
+- 預期：重播使晚註冊監聽器收到捕獲（消息丟失競態修復）；SPA 換視頻後新捕獲覆蓋重播（`matchesVideo` 過濾仍正確）；調試輔助供 M1-27 真實環境定位「hook 沒觸發」vs「捕獲到但解析/複用斷」。
+- 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+6：重播晚註冊/新捕獲覆蓋/空響應不重播/video.google.com 匹配/調試計數+lastCapture）、`test/integration/timedtext-bridge.test.ts`（+1：晚註冊收到重播）。E2E 時序盲區：mock 播放器請求時機設計在 content-script 就緒後，「捕獲早於監聽器」競態在 E2E 不暴露，由確定性集成用例覆蓋（避免 mock 時序 flaky）。
+
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
 - 步驟：
@@ -484,7 +496,7 @@ jobs:
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
 | TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 175（單元 53 + 契約 11 + 集成 98 + E2E 15）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。新增（TC-F19 捕獲鏈路 + M1-43 捕獲時序修復）：集成 +11（`timedtext-bridge.test.ts` +6：stop 保留 latest + start 冪等 + inject 冪等 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval；`yt-timedtext-interceptor.test.ts` +2：localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截；`platform-adapter.test.ts` +3：等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch）、E2E +1（TC-F19 捕獲鏈路：WAR 追加 localhost 後斷言 mock 播放器請求計數 = 1、擴充零 fetch）。新增（TC-F20 LLM body 讀取失敗與非 JSON 區分，M1-44）：單元 +2（`llm-translation.test.ts`：res.json() 拋 `TypeError('Failed to fetch')` → 「connection lost」且不含 not-valid-JSON；拋 `SyntaxError` → 仍報 not-valid-JSON 且不含 connection lost）。新增（TC-F21 SPA 換視頻 + M1-45 注入時序/跨視頻失效）：集成 +8（`timedtext-bridge.test.ts` +2：waitForCapture 期望 videoId 過濾兩分支 + 超時後 stop 仍 clearInterval；`yt-timedtext-interceptor.test.ts` +2：videoId 提取 + URL 無 v 空串；`platform-adapter.test.ts` +2：stale 跳過複用 + 診斷原因鏈、同視頻正常複用——另改 1 斷言：等待捕獲後複用 `toHaveBeenCalledWith(15_000, '')`，jsdom location 無 v 故期望空串）、E2E +1（TC-F21：SPA pushState 換視頻後字幕重新出現、無舊字幕殘留）。
+> 全部測試合計 182（單元 53 + 契約 11 + 集成 104 + E2E 15）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。新增（TC-F17 外部接口調用節點診斷證據化）：單元 +11（`llm-translation.test.ts` 3：非 JSON/choices 缺失/choices 非字符串；`chrome-message-bus.test.ts` 4：無接收方靜默/錯誤警告/dispose/消息分發；`service-worker.test.ts` 4：config:get/set 成功與失敗/未知 topic）、集成 +12（`platform-adapter.test.ts` 6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造 + observePlayback 麵包屑；`popup.test.ts` 3：配置讀取失敗/密鑰讀取失敗/重新載入反饋；`options.test.ts` 3：正常填充/配置失敗/密鑰失敗）、契約 +3（timedtext 非法 JSON 片段/HTML 證據/snippet）。新增（TC-F18 pot token 攔截複用）：集成 +14（`timedtext-bridge.test.ts` 5：inject 冪等 + getLatest + start/dispose 清理 + 外部消息過濾 + dispose 後不接收；`yt-timedtext-interceptor.test.ts` 4：open/send hook + URL 匹配 + load 轉發 + 空響應不轉發；`platform-adapter.test.ts` +5：捕獲複用不發 fetch / srv3 捕獲 / 無捕獲回退 / 空捕獲走 fetch / 捕獲解析失敗回退 + 診斷；`setup-dom.ts` 補 `chrome.runtime.getURL` mock）。新增（TC-F19 捕獲鏈路 + M1-43 捕獲時序修復）：集成 +11（`timedtext-bridge.test.ts` +6：stop 保留 latest + start 冪等 + inject 冪等 + dispose 後不接收 + waitForCapture 三分支：立即/捕獲到達/超時 + 輪詢器 interval；`yt-timedtext-interceptor.test.ts` +2：localhost 匹配 + fetch hook：timedtext 透傳+捕獲 / 非 timedtext 不攔截；`platform-adapter.test.ts` +3：等待捕獲後複用不發 fetch / 超時回退 fetch / 無 waitForCapture 舊實現直接 fetch）、E2E +1（TC-F19 捕獲鏈路：WAR 追加 localhost 後斷言 mock 播放器請求計數 = 1、擴充零 fetch）。新增（TC-F20 LLM body 讀取失敗與非 JSON 區分，M1-44）：單元 +2（`llm-translation.test.ts`：res.json() 拋 `TypeError('Failed to fetch')` → 「connection lost」且不含 not-valid-JSON；拋 `SyntaxError` → 仍報 not-valid-JSON 且不含 connection lost）。新增（TC-F21 SPA 換視頻 + M1-45 注入時序/跨視頻失效）：集成 +8（`timedtext-bridge.test.ts` +2：waitForCapture 期望 videoId 過濾兩分支 + 超時後 stop 仍 clearInterval；`yt-timedtext-interceptor.test.ts` +2：videoId 提取 + URL 無 v 空串；`platform-adapter.test.ts` +2：stale 跳過複用 + 診斷原因鏈、同視頻正常複用——另改 1 斷言：等待捕獲後複用 `toHaveBeenCalledWith(15_000, '')`，jsdom location 無 v 故期望空串）、E2E +1（TC-F21：SPA pushState 換視頻後字幕重新出現、無舊字幕殘留）。新增（TC-F22 攔截器重播修復捕獲早於監聽器註冊競態，M1-46）：集成 +7（`yt-timedtext-interceptor.test.ts` +6：重播晚註冊監聽器收到 / 新捕獲覆蓋重播 SPA 換視頻 / 空響應不重播 / video.google.com 放寬匹配 / 調試計數+lastCapture；`timedtext-bridge.test.ts` +1：晚註冊收到重播）。
 >
 > **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
@@ -534,6 +546,7 @@ jobs:
 | TC-F19 | F-01 | 集成/E2E（已實裝） |
 | TC-F20 | F-11 | 單元（已實裝） |
 | TC-F21 | F-01 | 集成/E2E（已實裝） |
+| TC-F22 | F-01 | 集成（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |

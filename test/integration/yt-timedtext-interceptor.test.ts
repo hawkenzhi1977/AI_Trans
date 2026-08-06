@@ -152,6 +152,149 @@ describe('yt-timedtext-interceptor — XHR 攔截', () => {
     expect(msg.type).toBe('ai-trans:timedtext-capture');
     expect(msg.payload.url).toContain('/timedtext');
   });
+
+  it('[M1-46] 重播：晚註冊的監聽器收到最近捕獲（修復 document_start 注入早於 bridge 監聽器就位的競態）', async () => {
+    vi.useFakeTimers();
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    // 即時 postMessage（第一次）。
+    expect(postMessageSpy).toHaveBeenCalledTimes(1);
+    const firstCall = postMessageSpy.mock.calls[0][0] as { payload: { url: string; responseText: string } };
+    expect(firstCall.payload.responseText).toBe('{"events":[]}');
+    // 推進 1.5s，重播定時器觸發（第二次 postMessage，payload 相同）。
+    vi.advanceTimersByTime(1500);
+    expect(postMessageSpy).toHaveBeenCalledTimes(2);
+    const replayCall = postMessageSpy.mock.calls[1][0] as { payload: { url: string; responseText: string } };
+    expect(replayCall.payload.url).toBe(firstCall.payload.url);
+    expect(replayCall.payload.responseText).toBe(firstCall.payload.responseText);
+    vi.useRealTimers();
+  });
+
+  it('[M1-46] 新捕獲覆蓋重播（SPA 換視頻場景）', async () => {
+    vi.useFakeTimers();
+    await loadInterceptor();
+    // 第一次捕獲（v=abc）。
+    const xhr1 = new XMLHttpRequest();
+    xhr1.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr1, 'responseText', { value: '{"events":[{"tStartMs":0}]}', configurable: true });
+    vi.spyOn(xhr1, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr1.send();
+    } catch {
+      /* ignore */
+    }
+    xhr1.dispatchEvent(new Event('load'));
+    postMessageSpy.mockClear();
+    // 第二次捕獲（v=xyz，新視頻）。
+    const xhr2 = new XMLHttpRequest();
+    xhr2.open('GET', 'https://www.youtube.com/api/timedtext?v=xyz&lang=en');
+    Object.defineProperty(xhr2, 'responseText', { value: '{"events":[{"tStartMs":1000}]}', configurable: true });
+    vi.spyOn(xhr2, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr2.send();
+    } catch {
+      /* ignore */
+    }
+    xhr2.dispatchEvent(new Event('load'));
+    // 推進 1.5s，重播應發送新捕獲（v=xyz）而非舊捕獲（v=abc）。
+    vi.advanceTimersByTime(1500);
+    const replayCall = postMessageSpy.mock.calls[postMessageSpy.mock.calls.length - 1][0] as {
+      payload: { url: string; videoId?: string };
+    };
+    expect(replayCall.payload.url).toContain('v=xyz');
+    expect(replayCall.payload.videoId).toBe('xyz');
+    vi.useRealTimers();
+  });
+
+  it('[M1-46] 空響應不更新 lastCapture，重播不發空', async () => {
+    vi.useFakeTimers();
+    await loadInterceptor();
+    // 先捕獲一個非空響應。
+    const xhr1 = new XMLHttpRequest();
+    xhr1.open('GET', 'https://www.youtube.com/api/timedtext?v=abc');
+    Object.defineProperty(xhr1, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr1, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr1.send();
+    } catch {
+      /* ignore */
+    }
+    xhr1.dispatchEvent(new Event('load'));
+    const initialCallCount = postMessageSpy.mock.calls.length;
+    // 再捕獲空響應（emitCapture 第 67 行 return，不更新 lastCapture）。
+    const xhr2 = new XMLHttpRequest();
+    xhr2.open('GET', 'https://www.youtube.com/api/timedtext?v=xyz');
+    Object.defineProperty(xhr2, 'responseText', { value: '', configurable: true });
+    try {
+      xhr2.send();
+    } catch {
+      /* ignore */
+    }
+    xhr2.dispatchEvent(new Event('load'));
+    // 空響應不 postMessage（即時不發）。
+    expect(postMessageSpy).toHaveBeenCalledTimes(initialCallCount);
+    // 推進 1.5s，重播應仍發舊的非空捕獲（v=abc），不發空。
+    vi.advanceTimersByTime(1500);
+    const replayCall = postMessageSpy.mock.calls[postMessageSpy.mock.calls.length - 1][0] as {
+      payload: { url: string };
+    };
+    expect(replayCall.payload.url).toContain('v=abc');
+    vi.useRealTimers();
+  });
+
+  it('[M1-46] 放寬 hostname 匹配：video.google.com/timedtext 被捕獲', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://video.google.com/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    expect(postMessageSpy).toHaveBeenCalled();
+    const msg = postMessageSpy.mock.calls[0][0] as { type: string; payload: { url: string } };
+    expect(msg.type).toBe('ai-trans:timedtext-capture');
+    expect(msg.payload.url).toContain('video.google.com');
+  });
+
+  it('[M1-46] 調試輔助：捕獲後 __aiTransTimedtextRequests 計數 + lastCapture 更新', async () => {
+    await loadInterceptor();
+    // 初始計數為 0。
+    expect(Reflect.get(globalThis, '__aiTransTimedtextRequests')).toBe(0);
+    expect(Reflect.get(globalThis, '__aiTransTimedtextLastCapture')).toBe(null);
+    // 捕獲一次。
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    // 計數 +1，lastCapture 更新。
+    expect(Reflect.get(globalThis, '__aiTransTimedtextRequests')).toBe(1);
+    const lastCapture = Reflect.get(globalThis, '__aiTransTimedtextLastCapture') as {
+      url: string;
+      videoId?: string;
+    };
+    expect(lastCapture).not.toBe(null);
+    expect(lastCapture.url).toContain('v=abc');
+    expect(lastCapture.videoId).toBe('abc');
+  });
 });
 
 describe('yt-timedtext-interceptor — fetch hook（M1-43）', () => {

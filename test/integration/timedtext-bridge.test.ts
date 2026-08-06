@@ -123,6 +123,31 @@ describe('TimedTextBridge — 消息接收與存儲', () => {
     expect(resolved).toEqual(payload);
   });
 
+  it('[M1-46] 晚註冊監聽器收到重播捕獲：捕獲發生在 bridge.start() 之前，重播仍送達', async () => {
+    // 背景：M1-45 把攔截器提前到 document_start（MAIN world），播放器在 document_idle 前
+    // 發的 timedtext 請求被捕獲並 postMessage，但 bridge 監聽器（content-script）尚未註冊，
+    // 即時消息丟失。修復：攔截器周期性重播最近捕獲（1.5s），晚註冊的監聽器最遲 1.5s 內收到。
+    vi.useFakeTimers();
+    // 捕獲已發生（模擬 interceptor 在 bridge.start() 之前發出了重播消息）。
+    const payload = {
+      url: 'https://www.youtube.com/api/timedtext?v=abc&pot=xyz',
+      responseText: '{"events":[{"tStartMs":0,"dDurationMs":1000,"segs":[{"utf8":"hi"}]}]}',
+      contentType: 'application/json',
+      capturedAt: 1,
+    };
+    // 晚註冊監聽器：此刻才 start。
+    bridge.start();
+    // 監聽器註冊後，重播的捕獲消息送達 → latest 就緒。
+    window.dispatchEvent(
+      new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } })
+    );
+    expect(bridge.getLatest()).toEqual(payload);
+    // 等待捕獲也能立即命中（waitForCapture 對已就緒 latest 立即返回）。
+    const result = await bridge.waitForCapture(5000);
+    expect(result).toEqual(payload);
+    vi.useRealTimers();
+  });
+
   it('waitForCapture：超時返回 null，且 timer 不殘留（R4）', async () => {
     vi.useFakeTimers();
     bridge.start();
