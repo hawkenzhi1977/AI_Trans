@@ -16,9 +16,11 @@
     /** 依序嘗試各策略，返回最終接管且成功執行的策略 origin。 */
     async runWithFallback(ctx) {
       const errors = [];
+      const diagnostics = [];
+      const ctxWithDiag = { ...ctx, diagnostics };
       for (const strategy of this.strategies) {
         try {
-          const applicable = await strategy.isApplicable(ctx);
+          const applicable = await strategy.isApplicable(ctxWithDiag);
           if (!applicable) {
             errors.push({
               port: "platform",
@@ -27,7 +29,7 @@
             });
             continue;
           }
-          await strategy.run(ctx, (e) => {
+          await strategy.run(ctxWithDiag, (e) => {
             if (e.type === "strategy-degraded") {
               this.onEvent?.(e);
             }
@@ -52,6 +54,18 @@
             return { origin: strategy.origin, errors };
           }
         }
+      }
+      if (this.onEvent) {
+        const reason = diagnostics.length > 0 ? diagnostics.join(" | ") : "all caption strategies not applicable (no captions found)";
+        this.onEvent({
+          type: "pipeline-error",
+          error: {
+            port: "platform",
+            code: "no-caption-strategy",
+            recoverable: false,
+            cause: new Error(reason)
+          }
+        });
       }
       return { origin: void 0, errors };
     }
@@ -242,11 +256,23 @@
   var NativeCaptionStrategy = class {
     origin = "native";
     stopped = false;
+    /**
+     * 判斷是否有原生字幕軌可用。
+     * 注意：listCaptionTracks 失敗/為空**不拋錯、返回 false**，交由鏈降級——
+     * 但必須把原因記到 ctx 供鏈在「全鏈不適用」時發出可見診斷（§5.6 不靜默）。
+     */
     async isApplicable(ctx) {
       try {
         const tracks = await ctx.platform.listCaptionTracks();
+        if (tracks.length === 0) {
+          const platformDiag = ctx.platform.getLastTrackDiagnostic?.();
+          ctx.diagnostics?.push?.(`native: no caption tracks found \u2014 ${platformDiag ?? "no captions on page"}`);
+        }
         return tracks.length > 0;
-      } catch {
+      } catch (err) {
+        ctx.diagnostics?.push?.(
+          `native: listCaptionTracks failed \u2014 ${err instanceof Error ? err.message : String(err)}`
+        );
         return false;
       }
     }
@@ -279,7 +305,8 @@
   // src/application/strategies/lookahead-asr-strategy.ts
   var LookAheadASRStrategy = class {
     origin = "lookahead-asr";
-    async isApplicable(_ctx) {
+    async isApplicable(ctx) {
+      ctx.diagnostics?.push?.("lookahead-asr: not implemented (M3)");
       return false;
     }
     async run(_ctx, _emit) {
@@ -291,7 +318,8 @@
   // src/application/strategies/realtime-asr-strategy.ts
   var RealtimeASRStrategy = class {
     origin = "realtime-asr";
-    async isApplicable(_ctx) {
+    async isApplicable(ctx) {
+      ctx.diagnostics?.push?.("realtime-asr: not implemented (M2)");
       return false;
     }
     async run(_ctx, _emit) {
@@ -378,20 +406,33 @@
   var FetchCaptionSource = class {
     doc;
     fetchFn;
+    lastTrackDiagnostic;
     constructor(doc = globalThis.document, fetchFn = globalThis.fetch) {
       this.doc = doc;
       this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
     }
+    getLastTrackDiagnostic() {
+      return this.lastTrackDiagnostic;
+    }
     async fetchTrackList() {
       const json = this.findPlayerResponseJson();
-      if (!json) return [];
+      if (!json) {
+        this.lastTrackDiagnostic = "player response JSON not found (ytInitialPlayerResponse missing/empty)";
+        return [];
+      }
       let data;
       try {
         data = JSON.parse(json);
-      } catch {
+      } catch (err) {
+        this.lastTrackDiagnostic = `player response JSON parse failed: ${err instanceof Error ? err.message : String(err)}`;
         return [];
       }
       const tracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+      if (tracks.length === 0) {
+        this.lastTrackDiagnostic = "player response has no captionTracks (video may have no captions)";
+      } else {
+        this.lastTrackDiagnostic = void 0;
+      }
       return tracks.map((t) => ({
         lang: String(t.languageCode ?? "und"),
         baseUrl: String(t.baseUrl ?? ""),
@@ -475,6 +516,9 @@
           () => this.captionSource.fetchTracks(t.baseUrl, t.lang)
         )
       );
+    }
+    getLastTrackDiagnostic() {
+      return this.captionSource.getLastTrackDiagnostic?.();
     }
     async getAudioSource() {
       return {
@@ -819,7 +863,17 @@
       const onStorageChanged = (changes, areaName) => {
         if (areaName !== "local") return;
         if ("engineConfig" in changes || "engineConfigKeys" in changes) {
-          void this.restart();
+          void this.restart().catch((err) => {
+            recordDiagnostic({
+              type: "pipeline-error",
+              error: {
+                port: "platform",
+                code: "config-hot-reload-failed",
+                recoverable: true,
+                cause: err instanceof Error ? err : new Error(String(err))
+              }
+            });
+          });
         }
       };
       chrome.storage.onChanged.addListener(onStorageChanged);
@@ -960,10 +1014,34 @@
     }
   };
   async function start() {
-    const config = await store.get();
+    let config;
+    try {
+      config = await store.get();
+    } catch (err) {
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "platform",
+          code: "config-load-failed",
+          recoverable: false,
+          cause: err instanceof Error ? err : new Error(String(err))
+        }
+      });
+      return;
+    }
     const controller = new SubtitleController(config, window.location.href);
     await controller.start();
   }
-  void start();
+  void start().catch((err) => {
+    recordDiagnostic({
+      type: "pipeline-error",
+      error: {
+        port: "platform",
+        code: "content-script-start-failed",
+        recoverable: false,
+        cause: err instanceof Error ? err : new Error(String(err))
+      }
+    });
+  });
 })();
 

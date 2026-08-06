@@ -77,10 +77,16 @@ async function loadKeysIntoForm(): Promise<void> {
 
 async function save(): Promise<void> {
   const config = readForm();
-  await store.set(config);
-  await store.setApiKey('llm', $<HTMLInputElement>('translation-api-key').value.trim());
-  await store.setApiKey('asr', $<HTMLInputElement>('asr-api-key').value.trim());
-  showStatus('配置已保存');
+  // §5.5/R6：保存失敗必須讓用戶可見（顯示錯誤狀態），不許未捕獲 reject 靜默消失。
+  try {
+    await store.set(config);
+    await store.setApiKey('llm', $<HTMLInputElement>('translation-api-key').value.trim());
+    await store.setApiKey('asr', $<HTMLInputElement>('asr-api-key').value.trim());
+    showStatus('配置已保存');
+  } catch (err) {
+    console.warn('[AI_Trans] config save failed:', err);
+    showStatus(`保存失敗: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // R4：去抖，避免快速連點累積 setTimeout 提前清空當前訊息。

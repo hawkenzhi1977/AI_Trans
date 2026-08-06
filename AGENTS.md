@@ -80,8 +80,17 @@ npm run test:e2e    # Playwright E2E（需先 build 產出 dist/）
 - 流式方法（`translateStream`）與非流式一樣要有 try/catch + fallback + 降級事件，不能只在 `translate()` 做降級。
 - 測試 Mock 中驅動 `currentTime` 等媒體狀態，**必須 `dispatchEvent(new Event('timeupdate'))`**，直接賦值不觸發監聽（真實 <video> 由事件驅動）。
 
-### 5.6 不用可選鏈掩蓋真實缺失
-- `registry.platforms[0]?.foo()` 這類會把「本應存在卻缺失」變成靜默無錯（字幕不動卻無日誌）。缺失屬異常時應顯式判空並報錯/發降級事件。
+### 5.6 關鍵流程節點不允許靜默失敗（§5.6 紅線）
+「字幕沒出來」絕不能只剩用戶主觀猜測——每一處可能失敗的關鍵節點都必須留下可被用戶/開發者查詢的痕跡（診斷、降級事件、日誌麵包屑）。以下情形**必須**落診斷/發事件/報錯，禁止無聲吞掉：
+
+- **不用可選鏈掩蓋真實缺失**：`registry.platforms[0]?.foo()` 這類會把「本應存在卻缺失」變成靜默無錯（字幕不動卻無日誌）。缺失屬異常時應顯式判空並報錯/發降級事件。
+- **策略適用性（isApplicable）軟失敗必須留痕**：策略返回 false 跳過是設計，但原因要寫入 `ctx.diagnostics`（如 `native: no caption tracks found`、`realtime-asr: not implemented (M2)`），讓全鏈失敗時 `no-caption-strategy` 的 cause 能解釋「為什麼」。
+- **軌列表/解析失敗三態必須可區分**：`fetchTrackList` 空結果要能區分「找不到數據源 JSON」vs「JSON 解析失敗」vs「確實無字幕軌」，通過 `getLastTrackDiagnostic()` 暴露，禁止空數組 + 無信息。
+- **外部數據解讀不通過 JSON.parse 靜默**：非法 JSON 不冒泡（§5.7）但必須記錄解析失敗診斷，不能當作「無字幕」誤判。
+- **配置讀取/保存/熱重載失敗必須可見**：啟動讀配置失敗、Options 保存失敗、`restart()` 熱重載失敗，都要落診斷或顯示錯誤狀態（如 `config-load-failed`、`config-hot-reload-failed`），禁止未捕獲懸掛 Promise 無聲消失。
+- **頂層兜底**：content-script 入口 `void start().catch(...)` 必須落診斷，任何未捕獲異常不許逃逸到瀏覽器 console 之外無痕跡。
+
+> 判斷標準：**用戶遇到功能失效時，popup「最近失敗」或 Options 頁必須能告訴他原因**；開發者從診斷/事件流必須能定位到具體節點。
 
 ### 5.7 外部 JSON / DOM 解析必須容錯
 - 選擇器要精確（避免 `script:not([src])` 誤匹配任意內聯腳本）；`JSON.parse` 外部內容必須 try/catch 兜底，禁止讓 parse 錯誤冒泡成功能降級誤判。

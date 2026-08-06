@@ -131,10 +131,15 @@
   }
   async function save() {
     const config = readForm();
-    await store.set(config);
-    await store.setApiKey("llm", $("translation-api-key").value.trim());
-    await store.setApiKey("asr", $("asr-api-key").value.trim());
-    showStatus("\u914D\u7F6E\u5DF2\u4FDD\u5B58");
+    try {
+      await store.set(config);
+      await store.setApiKey("llm", $("translation-api-key").value.trim());
+      await store.setApiKey("asr", $("asr-api-key").value.trim());
+      showStatus("\u914D\u7F6E\u5DF2\u4FDD\u5B58");
+    } catch (err) {
+      console.warn("[AI_Trans] config save failed:", err);
+      showStatus(`\u4FDD\u5B58\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   var statusTimer = null;
   function showStatus(msg) {

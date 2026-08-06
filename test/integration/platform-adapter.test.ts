@@ -97,6 +97,45 @@ describe('FetchCaptionSource — R1 fetch 綁定 / R2 URL 絕對化 / R7 JSON �
     // 沒有具名節點且無 captionTracks 內聯 → 返回空，不拋 SyntaxError
     await expect(src.fetchTrackList()).resolves.toEqual([]);
   });
+
+  it('[R6/§5.6] 找不到 player response JSON → 返回空並記錄診斷（不靜默）', async () => {
+    document.body.innerHTML = '';
+    const noise = document.createElement('script');
+    noise.textContent = 'window.__unrelated = 1;';
+    document.body.appendChild(noise);
+    const src = new FetchCaptionSource(document);
+    await src.fetchTrackList();
+    expect(src.getLastTrackDiagnostic()).toContain('player response JSON not found');
+  });
+
+  it('[R6/§5.6] 非法 JSON → 返回空並記錄解析失敗診斷', async () => {
+    document.body.innerHTML = '';
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.type = 'application/json';
+    script.textContent = '{ this is not valid json ]]';
+    document.body.appendChild(script);
+    const src = new FetchCaptionSource(document);
+    await src.fetchTrackList();
+    expect(src.getLastTrackDiagnostic()).toContain('parse failed');
+  });
+
+  it('[R6/§5.6] 結構無 captionTracks → 記錄「無字幕軌」診斷；有軌則清空診斷', async () => {
+    document.body.innerHTML = '';
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.type = 'application/json';
+    script.textContent = JSON.stringify({ some: 'response', without: 'captions' });
+    document.body.appendChild(script);
+    const src = new FetchCaptionSource(document);
+    await src.fetchTrackList();
+    expect(src.getLastTrackDiagnostic()).toContain('no captionTracks');
+
+    // 有軌時診斷清空
+    setPlayerResponse(validPlayerResponse);
+    await src.fetchTrackList();
+    expect(src.getLastTrackDiagnostic()).toBeUndefined();
+  });
 });
 
 describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {

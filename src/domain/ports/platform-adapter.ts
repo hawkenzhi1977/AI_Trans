@@ -13,6 +13,8 @@ export interface PlatformAdapter {
   observePlayback(cb: (state: PlaybackState) => void): () => void;
   /** 發現原生字幕軌。 */
   listCaptionTracks(): Promise<CaptionTrack[]>;
+  /** 上次字幕軌抓取的診斷信息（可選）：供策略鏈區分「無數據源/無字幕/解析失敗」，避免靜默（§5.6）。 */
+  getLastTrackDiagnostic?(): string | undefined;
   /** 提供音頻源句柄（含 tabCapture / buffered）。 */
   getAudioSource(): Promise<AudioSourceHandle>;
   /** 覆蓋層字幕掛載容器。 */

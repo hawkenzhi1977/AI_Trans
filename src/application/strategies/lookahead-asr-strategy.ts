@@ -8,8 +8,10 @@ import type { CaptionStrategy, StrategyContext } from '../../domain/ports/captio
 export class LookAheadASRStrategy implements CaptionStrategy {
   readonly origin = 'lookahead-asr' as const;
 
-  async isApplicable(_ctx: StrategyContext): Promise<boolean> {
-    return false; // M3 實現
+  async isApplicable(ctx: StrategyContext): Promise<boolean> {
+    // M3 未實現：返回 false 使策略鏈跳過；寫入診斷讓鏈能區分「未實現」與「真失敗」（§5.6）。
+    ctx.diagnostics?.push?.('lookahead-asr: not implemented (M3)');
+    return false;
   }
 
   async run(

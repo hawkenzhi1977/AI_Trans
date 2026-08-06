@@ -22,9 +22,14 @@ export class CaptionStrategyChain {
   }> {
     const errors: PipelineError[] = [];
 
+    // 提供策略可寫入的診斷累加器：軟失敗（isApplicable 內部 catch）原因也能在
+    // 「全鏈不適用」時被用戶看到，避免 §5.6 靜默吞掉「字幕軌抓取失敗」。
+    const diagnostics: string[] = [];
+    const ctxWithDiag = { ...ctx, diagnostics };
+
     for (const strategy of this.strategies) {
       try {
-        const applicable = await strategy.isApplicable(ctx);
+        const applicable = await strategy.isApplicable(ctxWithDiag);
         if (!applicable) {
           errors.push({
             port: 'platform',
@@ -34,7 +39,7 @@ export class CaptionStrategyChain {
           continue;
         }
 
-        await strategy.run(ctx, (e) => {
+        await strategy.run(ctxWithDiag, (e) => {
           if (e.type === 'strategy-degraded') {
             this.onEvent?.(e);
           }
@@ -61,6 +66,24 @@ export class CaptionStrategyChain {
           return { origin: strategy.origin, errors };
         }
       }
+    }
+
+    // 全鏈無策略接管：發 pipeline-error 診斷（含各策略軟失敗原因），
+    // 讓「字幕沒出現」的原因可見而非靜默（§5.6）。
+    if (this.onEvent) {
+      const reason =
+        diagnostics.length > 0
+          ? diagnostics.join(' | ')
+          : 'all caption strategies not applicable (no captions found)';
+      this.onEvent({
+        type: 'pipeline-error',
+        error: {
+          port: 'platform',
+          code: 'no-caption-strategy',
+          recoverable: false,
+          cause: new Error(reason),
+        },
+      });
     }
 
     return { origin: undefined, errors };

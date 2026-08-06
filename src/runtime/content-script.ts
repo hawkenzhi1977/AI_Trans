@@ -43,7 +43,18 @@ class SubtitleController {
     ): void => {
       if (areaName !== 'local') return;
       if ('engineConfig' in changes || 'engineConfigKeys' in changes) {
-        void this.restart();
+        // §5.5/R6：restart 拋錯必須落診斷，不許未捕獲懸掛 Promise 靜默消失。
+        void this.restart().catch((err) => {
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'platform',
+              code: 'config-hot-reload-failed',
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err)),
+            },
+          });
+        });
       }
     };
     chrome.storage.onChanged.addListener(onStorageChanged);
@@ -196,9 +207,35 @@ class SubtitleController {
 }
 
 async function start(): Promise<void> {
-  const config = await store.get();
+  let config: EngineConfig;
+  try {
+    config = await store.get();
+  } catch (err) {
+    // §5.5/R6：啟動讀取配置失敗不能成未捕獲懸掛——記錄診斷並中止，避免後續全鏈失敗。
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'platform',
+        code: 'config-load-failed',
+        recoverable: false,
+        cause: err instanceof Error ? err : new Error(String(err)),
+      },
+    });
+    return;
+  }
   const controller = new SubtitleController(config, window.location.href);
   await controller.start();
 }
 
-void start();
+void start().catch((err) => {
+  // §5.5：頂層兜底——任何未捕獲異常都落診斷，不靜默。
+  recordDiagnostic({
+    type: 'pipeline-error',
+    error: {
+      port: 'platform',
+      code: 'content-script-start-failed',
+      recoverable: false,
+      cause: err instanceof Error ? err : new Error(String(err)),
+    },
+  });
+});

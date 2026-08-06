@@ -8,6 +8,8 @@ interface FakeOpts {
   origin: CaptionOrigin;
   applicable: boolean;
   throwOnRun?: boolean;
+  /** isApplicable 時寫入的軟失敗診斷信息（模擬 §5.6 場景）。 */
+  diagMessage?: string;
 }
 
 class FakeStrategy implements CaptionStrategy {
@@ -17,7 +19,10 @@ class FakeStrategy implements CaptionStrategy {
   constructor(private readonly opts: FakeOpts) {
     this.origin = opts.origin;
   }
-  async isApplicable(): Promise<boolean> {
+  async isApplicable(ctx: StrategyContext): Promise<boolean> {
+    if (this.opts.diagMessage) {
+      ctx.diagnostics?.push?.(this.opts.diagMessage);
+    }
     return this.opts.applicable;
   }
   async run(_ctx: StrategyContext, emit: (e: PipelineEvent) => void): Promise<void> {
@@ -87,5 +92,46 @@ describe('CaptionStrategyChain', () => {
     chain.stopAll();
     expect(s1.stopped).toBe(true);
     expect(s2.stopped).toBe(true);
+  });
+
+  it('全鏈不適用時發 pipeline-error 診斷，原因含各策略軟失敗信息（§5.6）', async () => {
+    const s1 = new FakeStrategy({
+      origin: 'native',
+      applicable: false,
+      diagMessage: 'native: no caption tracks found on page',
+    });
+    const s2 = new FakeStrategy({
+      origin: 'realtime-asr',
+      applicable: false,
+      diagMessage: 'realtime-asr: ASR not enabled',
+    });
+    const events: PipelineEvent[] = [];
+    const chain = new CaptionStrategyChain([s1, s2], (e) => events.push(e));
+
+    const { origin } = await chain.runWithFallback(ctx);
+    expect(origin).toBeUndefined();
+
+    const err = events.find(
+      (e): e is Extract<PipelineEvent, { type: 'pipeline-error' }> => e.type === 'pipeline-error'
+    );
+    expect(err).toBeDefined();
+    expect(err!.error.code).toBe('no-caption-strategy');
+    expect(err!.error.cause).toBeInstanceOf(Error);
+    const msg = (err!.error.cause as Error).message;
+    expect(msg).toContain('native: no caption tracks found on page');
+    expect(msg).toContain('realtime-asr: ASR not enabled');
+  });
+
+  it('全鏈不適用且無診斷信息時 pipeline-error 原因為通用提示', async () => {
+    const s1 = new FakeStrategy({ origin: 'native', applicable: false });
+    const s2 = new FakeStrategy({ origin: 'realtime-asr', applicable: false });
+    const events: PipelineEvent[] = [];
+    const chain = new CaptionStrategyChain([s1, s2], (e) => events.push(e));
+
+    await chain.runWithFallback(ctx);
+    const err = events.find((e) => e.type === 'pipeline-error');
+    expect(err).toBeDefined();
+    const msg = ((err as Extract<PipelineEvent, { type: 'pipeline-error' }>).error.cause as Error).message;
+    expect(msg).toContain('all caption strategies not applicable');
   });
 });

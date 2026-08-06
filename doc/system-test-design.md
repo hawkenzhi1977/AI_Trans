@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-05（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接；測試合計 88→94）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷；測試合計 88→107）
 
 ---
 
@@ -328,7 +328,33 @@ jobs:
 - 步驟 B（Popup 顯示）：**常駐顯示**「最近失敗」行——有記錄顯示原因（警告色）；**無記錄顯示「最近失敗: 無」**（不整行隱藏，避免「看不到行」誤判為 bug）。本地模式翻譯狀態行顯示實際生效模型名（辨識保存未生效/載入舊版插件）。
 - 步驟 C（§5.7 守護）：`chrome.storage.set` 拋錯時 `recordDiagnostic` 不崩潰、console 麵包屑仍輸出。
 - 預期：E2E 中降級後 `lastDiagnostic` 被寫入（poll 可讀）；popup 有診斷行；策略級 `strategy-degraded` 不記錄（屬正常流轉）。
-- 落點：集成 `test/integration/diagnostics.test.ts`（7）+ `test/integration/popup.test.ts`（4：含常駐「無」+ 測試連接按鈕）；E2E `test/e2e/extension.spec.ts`（TC-F11 降級寫入）。
+- 落點：集成 `test/integration/diagnostics.test.ts`（7）+ `test/integration/popup.test.ts`（4：含常駐「無」+ 測試連接按鈕）；單元 `test/unit/caption-strategy-chain.test.ts`（全鏈不適用→pipeline-error）+ `test/unit/native-caption-strategy.test.ts`（軌抓取軟失敗→診斷）；E2E `test/e2e/extension.spec.ts`（TC-F11 降級寫入）。
+
+#### TC-F13 「全鏈不適用」不再靜默（對應 F-11，已實裝）
+- 前置：mock 平台 `listCaptionTracks` 返回空或拋錯（模擬真實 YouTube 上字幕軌抓取失敗/無字幕）。
+- 步驟：
+  - A（軌為空）：`NativeCaptionStrategy.isApplicable` 返回 false，`ctx.diagnostics` 記錄 `native: no caption tracks found — <平台診斷>`（三態，見 TC-F14）。
+  - B（軌拋錯）：返回 false，診斷記錄 `native: listCaptionTracks failed — <異常詳情>`（不再吞掉）。
+  - C（全鏈不適用）：`CaptionStrategyChain` 全部策略 `isApplicable=false` → 發 `pipeline-error`（code `no-caption-strategy`，cause.message 含各策略診斷，` | ` 連接）。
+  - D（無診斷時通用提示）：cause.message 為 `all caption strategies not applicable (no captions found)`。
+- 預期：字幕軌失敗不再靜默——診斷鏈路與「翻譯失敗」可區分；content-script `recordDiagnostic` 持久化 → popup「最近失敗」顯示真實原因。
+- 落點：單元 `test/unit/caption-strategy-chain.test.ts`（2）+ `test/unit/native-caption-strategy.test.ts`（4）。
+
+#### TC-F14 軌列表/解析失敗三態診斷（對應 F-11/M1-39，已實裝）
+- 前置：mock 頁含/不含 `#ytInitialPlayerResponse` 具名腳本；或腳本內容非法 JSON。
+- 步驟：
+  - A（找不到數據源）：頁面無 `#ytInitialPlayerResponse` 且內聯掃描無 captionTracks → `fetchTrackList` 返回 `[]`，`getLastTrackDiagnostic()` = `player response JSON not found (ytInitialPlayerResponse missing/empty)`。
+  - B（JSON 解析失敗）：腳本內容非法 JSON → 返回 `[]` 不拋錯，診斷 = `player response JSON parse failed: …`。
+  - C（確實無字幕軌）：JSON 合法但結構無 `captionTracks` → 診斷 = `player response has no captionTracks …`。
+  - D（有軌）：返回軌列表且診斷清空（`undefined`）。
+- 預期：空結果三態可區分，不與「無字幕」誤判；`NativeCaptionStrategy` 空軌時把平台診斷帶入 `ctx.diagnostics`（`native: no caption tracks found — <平台診斷>`），全鏈失敗 cause 能解釋「為什麼抓不到」。
+- 落點：集成 `test/integration/platform-adapter.test.ts`（+4 三態診斷）；單元 `test/unit/native-caption-strategy.test.ts`（+1 平台診斷帶入）。
+
+#### TC-F15 M2/M3 佔位策略診斷（對應 F-11/M1-39，已實裝）
+- 前置：真實佔位策略 `RealtimeASRStrategy`/`LookAheadASRStrategy`。
+- 步驟：調用 `isApplicable`，斷言返回 `false` 且 `ctx.diagnostics` 記錄 `realtime-asr: not implemented (M2)` / `lookahead-asr: not implemented (M3)`；`diagnostics` 為 undefined 時不拋錯。
+- 預期：佔位策略的「未實現」可與「真失敗」區分，全鏈失敗原因不再空白。
+- 落點：單元 `test/unit/placeholder-strategies.test.ts`（3）。
 
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
@@ -399,7 +425,7 @@ jobs:
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
 | TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 94（單元 29 + 契約 5 + 集成 47 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。
+> 全部測試合計 107（單元 39 + 契約 5 + 集成 50 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +6（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + `native-caption-strategy.test.ts` 軌抓取診斷 4）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。
 >
 > **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
@@ -440,6 +466,9 @@ jobs:
 | TC-F05 | F-05 | 集成 |
 | TC-F10 | F-10 | 單元/集成/E2E（已實裝） |
 | TC-F11 | F-11 | 集成/E2E（已實裝） |
+| TC-F13 | F-11 | 單元（已實裝） |
+| TC-F14 | F-11 | 集成/單元（已實裝） |
+| TC-F15 | F-11 | 單元（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |

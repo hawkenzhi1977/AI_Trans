@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-05（§7.1 可靠性紅線加固；§7.5/7.6 補本地 LLM 兼容 F-10：端點規範化、reasoning 剝離、超時降級、storage.onChanged 熱重啟；§7 補翻譯失敗診斷可見性 F-11：diagnostics 模塊 + lastDiagnostic + Popup 常駐診斷行 + 測試連接按鈕；endpoint.ts 抽離）
+> 最後更新：2026-08-06（§7 補翻譯失敗診斷可見性 F-11：diagnostics 模塊 + lastDiagnostic + Popup 常駐診斷行 + 測試連接按鈕 +「全鏈不適用」診斷 §5.6 + 軌列表三態診斷 `getLastTrackDiagnostic` + Options 保存失敗可見 + M2/M3 佔位診斷；endpoint.ts 抽離）
 
 ---
 
@@ -482,6 +482,10 @@ export interface MessageBus {
 > **Popup「測試連接」按鈕**（F-11 新增，`src/runtime/popup/connection-test.ts`）：一鍵向配置端點發最小 `POST /chat/completions`（`messages:[{role:'user',content:'ping'}]`、`max_tokens:1`、`temperature:0`），驗證三件事——端點可達（排除 mixed-content/端口/CORS/連接失敗）、模型存在（HTTP 200 vs 404 Model not found）、響應結構有效（含 `choices[].message.content`）。成功標綠、失敗標紅並顯示原因（含伺服器 error.message、超時、網絡錯誤）。與真實翻譯路徑共用 `normalizeEndpoint`，保證「測試的就是實際會發的請求」。popup 位於擴充上下文且有 `http://127.0.0.1/*`/`http://localhost/*` host_permissions，直接 fetch 即可（無需 SW 代理）。實作規範：`fetchFn = globalThis.fetch.bind(globalThis)`（§5.1 綁定）；超時用 `AbortController` + `finally` 清 timer（§5.4 無洩漏）。
 > 
 > **`normalizeEndpoint` 抽離為獨立模組**（`src/runtime/endpoint.ts`）：原位於 `composition.ts`（依賴整個 registry 組裝鏈），Popup bundle 引用會連帶打包 adapters/application，故抽為**零依賴純函數**——`composition.ts`（建構 LLM provider）與 `connection-test.ts`（驗證請求）共用，保持行為唯一來源。測試落點 `test/integration/composition.test.ts`（五態）與 `test/integration/connection-test.test.ts`。
+>
+> **「全鏈不適用」診斷（§5.6 對齊，F-11 改進）**：此前 `NativeCaptionStrategy.isApplicable` 內 `listCaptionTracks` 失敗/為空被 `catch { return false }` 靜默吞掉，`CaptionStrategyChain` 對 `isApplicable=false` 只壓入 errors 數組不發事件——「字幕軌抓不到」與「翻譯失敗」無法區分，診斷行恆為「無」。改進：(1) `StrategyContext` 新增可選 `diagnostics?: string[]` 累加器；(2) `NativeCaptionStrategy.isApplicable` 把軟失敗原因（空軌 / 抓取異常詳情）寫入其中；(3) `CaptionStrategyChain` 全鏈無策略接管時統一發 `pipeline-error`（code `no-caption-strategy`，cause 為 Error 且 message 含各策略診斷，以 ` | ` 連接）→ content-script `recordDiagnostic` → popup 顯示真實原因。測試：單元 `caption-strategy-chain.test.ts`（全鏈診斷 2）+ `native-caption-strategy.test.ts`（軌抓取診斷 4）。
+>
+> **軌列表三態診斷（M1-39，F-11 細化）**：`fetchTrackList` 返回空數組必須能區分**三個根因**——(a) 找不到數據源 JSON（`#ytInitialPlayerResponse` 缺失/為空）、(b) 外部 JSON 解析失敗（§5.7 不冒泡但不得誤判「無字幕」）、(c) 確實無字幕軌（`captionTracks` 結構不存在）。實現：`FetchCaptionSource` 增 `lastTrackDiagnostic` 字段，三態分別寫入 `player response JSON not found (…)` / `player response JSON parse failed: …` / `player response has no captionTracks (…)`，經新增端口方法 `getLastTrackDiagnostic()`（可選，`YouTubePlatformAdapter` 轉發）暴露；`NativeCaptionStrategy` 空軌時把平台診斷帶入 `ctx.diagnostics`（`native: no caption tracks found — <平台診斷>`），使全鏈失敗 cause 能解釋「為什麼」。另（§5.6 收口）：Options `save()` 保存失敗顯示錯誤狀態（不靜默）；M2/M3 佔位策略 `isApplicable` 寫入 `not implemented (M2/M3)` 診斷——「未實現（預期跳過）」與「真失敗」可區分。測試：集成 `platform-adapter.test.ts`（三態 4）+ 單元 `placeholder-strategies.test.ts`（3）+ `native-caption-strategy.test.ts`（+1 平台診斷帶入）。
 
 ---
 

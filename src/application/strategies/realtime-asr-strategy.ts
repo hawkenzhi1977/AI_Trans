@@ -8,8 +8,9 @@ import type { CaptionStrategy, StrategyContext } from '../../domain/ports/captio
 export class RealtimeASRStrategy implements CaptionStrategy {
   readonly origin = 'realtime-asr' as const;
 
-  async isApplicable(_ctx: StrategyContext): Promise<boolean> {
-    // M1 未實現：返回 false 使策略鏈跳過。
+  async isApplicable(ctx: StrategyContext): Promise<boolean> {
+    // M1 未實現：返回 false 使策略鏈跳過；但寫入診斷讓鏈能區分「未實現」與「真失敗」（§5.6）。
+    ctx.diagnostics?.push?.('realtime-asr: not implemented (M2)');
     return false;
   }
 
