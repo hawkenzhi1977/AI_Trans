@@ -12,7 +12,7 @@ English version: [README.md](./README.md).
 
 ### 已實現（里程碑 M1）
 
-- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。兼容 YouTube timedtext 全部真實格式：優先請求穩定 JSON（`fmt=json3`），回退可解析 `srv3` XML（`<timedtext><p t d><s>`）或傳統 `<transcript><text>` XML；非法 HTML（登錄/錯誤頁）被識別為解析錯誤，不再誤報「無字幕」。**兼容 YouTube 對 `/api/timedtext` 的 `pot`（proof-of-origin token）防護**：當播放器自身發起帶 token 驗證的字幕請求（擴充無法自行複製該請求）時，擴充在頁面 MAIN world 捕獲該響應並複用，token 防護下字幕仍能正常載入。攔截器以 manifest 聲明在 `document_start` 的 MAIN world 注入，**頁面最早階段、播放器首次字幕請求前**就已就位（含帶緩存的二次加載/重載）。**SPA 換視頻**——不重載頁面切換視頻（播放清單/側欄導航）經 URL 變化偵測，字幕管線自動熱重啟載入新視頻字幕；舊視頻的殘留字幕捕獲不會被誤用到新視頻。
+- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。兼容 YouTube timedtext 全部真實格式：優先請求穩定 JSON（`fmt=json3`），回退可解析 `srv3` XML（`<timedtext><p t d><s>`）或傳統 `<transcript><text>` XML；非法 HTML（登錄/錯誤頁）被識別為解析錯誤，不再誤報「無字幕」。**兼容 YouTube 對 `/api/timedtext` 的 `pot`（proof-of-origin token）防護**：當播放器自身發起帶 token 驗證的字幕請求（擴充無法自行複製該請求）時，擴充在頁面 MAIN world 捕獲該響應並複用，token 防護下字幕仍能正常載入。攔截器以 manifest 聲明在 `document_start` 的 MAIN world 注入，**頁面最早階段、播放器首次字幕請求前**就已就位（含帶緩存的二次加載/重載）。**SPA 換視頻**——不重載頁面切換視頻（播放清單/側欄導航）經 URL 變化偵測，字幕管線自動熱重啟載入新視頻字幕；舊視頻的殘留字幕捕獲不會被誤用到新視頻。**跨 world 通信採用 CustomEvent**——content script（isolated world）與攔截器（main world）通過 `document` 上派發的 `CustomEvent` 通信，避免 `postMessage` 在跨 isolated world 場景下的不可靠性。**字幕模組驅動增強重試**——攔截器驅動 YouTube 字幕模組最多重試 60 次（60 秒），並在目標語言變更時立即觸發，確保播放器加載較慢時字幕仍能正常載入。
 - **覆蓋層字幕渲染**——支持單語或雙語（原文＋譯文），渲染於獨立覆蓋層並對齊播放時間。
 - **播放狀態同步**——字幕隨當前時間、暫停、快進同步（媒體事件 + `requestAnimationFrame` 對齊）。
 - **可配置翻譯引擎**——雲端 LLM（OpenAI 兼容 `/chat/completions`）為主、傳統 MT 兜底；端點、模型、API Key 由用戶配置。API Key 與配置對象分離存儲。
@@ -21,6 +21,7 @@ English version: [README.md](./README.md).
 - **Options 與 Popup 配置界面**——完整設定頁 + 快捷彈出頁（狀態顯示 + 重新載入）。
 - **可靠性加固的內容腳本**——宿主方法綁定（避免 "Illegal invocation"）、配置熱重載時無訂閱洩漏、外部 JSON 容錯解析（詳見 `AGENTS.md` §5）。
 - **翻譯失敗診斷可見性**——翻譯降級/錯誤不再被管線無聲吞掉：失敗原因持久化至 `chrome.storage.local`，並在 Popup 的「最近失敗」行**常駐顯示**（無記錄時顯示「無」，確保可見性）；同時輸出 `console.warn` 麵包屑。**當無任何字幕策略可接管時**（例如視頻原生字幕軌抓取失敗——與「翻譯失敗」不同），也會帶原因報告，讓「抓不到字幕」與「翻譯失敗」可區分。Popup 新增**「測試連接」按鈕**——一鍵向配置端點發最小實時請求，驗證端點可達/模型名/響應結構，直接終結「配置對不對」的猜測。Popup 的翻譯狀態行也會顯示**實際生效的模型名**（本地模式），便於確認保存後 storage 是否真正更新。**所有外部接口調用節點**都留下**證據化診斷**而非猜測：字幕拉取失敗會報告實際 HTTP 狀態、content-type 與 body 片段；LLM 響應異常（body 非 JSON、`choices` 缺失/為空）會被當作失敗並發降級事件留痕，而非靜默回退原文；播放器 15 秒仍未出現會發 `player-not-found` 錯誤；Popup、Options 頁與 service worker 的配置/密鑰讀取失敗都會明確顯示而非無聲失效。
+- **翻譯失敗降級顯示原文**——當 LLM 翻譯服務失敗時（如連接中斷、超時），擴充**降級顯示原文字幕**而非完全不顯示。同時發送 `engine-degraded` 事件，Popup 可顯示降級原因。用戶寧可看到原文字幕也不願看到空白。
 
 ### 待實現（後續里程碑）
 

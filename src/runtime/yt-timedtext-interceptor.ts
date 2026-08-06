@@ -16,6 +16,8 @@
 export const TIMEDTEXT_CAPTURE_EVENT = 'ai-trans:timedtext-capture';
 /** 消息通道常量：內容腳本向 MAIN world 請求觸發/狀態查詢。 */
 export const TIMEDTEXT_REQUEST_EVENT = 'ai-trans:timedtext-request';
+/** 消息通道常量（M1-47）：content-script 通知目標字幕語言（isolated world → MAIN world）。 */
+export const SET_TARGET_LANG_EVENT = 'ai-trans:set-target-lang';
 
 /** 發送給 content-script 的捕獲結果。 */
 export interface TimedTextCapture {
@@ -45,6 +47,31 @@ function isTimedText(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * 安全讀取 XHR 響應文本（M1-47 硬化）。
+ * 真實瀏覽器中，若播放器把 `responseType` 設為 'json'/'arraybuffer'/'blob'，
+ * 讀 `xhr.responseText` 會拋 `InvalidStateError`（jsdom 不拋，故此 bug 只在真實環境暴露）。
+ * 此時改從 `xhr.response` 取值：json → JSON.stringify；字符串 → 原樣；其他（二進制）→ 空串跳過。
+ */
+function readXhrResponseText(xhr: XMLHttpRequest): string {
+  const responseType = (xhr as unknown as { responseType?: string }).responseType ?? '';
+  if (responseType === '' || responseType === 'text') {
+    return String((xhr as unknown as { responseText?: string }).responseText ?? '');
+  }
+  const response = (xhr as unknown as { response?: unknown }).response;
+  if (response == null) return '';
+  if (typeof response === 'string') return response;
+  if (responseType === 'json') {
+    try {
+      return JSON.stringify(response);
+    } catch {
+      return '';
+    }
+  }
+  // arraybuffer/blob/document 等二進制或非文本類型：本輪不複用（返回空，emitCapture 會跳過）。
+  return '';
 }
 
 /** 從 timedtext URL 的 `v` query 參數提取視頻 ID；無則返回空串。 */
@@ -110,11 +137,157 @@ function startReplay(): void {
   }, REPLAY_INTERVAL_MS);
 }
 
+/** 目標字幕語言（M1-47）：由 content-script 經 SET_TARGET_LANG_EVENT 消息設定。
+ *  注意：這是「翻譯目標語言」（如 zh-Hant），用於調試輔助與重驅動觸發信號，
+ *  不直接用於選軌（字幕來源語言為視頻原文，見 pickTargetTrack 註釋）。 */
+let targetLang: string | null = null;
+
+/** 播放器字幕軌條目（YouTube 未文件化結構，僅取用到的欄位）。 */
+interface YtCaptionTrack {
+  languageCode?: string;
+  languageName?: string;
+  kind?: string;
+  is_translatable?: boolean;
+  vss_id?: string;
+  name?: { simpleText?: string } | string;
+}
+
+/**
+ * 從播放器字幕軌列表挑選要載入的軌（M1-47）。
+ * 注意：翻譯「目標語言」（如 zh-Hant）與字幕「來源語言」（視頻原文，常為英文）不同，
+ * 故不以翻譯目標匹配軌。偏好人工軌（kind !== 'asr'）以取得質量更佳的原文字幕；
+ * 無人工軌時退化為第一軌（通常為自動字幕）。content-script 側最終按需選軌翻譯，
+ * 此處只需逼播放器發出**某一軌**帶 pot 的請求供攔截。
+ */
+function pickTargetTrack(tracklist: YtCaptionTrack[]): YtCaptionTrack {
+  const manual = tracklist.find((t) => t.kind !== 'asr');
+  return manual ?? tracklist[0];
+}
+
+/** 標記字幕模組驅動是否已成功（避免重試定時器無限跑）。 */
+let captionModuleDriven = false;
+
+/**
+ * 主動驅動播放器字幕模組發出 timedtext 請求（M1-47 核心修復）。
+ *
+ * 背景：真實環境中若用戶未開啟字幕（CC 關閉），播放器**根本不發** timedtext 請求，
+ * 攔截器永遠捕獲不到帶 pot 的 URL → waitForCapture 超時 → 回退直接 fetch（無 pot）
+ * → YouTube 返回 HTML 登錄頁（empty body）→ 解析失敗。M1-46 的重播只能重發「已捕獲」
+ * 的響應，捕獲不到時無濟於事。此函式透過播放器 API 主動載入字幕模組並選軌，
+ * 逼播放器自己發帶 pot 的請求，供攔截器捕獲；隨後復位抑制原生字幕顯示。
+ *
+ * 播放器 API（loadModule/getOption/setOption）未文件化且版本多變，全程 try/catch，
+ * 失敗不致命（僅回退到原捕獲路徑）。
+ */
+function ensureCaptionModuleLoaded(): void {
+  if (captionModuleDriven) return;
+  const player = document.getElementById('movie_player') as unknown as {
+    loadModule?: (m: string) => void;
+    getOption?: (m: string, k: string) => unknown;
+    setOption?: (m: string, k: string, v: unknown) => void;
+  } | null;
+  
+  // 診斷日誌
+  if (!player) {
+    console.log('[AI_Trans Interceptor] Player element not found');
+    return;
+  }
+  if (typeof player.loadModule !== 'function' || typeof player.getOption !== 'function' || typeof player.setOption !== 'function') {
+    console.log('[AI_Trans Interceptor] Player API not available');
+    return; // 播放器未就緒/API 未暴露：由重試定時器稍後再試。
+  }
+  
+  try {
+    player.loadModule('captions');
+  } catch {
+    // 載入失敗（可能已載入）：繼續嘗試讀軌列表。
+  }
+  
+  let tracklist: YtCaptionTrack[] | undefined;
+  try {
+    const raw = player.getOption('captions', 'tracklist');
+    console.log('[AI_Trans Interceptor] Tracklist:', raw, 'isArray:', Array.isArray(raw));
+    if (Array.isArray(raw)) tracklist = raw as YtCaptionTrack[];
+  } catch (err) {
+    console.log('[AI_Trans Interceptor] getOption error:', err);
+    return; // 讀軌列表拋錯：播放器尚未就緒，稍後重試。
+  }
+  
+  if (!tracklist || tracklist.length === 0) {
+    console.log('[AI_Trans Interceptor] No caption tracks available');
+    // 無字幕軌：可能真無字幕，或軌列表尚未就緒。標記調試碼，讓重試繼續（真無字幕時無害）。
+    Reflect.set(globalThis, '__aiTransCaptionTracks', 0);
+    return;
+  }
+  
+  console.log('[AI_Trans Interceptor] Found', tracklist.length, 'caption tracks');
+  Reflect.set(globalThis, '__aiTransCaptionTracks', tracklist.length);
+  const track = pickTargetTrack(tracklist);
+  
+  try {
+    // 選軌 → 播放器發帶 pot 的 timedtext 請求（被 XHR/fetch hook 捕獲）。
+    player.setOption('captions', 'track', track);
+    captionModuleDriven = true;
+    console.log('[AI_Trans Interceptor] Caption module driven successfully, selected track:', track);
+    // 短延遲後復位，抑制原生字幕渲染（我們只要 pot 響應，不要播放器把原文字幕畫上去）。
+    setTimeout(() => {
+      try {
+        player.setOption!('captions', 'track', {});
+        console.log('[AI_Trans Interceptor] Caption track reset to suppress native rendering');
+      } catch {
+        /* 復位失敗無害：原生字幕可能短暫顯示，不影響捕獲。 */
+      }
+    }, 600);
+  } catch (err) {
+    console.log('[AI_Trans Interceptor] setOption error:', err);
+    // 選軌失敗：不標記成功，重試定時器會再試。
+  }
+}
+
+/** 啟動字幕模組驅動重試（M1-47）：播放器異步就緒，周期重試直到成功。 */
+function startCaptionModuleDriver(): void {
+  const RETRY_INTERVAL_MS = 1_000;
+  const MAX_RETRIES = 60; // 最多 60 秒等播放器就緒（YouTube 播放器加載可能較慢）
+  let attempts = 0;
+  const timer = setInterval(() => {
+    attempts += 1;
+    ensureCaptionModuleLoaded();
+    if (captionModuleDriven || attempts >= MAX_RETRIES) {
+      clearInterval(timer);
+    }
+  }, RETRY_INTERVAL_MS);
+}
+
+/** SPA 換視頻時重置驅動狀態並重新觸發（M1-47）。 */
+function resetAndRedriveCaptionModule(): void {
+  captionModuleDriven = false;
+  // 立即嘗試一次（處理播放器已就緒的情況）
+  ensureCaptionModuleLoaded();
+  // 如果未成功，啟動定時器重試（處理播放器尚未就緒的情況）
+  if (!captionModuleDriven) {
+    startCaptionModuleDriver();
+  }
+}
+
 function install(): void {
   if (Reflect.get(globalThis, INSTALL_FLAG)) return;
   Reflect.set(globalThis, INSTALL_FLAG, true);
   // M1-46：啟動重播定時器（周期性重發最近捕獲）。
   startReplay();
+  // M1-47：接收 content-script 的目標語言，並啟動字幕模組主動驅動。
+  // 使用 CustomEvent 替代 postMessage，避免 isolated world 與 MAIN world 之間的通信問題。
+  const onSetTargetLang = (ev: Event): void => {
+    const detail = (ev as CustomEvent).detail as { targetLang?: string } | undefined;
+    targetLang = typeof detail?.targetLang === 'string' ? detail.targetLang : null;
+    // 調試輔助：暴露目標語言，供真實環境確認消息通道已通。
+    Reflect.set(globalThis, '__aiTransTargetLang', targetLang);
+    console.log('[AI_Trans Interceptor] Received set-target-lang message, targetLang:', targetLang);
+    // 收到語言後（重）啟動驅動：涵蓋首次啟動與 SPA 換視頻後 restart 重發。
+    resetAndRedriveCaptionModule();
+  };
+  document.addEventListener('ai-trans:set-target-lang', onSetTargetLang);
+  // 即使未收到語言消息也啟動一次驅動（用第一/人工軌），避免消息時序問題導致完全不驅動。
+  startCaptionModuleDriver();
   // 調試輔助（M1-27 真實環境驗證）：暴露計數器與最近捕獲對象到 window。
   Reflect.set(globalThis, '__aiTransTimedtextRequests', 0);
   Reflect.set(globalThis, '__aiTransTimedtextLastCapture', null);
@@ -146,9 +319,7 @@ function install(): void {
       const onLoad = (): void => {
         this.removeEventListener('load', onLoad);
         try {
-          const responseText = String(
-            (this as unknown as { responseText?: string }).responseText ?? ''
-          );
+          const responseText = readXhrResponseText(this);
           const contentType =
             (this as unknown as { getResponseHeader?: (h: string) => string | null })
               .getResponseHeader?.('content-type') ?? 'unknown';

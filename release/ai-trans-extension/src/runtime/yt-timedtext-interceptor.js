@@ -3,6 +3,7 @@
   // src/runtime/yt-timedtext-interceptor.ts
   var TIMEDTEXT_CAPTURE_EVENT = "ai-trans:timedtext-capture";
   var TIMEDTEXT_REQUEST_EVENT = "ai-trans:timedtext-request";
+  var SET_TARGET_LANG_EVENT = "ai-trans:set-target-lang";
   var INSTALL_FLAG = "__aiTransTimedtextInterceptorInstalled";
   function isTimedText(url) {
     try {
@@ -11,6 +12,23 @@
     } catch {
       return false;
     }
+  }
+  function readXhrResponseText(xhr) {
+    const responseType = xhr.responseType ?? "";
+    if (responseType === "" || responseType === "text") {
+      return String(xhr.responseText ?? "");
+    }
+    const response = xhr.response;
+    if (response == null) return "";
+    if (typeof response === "string") return response;
+    if (responseType === "json") {
+      try {
+        return JSON.stringify(response);
+      } catch {
+        return "";
+      }
+    }
+    return "";
   }
   function extractVideoId(url) {
     try {
@@ -52,10 +70,91 @@
       );
     }, REPLAY_INTERVAL_MS);
   }
+  var targetLang = null;
+  function pickTargetTrack(tracklist) {
+    const manual = tracklist.find((t) => t.kind !== "asr");
+    return manual ?? tracklist[0];
+  }
+  var captionModuleDriven = false;
+  function ensureCaptionModuleLoaded() {
+    if (captionModuleDriven) return;
+    const player = document.getElementById("movie_player");
+    if (!player) {
+      console.log("[AI_Trans Interceptor] Player element not found");
+      return;
+    }
+    if (typeof player.loadModule !== "function" || typeof player.getOption !== "function" || typeof player.setOption !== "function") {
+      console.log("[AI_Trans Interceptor] Player API not available");
+      return;
+    }
+    try {
+      player.loadModule("captions");
+    } catch {
+    }
+    let tracklist;
+    try {
+      const raw = player.getOption("captions", "tracklist");
+      console.log("[AI_Trans Interceptor] Tracklist:", raw, "isArray:", Array.isArray(raw));
+      if (Array.isArray(raw)) tracklist = raw;
+    } catch (err) {
+      console.log("[AI_Trans Interceptor] getOption error:", err);
+      return;
+    }
+    if (!tracklist || tracklist.length === 0) {
+      console.log("[AI_Trans Interceptor] No caption tracks available");
+      Reflect.set(globalThis, "__aiTransCaptionTracks", 0);
+      return;
+    }
+    console.log("[AI_Trans Interceptor] Found", tracklist.length, "caption tracks");
+    Reflect.set(globalThis, "__aiTransCaptionTracks", tracklist.length);
+    const track = pickTargetTrack(tracklist);
+    try {
+      player.setOption("captions", "track", track);
+      captionModuleDriven = true;
+      console.log("[AI_Trans Interceptor] Caption module driven successfully, selected track:", track);
+      setTimeout(() => {
+        try {
+          player.setOption("captions", "track", {});
+          console.log("[AI_Trans Interceptor] Caption track reset to suppress native rendering");
+        } catch {
+        }
+      }, 600);
+    } catch (err) {
+      console.log("[AI_Trans Interceptor] setOption error:", err);
+    }
+  }
+  function startCaptionModuleDriver() {
+    const RETRY_INTERVAL_MS = 1e3;
+    const MAX_RETRIES = 60;
+    let attempts = 0;
+    const timer = setInterval(() => {
+      attempts += 1;
+      ensureCaptionModuleLoaded();
+      if (captionModuleDriven || attempts >= MAX_RETRIES) {
+        clearInterval(timer);
+      }
+    }, RETRY_INTERVAL_MS);
+  }
+  function resetAndRedriveCaptionModule() {
+    captionModuleDriven = false;
+    ensureCaptionModuleLoaded();
+    if (!captionModuleDriven) {
+      startCaptionModuleDriver();
+    }
+  }
   function install() {
     if (Reflect.get(globalThis, INSTALL_FLAG)) return;
     Reflect.set(globalThis, INSTALL_FLAG, true);
     startReplay();
+    const onSetTargetLang = (ev) => {
+      const detail = ev.detail;
+      targetLang = typeof detail?.targetLang === "string" ? detail.targetLang : null;
+      Reflect.set(globalThis, "__aiTransTargetLang", targetLang);
+      console.log("[AI_Trans Interceptor] Received set-target-lang message, targetLang:", targetLang);
+      resetAndRedriveCaptionModule();
+    };
+    document.addEventListener("ai-trans:set-target-lang", onSetTargetLang);
+    startCaptionModuleDriver();
     Reflect.set(globalThis, "__aiTransTimedtextRequests", 0);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);
     const origOpen = XMLHttpRequest.prototype.open;
@@ -73,9 +172,7 @@
         const onLoad = () => {
           this.removeEventListener("load", onLoad);
           try {
-            const responseText = String(
-              this.responseText ?? ""
-            );
+            const responseText = readXhrResponseText(this);
             const contentType = this.getResponseHeader?.("content-type") ?? "unknown";
             emitCapture(urlStr, responseText, contentType, globalThis.location);
           } catch {

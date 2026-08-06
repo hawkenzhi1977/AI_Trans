@@ -53,13 +53,30 @@ export class NativeCaptionStrategy implements CaptionStrategy {
     const segments = await track.fetch();
     if (this.stopped) return;
 
-    const result = await ctx.translation.translate({
-      segments,
-      targetLang: ctx.config.targetLang,
-    });
-    if (this.stopped) return;
+    try {
+      const result = await ctx.translation.translate({
+        segments,
+        targetLang: ctx.config.targetLang,
+      });
+      if (this.stopped) return;
 
-    emit({ type: 'segments-ready', segments: result.segments });
+      emit({ type: 'segments-ready', segments: result.segments });
+    } catch (err) {
+      // 翻譯失敗時顯示原文字幕作為降級（§5.6：不靜默失敗）
+      if (this.stopped) return;
+      emit({
+        type: 'engine-degraded',
+        port: 'translation',
+        reason: `translation failed, falling back to original subtitles: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      // 使用原文字幕（translatedText 設為 sourceText）
+      const fallbackSegments = segments.map((s) => ({
+        ...s,
+        translatedText: s.sourceText,
+        targetLang: s.sourceLang,
+      }));
+      emit({ type: 'segments-ready', segments: fallbackSegments });
+    }
   }
 
   stop(): void {

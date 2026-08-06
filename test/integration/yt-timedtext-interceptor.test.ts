@@ -361,4 +361,153 @@ describe('yt-timedtext-interceptor — fetch hook（M1-43）', () => {
     expect(result).toBe(fakeRes);
     expect(postMessageSpy).not.toHaveBeenCalled();
   });
+
+  // ── M1-47 §5.1/§5.5：responseType 硬化 ──
+  // 真實環境播放器可能把 responseType 設為 'json'，此時讀 responseText 拋 InvalidStateError。
+  // 硬化後應改從 xhr.response 讀取並 JSON.stringify，仍能捕獲。
+  it('[M1-47] responseType=json 時從 response 讀取（不觸碰 responseText）', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    const url = 'https://www.youtube.com/api/timedtext?v=abc&pot=xyz&fmt=json3';
+    xhr.open('GET', url);
+    // 模擬 responseType='json'：response 為已解析對象；responseText 存取器設為拋錯（模擬真實瀏覽器）。
+    Object.defineProperty(xhr, 'responseType', { value: 'json', configurable: true });
+    Object.defineProperty(xhr, 'response', { value: { events: [{ segs: [] }] }, configurable: true });
+    Object.defineProperty(xhr, 'responseText', {
+      get() {
+        throw new DOMException('InvalidStateError', 'InvalidStateError');
+      },
+      configurable: true,
+    });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+
+    expect(postMessageSpy).toHaveBeenCalled();
+    const msg = postMessageSpy.mock.calls[0][0] as { payload: { responseText: string } };
+    expect(msg.payload.responseText).toBe(JSON.stringify({ events: [{ segs: [] }] }));
+  });
+
+  it('[M1-47] responseType=blob（二進制）時跳過，不 postMessage', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&fmt=srv3');
+    Object.defineProperty(xhr, 'responseType', { value: 'blob', configurable: true });
+    Object.defineProperty(xhr, 'response', { value: { size: 10 }, configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/octet-stream');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    expect(postMessageSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ── M1-47：主動驅動播放器字幕模組（核心修復）──
+// 背景：CC 關閉時播放器不發 timedtext 請求，攔截器捕獲不到 pot → 回退無 pot fetch → 空 body。
+// 攔截器透過播放器 API（loadModule/getOption/setOption）主動選軌，逼播放器發帶 pot 的請求。
+describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
+  const INSTALL_FLAG_2 = '__aiTransTimedtextInterceptorInstalled';
+  let origOpen: typeof XMLHttpRequest.prototype.open;
+  let origSend: typeof XMLHttpRequest.prototype.send;
+
+  beforeEach(() => {
+    origOpen = XMLHttpRequest.prototype.open;
+    origSend = XMLHttpRequest.prototype.send;
+    Reflect.deleteProperty(globalThis, INSTALL_FLAG_2);
+    vi.useFakeTimers();
+    document.body.innerHTML = '';
+  });
+
+  afterEach(() => {
+    XMLHttpRequest.prototype.open = origOpen;
+    XMLHttpRequest.prototype.send = origSend;
+    Reflect.deleteProperty(globalThis, INSTALL_FLAG_2);
+    vi.useRealTimers();
+    document.body.innerHTML = '';
+    vi.resetModules();
+  });
+
+  /** 建立帶字幕 API 的 mock 播放器元素並掛到 DOM。 */
+  function mountMockPlayer(tracklist: unknown[]): {
+    setOption: ReturnType<typeof vi.fn>;
+    loadModule: ReturnType<typeof vi.fn>;
+  } {
+    const el = document.createElement('div');
+    el.id = 'movie_player';
+    const setOption = vi.fn();
+    const loadModule = vi.fn();
+    Object.assign(el, {
+      loadModule,
+      getOption: (m: string, k: string) => (m === 'captions' && k === 'tracklist' ? tracklist : undefined),
+      setOption,
+    });
+    document.body.appendChild(el);
+    return { setOption, loadModule };
+  }
+
+  async function loadInterceptor(): Promise<void> {
+    await import('../../src/runtime/yt-timedtext-interceptor?t=' + Date.now());
+  }
+
+  it('播放器就緒且有字幕軌時，選人工軌 setOption 觸發字幕請求', async () => {
+    const { setOption, loadModule } = mountMockPlayer([
+      { languageCode: 'en', kind: 'asr' },
+      { languageCode: 'en', kind: undefined }, // 人工軌
+    ]);
+    await loadInterceptor();
+    // 驅動由 setInterval(1000ms) 重試；推進計時器觸發一次 ensureCaptionModuleLoaded。
+    vi.advanceTimersByTime(1_000);
+    expect(loadModule).toHaveBeenCalledWith('captions');
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+  });
+
+  it('無字幕軌時不選軌，記錄 __aiTransCaptionTracks=0（診斷可見）', async () => {
+    const { setOption } = mountMockPlayer([]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    expect(setOption).not.toHaveBeenCalled();
+    expect(Reflect.get(globalThis, '__aiTransCaptionTracks')).toBe(0);
+  });
+
+  it('選軌後短延遲復位（抑制原生字幕渲染）', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    setOption.mockClear();
+    vi.advanceTimersByTime(600);
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', {});
+  });
+
+  it('播放器未就緒時不拋錯，後續就緒後重試成功', async () => {
+    // 首次無播放器 → 不動作；掛上播放器後下一輪重試觸發選軌。
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000); // 播放器缺席，靜默跳過
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    vi.advanceTimersByTime(1_000); // 就緒後重試
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+  });
+
+  it('set-target-lang 消息更新調試變量並重驅動', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000); // 首輪驅動成功
+    setOption.mockClear();
+    // 發送 set-target-lang（模擬 SPA 換視頻 restart 重發）→ 重置並重驅動。
+    // 使用 CustomEvent 替代 MessageEvent（M1-47 修復：避免 isolated world 與 MAIN world 通信問題）
+    document.dispatchEvent(
+      new CustomEvent('ai-trans:set-target-lang', {
+        detail: { targetLang: 'zh-Hant' },
+      })
+    );
+    expect(Reflect.get(globalThis, '__aiTransTargetLang')).toBe('zh-Hant');
+    vi.advanceTimersByTime(1_000); // 重驅動輪
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+  });
 });

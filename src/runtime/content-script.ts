@@ -6,6 +6,7 @@ import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store'
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import { TimedTextBridge } from './timedtext-bridge';
+import { isWatchPage } from './watch-url';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
 import type { EngineConfig } from '../domain/models/config';
@@ -99,10 +100,29 @@ class SubtitleController {
     this.bridge.inject();
     this.bridge.start();
 
+    // M1-47：通知 MAIN world 攔截器目標翻譯語言——攔截器收到後主動驅動播放器字幕模組
+    // 發帶 pot 的 timedtext 請求（CC 關閉時播放器默認不發，攔截器捕獲不到）。
+    // 目標語言用於內容腳本後續翻譯，此處僅作為「重新驅動字幕載入」的觸發信號。
+    // 使用 CustomEvent 替代 postMessage，避免 isolated world 與 MAIN world 之間的通信問題。
+    document.dispatchEvent(
+      new CustomEvent('ai-trans:set-target-lang', {
+        detail: { targetLang: this.config.targetLang }
+      })
+    );
+    console.log('[AI_Trans] Sent set-target-lang message to MAIN world:', this.config.targetLang);
+
+    // M1-47：讀取當前 URL（會話恢復後 tab 先為首頁，之後 SPA 導航到 /watch）。
+    // 非 watch 頁時靜默返回（不發降級事件），保持攔截器與 SPA 監聽存活，
+    // 待 SPA 導航後由 onUrlChanged→restart 接管。
+    const currentUrl = this.currentUrl();
+    if (!isWatchPage(currentUrl)) {
+      return;
+    }
+
     await this.ensureMounted();
 
     // 測試環境（localhost Mock 站點）放寬平台匹配規則，使 YouTube 適配器接管 mock 頁。
-    const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
+    const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(currentUrl);
     const platformWatchRe = isMockHost
       ? /^https?:\/\/localhost(:\d+)?\//
       : undefined;
@@ -138,7 +158,12 @@ class SubtitleController {
       });
     }
 
-    await this.orchestrator.start(this.url);
+    await this.orchestrator.start(currentUrl);
+  }
+
+  /** 取得當前頁面 URL（M1-47：每次 start/restart 都讀最新 location）。 */
+  private currentUrl(): string {
+    return globalThis.location?.href ?? this.url;
   }
 
   /** 配置變更後熱重啟：停止舊管線 → 讀新配置 → 重新啟動。 */

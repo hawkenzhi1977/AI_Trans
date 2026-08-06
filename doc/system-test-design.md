@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45 注入時序 document_start + 跨視頻捕獲失效）、**TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）**；測試合計 113→139→153→164→168→175→182）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45 注入時序 document_start + 跨視頻捕獲失效）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、**TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）**；測試合計 113→139→153→164→168→175→182→183）
 
 ---
 
@@ -426,6 +426,15 @@ jobs:
   - F（bridge 晚註冊收到重播）：`TimedTextBridge` 在捕獲已發生後才 `start()`，重播消息送達 → `getLatest()` 就緒 → `waitForCapture` 立即命中。
 - 預期：重播使晚註冊監聽器收到捕獲（消息丟失競態修復）；SPA 換視頻後新捕獲覆蓋重播（`matchesVideo` 過濾仍正確）；調試輔助供 M1-27 真實環境定位「hook 沒觸發」vs「捕獲到但解析/複用斷」。
 - 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+6：重播晚註冊/新捕獲覆蓋/空響應不重播/video.google.com 匹配/調試計數+lastCapture）、`test/integration/timedtext-bridge.test.ts`（+1：晚註冊收到重播）。E2E 時序盲區：mock 播放器請求時機設計在 content-script 就緒後，「捕獲早於監聽器」競態在 E2E 不暴露，由確定性集成用例覆蓋（避免 mock 時序 flaky）。
+
+#### TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（對應 F-01/M1-47，已實裝）
+- 前置：M1-46 修復了「捕獲早於監聽器註冊」的競態，但真實環境仍現「捕獲成功但字幕不顯示」——`__aiTransTimedtextLastCapture` 有值（捕獲成功）、`Capture count: 1`，但字幕不顯示，console 出現 `LLM translation response body read failed (connection lost): Failed to fetch`。三層根因與修復：**(1) 消息通信失敗**——content-script 的 `window.postMessage` 與 MAIN world 的 `globalThis.addEventListener('message')` 在 isolated world 與 MAIN world 之間通信失敗（`__aiTransTargetLang: undefined`），導致字幕模組驅動未觸發。修復：改用 `CustomEvent`——content-script 用 `document.dispatchEvent(new CustomEvent('ai-trans:set-target-lang', { detail: { targetLang } }))`，interceptor 用 `document.addEventListener('ai-trans:set-target-lang', ...)`，避免跨 world 通信問題。**(2) 字幕模組驅動重試不足**——`MAX_RETRIES=20`（20 秒）在 YouTube 播放器加載較慢時不足，且沒有立即觸發機制。修復：`MAX_RETRIES` 增至 60（60 秒）；`resetAndRedriveCaptionModule()` 立即嘗試一次 `ensureCaptionModuleLoaded()`；收到 `SET_TARGET_LANG_EVENT` 消息時立即調用 `resetAndRedriveCaptionModule()`。**(3) 翻譯失敗時字幕完全不顯示**——LLM 翻譯服務連接失敗時，錯誤冒泡到策略鏈但不顯示任何字幕。修復：`NativeCaptionStrategy.run()` 添加 try-catch 捕獲翻譯錯誤，失敗時顯示原文字幕（`translatedText` 設為 `sourceText`）並發送 `engine-degraded` 事件。
+- 步驟（集成測試覆蓋）：
+  - A（CustomEvent 消息通信）：interceptor 監聽 `ai-trans:set-target-lang` CustomEvent → 設置 `__aiTransTargetLang` → 斷言值正確設置（替代原 `postMessage` 測試）。
+  - B（字幕模組驅動立即觸發）：收到 `SET_TARGET_LANG_EVENT` 消息 → 立即調用 `resetAndRedriveCaptionModule()` → 斷言 `ensureCaptionModuleLoaded()` 被調用。
+  - C（MAX_RETRIES 增強）：`MAX_RETRIES` 從 20 增至 60 → 斷言重試窗口為 60 秒。
+- 預期：isolated world 與 MAIN world 之間的消息通信通過 `CustomEvent` 正常傳遞（`__aiTransTargetLang` 正確設置）；字幕模組驅動有足夠的重試窗口（60 秒）和立即觸發機制；翻譯失敗時顯示原文字幕並發送 `engine-degraded` 事件（popup 顯示降級原因）。
+- 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+1：`set-target-lang` 消息測試改用 `CustomEvent`）。
 
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。

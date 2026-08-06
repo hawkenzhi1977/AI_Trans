@@ -292,12 +292,27 @@
       }
       const segments = await track.fetch();
       if (this.stopped) return;
-      const result = await ctx.translation.translate({
-        segments,
-        targetLang: ctx.config.targetLang
-      });
-      if (this.stopped) return;
-      emit({ type: "segments-ready", segments: result.segments });
+      try {
+        const result = await ctx.translation.translate({
+          segments,
+          targetLang: ctx.config.targetLang
+        });
+        if (this.stopped) return;
+        emit({ type: "segments-ready", segments: result.segments });
+      } catch (err) {
+        if (this.stopped) return;
+        emit({
+          type: "engine-degraded",
+          port: "translation",
+          reason: `translation failed, falling back to original subtitles: ${err instanceof Error ? err.message : String(err)}`
+        });
+        const fallbackSegments = segments.map((s) => ({
+          ...s,
+          translatedText: s.sourceText,
+          targetLang: s.sourceLang
+        }));
+        emit({ type: "segments-ready", segments: fallbackSegments });
+      }
     }
     stop() {
       this.stopped = true;
@@ -1175,6 +1190,20 @@
     }
   };
 
+  // src/runtime/watch-url.ts
+  var YT_HOST_RE = /^(www\.)?youtube\.com$/;
+  function isWatchPage(url) {
+    try {
+      const u = new URL(url);
+      if (YT_HOST_RE.test(u.hostname)) {
+        return u.pathname === "/watch" && u.searchParams.has("v");
+      }
+      return u.hostname === "localhost";
+    } catch {
+      return false;
+    }
+  }
+
   // src/runtime/content-script.ts
   var PLAYER_SELECTOR = "div#movie_player, .html5-video-player, #mock-player";
   function extractVideoId(url) {
@@ -1243,8 +1272,18 @@
     async start() {
       this.bridge.inject();
       this.bridge.start();
+      document.dispatchEvent(
+        new CustomEvent("ai-trans:set-target-lang", {
+          detail: { targetLang: this.config.targetLang }
+        })
+      );
+      console.log("[AI_Trans] Sent set-target-lang message to MAIN world:", this.config.targetLang);
+      const currentUrl = this.currentUrl();
+      if (!isWatchPage(currentUrl)) {
+        return;
+      }
       await this.ensureMounted();
-      const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(this.url);
+      const isMockHost = /^https?:\/\/localhost(:\d+)?\//.test(currentUrl);
       const platformWatchRe = isMockHost ? /^https?:\/\/localhost(:\d+)?\// : void 0;
       const registry = await buildDefaultRegistry(this.config, {
         apiKeyStore: store,
@@ -1272,7 +1311,11 @@
           this.scheduleDraw();
         });
       }
-      await this.orchestrator.start(this.url);
+      await this.orchestrator.start(currentUrl);
+    }
+    /** 取得當前頁面 URL（M1-47：每次 start/restart 都讀最新 location）。 */
+    currentUrl() {
+      return globalThis.location?.href ?? this.url;
     }
     /** 配置變更後熱重啟：停止舊管線 → 讀新配置 → 重新啟動。 */
     async restart() {
