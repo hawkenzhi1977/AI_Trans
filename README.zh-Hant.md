@@ -12,7 +12,7 @@ English version: [README.md](./README.md).
 
 ### 已實現（里程碑 M1）
 
-- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。
+- **原生字幕翻譯**——檢測並抓取 YouTube 原生字幕軌，翻譯後覆蓋顯示在播放器上。兼容 YouTube timedtext 全部真實格式：優先請求穩定 JSON（`fmt=json3`），回退可解析 `srv3` XML（`<timedtext><p t d><s>`）或傳統 `<transcript><text>` XML；非法 HTML（登錄/錯誤頁）被識別為解析錯誤，不再誤報「無字幕」。
 - **覆蓋層字幕渲染**——支持單語或雙語（原文＋譯文），渲染於獨立覆蓋層並對齊播放時間。
 - **播放狀態同步**——字幕隨當前時間、暫停、快進同步（媒體事件 + `requestAnimationFrame` 對齊）。
 - **可配置翻譯引擎**——雲端 LLM（OpenAI 兼容 `/chat/completions`）為主、傳統 MT 兜底；端點、模型、API Key 由用戶配置。API Key 與配置對象分離存儲。
@@ -121,7 +121,7 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 
 > **reasoning 模型提示**：會輸出長 `<think>` 思考的模型已支援（思考塊會被剝離），但單次翻譯可能耗時 30–40s，易命中 30s 請求超時而降級 MT 兜底。要即時字幕建議改用非推理（instruct）模型。
 
-> **排查提示 — 字幕不出現時**：先開 Popup 點**「測試連接」**——它會向配置端點發真實請求，直接告訴你失敗在哪一環（端點不可達/模型名不符/響應異常）。也可看**「最近失敗」**行（常駐顯示，如模型 404 `LLM translation failed: HTTP 404`）或 DevTools console 的 `[AI_Trans] translation degraded` 麵包屑。若原因為 `no caption strategies applicable`，則屬**字幕軌抓取失敗**（與翻譯失敗不同），cause 會進一步區分三種子情況——找不到 player-response JSON / JSON 解析失敗 / 視頻確實無字幕軌。常見原因：模型 ID 與伺服器實際名稱不符（omlx 會回 404 Model not found）；端點格式（`http://127.0.0.1:8000/v1` 與 `http://127.0.0.1:8000/v1/chat/completions` 都會自動規範化）。**注意**：Chrome 對 `127.0.0.1`/`localhost` 的明文 HTTP 有 mixed-content 豁免，本地端點用 `http://127.0.0.1:PORT/v1` 即可，無需 HTTPS。
+> **排查提示 — 字幕不出現時**：先開 Popup 點**「測試連接」**——它會向配置端點發真實請求，直接告訴你失敗在哪一環（端點不可達/模型名不符/響應異常）。也可看**「最近失敗」**行（常駐顯示，如模型 404 `LLM translation failed: HTTP 404`）或 DevTools console 的 `[AI_Trans] translation degraded` 麵包屑。若原因為 `no caption strategies applicable`，則屬**字幕軌抓取失敗**（與翻譯失敗不同），cause 會進一步區分三種子情況——找不到 player-response JSON / JSON 解析失敗 / 視頻確實無字幕軌。若原因為 `timedtext XML: missing transcript root` 或 timedtext 解析錯誤，說明字幕響應格式未被識別——擴充現已優先請求 `fmt=json3` 並回退 srv3 XML 解析，僅在 YouTube 再次改變格式時才應出現。常見原因：模型 ID 與伺服器實際名稱不符（omlx 會回 404 Model not found）；端點格式（`http://127.0.0.1:8000/v1` 與 `http://127.0.0.1:8000/v1/chat/completions` 都會自動規範化）。**注意**：Chrome 對 `127.0.0.1`/`localhost` 的明文 HTTP 有 mixed-content 豁免，本地端點用 `http://127.0.0.1:PORT/v1` 即可，無需 HTTPS。
 
 ---
 

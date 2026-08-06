@@ -92,10 +92,31 @@ export class FetchCaptionSource implements CaptionSource {
   async fetchTracks(baseUrl: string, lang: string): Promise<SubtitleSegment[]> {
     // baseUrl 可能為相對路徑（Mock 站點），統一解析為絕對 URL。
     const url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
-    const res = await this.fetchFn(url, { credentials: 'omit' });
+    // 真實 YouTube 的 captionTracks[].baseUrl 不帶 fmt 時默認回 srv3 XML
+    // （根為 <timedtext format="3">，子節點 body>p>s，非傳統 <transcript><text>），
+    // 舊解析器會誤判「missing transcript root」或解析為空。強制 fmt=json3 取穩定 JSON
+    // （{"events":[{tStartMs,dDurationMs,segs:[{utf8}]}]}），與解析器 JSON 分支對齊。
+    // Mock 站點的相對 URL（無 host）不加 fmt，避免破壞既有契約。
+    const finalUrl = this.withJson3Format(url);
+    const res = await this.fetchFn(finalUrl, { credentials: 'omit' });
     if (!res.ok) throw new Error(`timedtext fetch failed: ${res.status}`);
     const raw = await res.text();
     return parseTimedText(raw, lang);
+  }
+
+  /** 為真實 YouTube timedtext URL 追加 fmt=json3（Mock 相對路徑不動）。 */
+  private withJson3Format(url: string): string {
+    try {
+      const u = new URL(url);
+      // 僅對 youtube 域名的 timedtext 追加，避免影響 Mock 站點的 /timedtext。
+      if (u.hostname.endsWith('youtube.com') && u.pathname.includes('timedtext')) {
+        u.searchParams.set('fmt', 'json3');
+        return u.href;
+      }
+      return url;
+    } catch {
+      return url;
+    }
   }
 }
 

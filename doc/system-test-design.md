@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷；測試合計 88→108）
+> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容；測試合計 88→113）
 
 ---
 
@@ -357,6 +357,16 @@ jobs:
 - 預期：佔位策略的「未實現」可與「真失敗」區分，全鏈失敗原因不再空白。
 - 落點：單元 `test/unit/placeholder-strategies.test.ts`（3）。
 
+#### TC-F16 timedtext 真實格式兼容（對應 F-01/M1-27，已實裝）
+- 前置：真實 YouTube 的 `captionTracks[].baseUrl` 默認返回 **srv3 XML**（`<timedtext format="3"><body><p t d><s>`），非傳統 `<transcript><text>`；且可能返回 HTML 錯誤/登錄頁。
+- 步驟：
+  - A（強制 JSON）：`fetchTracks` 對 YouTube 域名的 timedtext URL 追加 `fmt=json3`（已有 fmt 參數則覆寫）；非 YouTube 域名（Mock 站點）不動。
+  - B（srv3 兜底）：即使返回 srv3 XML，`parseXml` 識別 `<timedtext>` 根內含 `<p>` → `parseSrv3`（`t`/`d` 為毫秒，多 `<s>` 拼接文本）。
+  - C（HTML 錯誤頁）：DOMParser 產生 `parsererror` → 拋「parse error (not valid XML…)」而非誤判「missing transcript root」。
+  - D（HTML 實體）：`&#39;` `&amp;` 等解碼。
+- 預期：真實 YouTube 字幕內容三種形態（json3 / srv3 XML / 傳統 transcript XML）均可解析；錯誤頁不再被誤判為「無字幕根」。
+- 落點：契約 `test/contract/timedtext.test.ts`（+3：srv3/錯誤頁/實體）；集成 `test/integration/platform-adapter.test.ts`（+2：TC-F16 追加 fmt 與非 YouTube 不動）。
+
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
 - 步驟：
@@ -426,7 +436,7 @@ jobs:
 | TC-R7b | R7 JSON 容錯 | 非法 JSON / 首個內聯非字幕腳本時返回 `[]` 不拋 SyntaxError | `test/integration/platform-adapter.test.ts` |
 | TC-R8 | R4 跨上下文熱重啟 | 經 service worker 寫 `chrome.storage.local`（等價 Options 保存）觸發 `storage.onChanged` → content-script `restart()`，覆蓋層仍恰好 1 個、仍 attached（不累積、不崩潰） | `test/e2e/extension.spec.ts` |
 
-> 全部測試合計 108（單元 40 + 契約 5 + 集成 50 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。
+> 全部測試合計 113（單元 40 + 契約 8 + 集成 52 + E2E 13）。R 系列為 §5 紅線的專屬回歸，改動相關代碼須保持這些斷言不破。新增（F-11 診斷可見性）：集成 +11（`diagnostics.test.ts` 7：extract/record/read/format + §5.7 storage 拋錯守護；`popup.test.ts` 4：有診斷/常駐「無」/狀態行/測試連接按鈕；`connection-test.test.ts` 5：TC-F12 六類分支）、單元 +8（TC-F13：`caption-strategy-chain.test.ts` 全鏈診斷 2 + run 失敗診斷 1 + `native-caption-strategy.test.ts` 軌抓取診斷 4 + `placeholder-strategies.test.ts` 3）、E2E +1（TC-F11 降級後 `lastDiagnostic` 寫入）。新增（M1-39 不靜默失敗收口）：集成 +4（TC-F14 軌列表三態診斷）、單元 +4（TC-F15 佔位策略 3 + TC-F14 平台診斷帶入 1）。新增（TC-F16 timedtext 真實格式兼容）：契約 +3（srv3/HTML 錯誤頁/實體）、集成 +2（fmt=json3 追加/非 YouTube 不動）。
 >
 > **E2E 配置污染防護（重要）**：E2E 經 persistent context 加載擴充，content-script 會真實請求配置中的端點。**禁止測試寫入指向真實本地服務的端點**（如 `127.0.0.1:8000`——開發機上的 omlx 等）——否則測試會真實打開發機服務、污染日誌與診斷（曾發生：omlx 出現大量 `qwen-mlx` 404 記錄，實為 TC-R8 舊版寫入真實 8000 端口所致）。統一改用不可達假端口 `127.0.0.1:59999`。
 
@@ -470,6 +480,7 @@ jobs:
 | TC-F13 | F-11 | 單元（已實裝） |
 | TC-F14 | F-11 | 集成/單元（已實裝） |
 | TC-F15 | F-11 | 單元（已實裝） |
+| TC-F16 | F-01 | 契約/集成（已實裝） |
 | TC-F06 | F-06 | E2E |
 | TC-F07 | F-07 | 集成 |
 | TC-F08 | F-08 | 集成/E2E |

@@ -51,9 +51,20 @@ function parseJson(raw: string, lang: string): SubtitleSegment[] {
 
 function parseXml(raw: string, lang: string): SubtitleSegment[] {
   const doc = new DOMParser().parseFromString(raw, 'application/xml');
+  // 解析錯誤（非法 XML / HTML 錯誤頁）：DOMParser 返回含 <parsererror> 的文檔。
+  if (doc.getElementsByTagName('parsererror').length > 0) {
+    throw new Error('timedtext XML: parse error (not valid XML — possibly an HTML error/login page)');
+  }
+  // srv3 格式：<timedtext format="3"><body><p t=".." d=".."><s>text</s></p></body></timedtext>
+  // 真實 YouTube 默認返回此格式（我們已改為請求 fmt=json3，此處為兜底）。
+  const timedtextRoot = doc.getElementsByTagName('timedtext')[0];
+  if (timedtextRoot && timedtextRoot.getElementsByTagName('p').length > 0) {
+    return parseSrv3(timedtextRoot, lang);
+  }
+  // 傳統格式：<transcript><text start=".." dur="..">text</text></transcript>
   const transcribe =
     doc.getElementsByTagName('transcript')[0] ??
-    doc.getElementsByTagName('timedtext')[0];
+    timedtextRoot;
   if (!transcribe) {
     throw new Error('timedtext XML: missing transcript root');
   }
@@ -62,7 +73,7 @@ function parseXml(raw: string, lang: string): SubtitleSegment[] {
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (node.tagName !== 'text') continue;
-    const text = (node.textContent ?? '').trim();
+    const text = decodeEntities((node.textContent ?? '').trim());
     if (!text) continue;
     const start = Number(node.getAttribute('start') ?? 0);
     const dur = Number(node.getAttribute('dur') ?? 2);
@@ -71,6 +82,36 @@ function parseXml(raw: string, lang: string): SubtitleSegment[] {
     );
   }
   return segments;
+}
+
+/** 解析 srv3 XML（<p t d><s>...</s></p>，時間為毫秒）。 */
+function parseSrv3(root: Element, lang: string): SubtitleSegment[] {
+  const ps = root.getElementsByTagName('p');
+  const segments: SubtitleSegment[] = [];
+  for (let i = 0; i < ps.length; i++) {
+    const p = ps[i];
+    // <p> 內文本可能直接在 p 或分佈於多個 <s> 子節點。
+    const text = decodeEntities((p.textContent ?? '').trim());
+    if (!text) continue;
+    const start = Number(p.getAttribute('t') ?? 0); // 毫秒
+    const dur = Number(p.getAttribute('d') ?? 2000); // 毫秒
+    segments.push(
+      toSegment(String(i), Math.round(start), Math.round(start + dur), text, lang)
+    );
+  }
+  return segments;
+}
+
+/** 解碼常見 HTML 實體（YouTube 字幕文本可能含 &amp;#39; 等）。 */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
 }
 
 function toSegment(

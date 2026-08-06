@@ -64,6 +64,40 @@ describe('FetchCaptionSource — R1 fetch 綁定 / R2 URL 絕對化 / R7 JSON �
     expect(calledUrl).toMatch(/^https?:\/\/[^/]+\/timedtext\?lang=en$/);
   });
 
+  it('[TC-F16] 真實 YouTube timedtext URL 強制追加 fmt=json3（避免默認 srv3 XML 誤判）', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [] }),
+    }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await src.fetchTracks(
+      'https://www.youtube.com/api/timedtext?lang=en&v=abc123',
+      'en'
+    );
+    const calledUrl = new URL(String(fetchFn.mock.calls[0][0]));
+    expect(calledUrl.searchParams.get('fmt')).toBe('json3');
+    // 已有 fmt 參數時覆寫為 json3
+    await src.fetchTracks(
+      'https://www.youtube.com/api/timedtext?lang=en&fmt=srv3&v=abc123',
+      'en'
+    );
+    const secondUrl = new URL(String(fetchFn.mock.calls[1][0]));
+    expect(secondUrl.searchParams.get('fmt')).toBe('json3');
+  });
+
+  it('[TC-F16] 非 YouTube 域名的 timedtext 不追加 fmt（不破壞 Mock 站點契約）', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [] }),
+    }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await src.fetchTracks('http://localhost:8721/timedtext?lang=en', 'en');
+    const calledUrl = new URL(String(fetchFn.mock.calls[0][0]));
+    expect(calledUrl.searchParams.has('fmt')).toBe(false);
+  });
+
   it('[R7] 具名 #ytInitialPlayerResponse 優先，忽略其他內聯腳本', async () => {
     setPlayerResponse(validPlayerResponse, {
       extraInlineScript: 'window.__ytExtra = 1;',

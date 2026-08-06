@@ -363,7 +363,14 @@
   }
   function parseXml(raw, lang) {
     const doc = new DOMParser().parseFromString(raw, "application/xml");
-    const transcribe = doc.getElementsByTagName("transcript")[0] ?? doc.getElementsByTagName("timedtext")[0];
+    if (doc.getElementsByTagName("parsererror").length > 0) {
+      throw new Error("timedtext XML: parse error (not valid XML \u2014 possibly an HTML error/login page)");
+    }
+    const timedtextRoot = doc.getElementsByTagName("timedtext")[0];
+    if (timedtextRoot && timedtextRoot.getElementsByTagName("p").length > 0) {
+      return parseSrv3(timedtextRoot, lang);
+    }
+    const transcribe = doc.getElementsByTagName("transcript")[0] ?? timedtextRoot;
     if (!transcribe) {
       throw new Error("timedtext XML: missing transcript root");
     }
@@ -372,7 +379,7 @@
     for (let i = 0; i < nodes.length; i++) {
       const node = nodes[i];
       if (node.tagName !== "text") continue;
-      const text = (node.textContent ?? "").trim();
+      const text = decodeEntities((node.textContent ?? "").trim());
       if (!text) continue;
       const start2 = Number(node.getAttribute("start") ?? 0);
       const dur = Number(node.getAttribute("dur") ?? 2);
@@ -381,6 +388,24 @@
       );
     }
     return segments;
+  }
+  function parseSrv3(root, lang) {
+    const ps = root.getElementsByTagName("p");
+    const segments = [];
+    for (let i = 0; i < ps.length; i++) {
+      const p = ps[i];
+      const text = decodeEntities((p.textContent ?? "").trim());
+      if (!text) continue;
+      const start2 = Number(p.getAttribute("t") ?? 0);
+      const dur = Number(p.getAttribute("d") ?? 2e3);
+      segments.push(
+        toSegment(String(i), Math.round(start2), Math.round(start2 + dur), text, lang)
+      );
+    }
+    return segments;
+  }
+  function decodeEntities(s) {
+    return s.replace(/&amp;#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   }
   function toSegment(id, start2, end, text, lang) {
     return {
@@ -457,10 +482,24 @@
     }
     async fetchTracks(baseUrl, lang) {
       const url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
-      const res = await this.fetchFn(url, { credentials: "omit" });
+      const finalUrl = this.withJson3Format(url);
+      const res = await this.fetchFn(finalUrl, { credentials: "omit" });
       if (!res.ok) throw new Error(`timedtext fetch failed: ${res.status}`);
       const raw = await res.text();
       return parseTimedText(raw, lang);
+    }
+    /** 為真實 YouTube timedtext URL 追加 fmt=json3（Mock 相對路徑不動）。 */
+    withJson3Format(url) {
+      try {
+        const u = new URL(url);
+        if (u.hostname.endsWith("youtube.com") && u.pathname.includes("timedtext")) {
+          u.searchParams.set("fmt", "json3");
+          return u.href;
+        }
+        return url;
+      } catch {
+        return url;
+      }
     }
   };
   var YouTubePlatformAdapter = class {

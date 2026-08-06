@@ -37,6 +37,28 @@ describe('timedtext 契約：XML 格式', () => {
   it('缺 transcript 根時拋錯', () => {
     expect(() => parseTimedText('<foo/>', 'en')).toThrow('missing transcript');
   });
+
+  it('srv3 格式（timedtext>body>p>s）解析為內部段（毫秒時間軸）', () => {
+    const srv3 = `<?xml version="1.0" encoding="utf-8"?><timedtext format="3"><body><p t="0" d="1500"><s>Hello</s> <s>world</s></p><p t="1500" d="2000"><s>Second</s></p></body></timedtext>`;
+    const segs = parseTimedText(srv3, 'en');
+    expect(segs).toHaveLength(2);
+    expect(segs[0].start).toBe(0);
+    expect(segs[0].end).toBe(1500);
+    expect(segs[0].sourceText).toBe('Hello world');
+    expect(segs[1].sourceText).toBe('Second');
+  });
+
+  it('HTML 錯誤/登錄頁（非法 XML）拋解析錯誤而非 missing root', () => {
+    // DOMParser 對 HTML 片段會產生 parsererror——應報「非合法 XML」而非誤判「無字幕根」。
+    const html = `<!DOCTYPE html><html><head><title>Sign in</title></head><body>...</body></html>`;
+    expect(() => parseTimedText(html, 'en')).toThrow(/parse error|missing transcript/);
+  });
+
+  it('HTML 實體解碼（&#39; &amp;）', () => {
+    const xml = `<?xml version="1.0" encoding="utf-8"?><transcript><text start="0" dur="1">It&#39;s &amp; fine</text></transcript>`;
+    const segs = parseTimedText(xml, 'en');
+    expect(segs[0].sourceText).toBe("It's & fine");
+  });
 });
 
 describe('timedtext 契約：格式識別', () => {
