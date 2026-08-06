@@ -38,6 +38,8 @@
           return { origin: strategy.origin, errors };
         } catch (err) {
           const next = this.strategies[this.strategies.indexOf(strategy) + 1];
+          const causeMsg = err instanceof Error ? err.message : String(err);
+          diagnostics.push(`${strategy.origin}: run failed \u2014 ${causeMsg}`);
           errors.push({
             port: "platform",
             code: "strategy-failed",

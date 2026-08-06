@@ -49,6 +49,11 @@ export class CaptionStrategyChain {
         return { origin: strategy.origin, errors };
       } catch (err) {
         const next = this.strategies[this.strategies.indexOf(strategy) + 1];
+        const causeMsg = err instanceof Error ? err.message : String(err);
+        // §5.6：策略 run 失敗的真實原因也必須進診斷累加器，否則「全鏈不適用」
+        // 的 pipeline-error 只剩下後續佔位策略（M2/M3 not implemented）的原因，
+        // 用戶看不到真正把字幕擋住的根因（如 timedtext 抓取失敗 / 翻譯異常）。
+        diagnostics.push(`${strategy.origin}: run failed — ${causeMsg}`);
         errors.push({
           port: 'platform',
           code: 'strategy-failed',

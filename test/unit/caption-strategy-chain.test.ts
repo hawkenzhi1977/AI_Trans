@@ -75,6 +75,24 @@ describe('CaptionStrategyChain', () => {
     ).toBe(true);
   });
 
+  it('策略 run 拋錯且後續全不適用時，pipeline-error 含 run 失敗真實原因（§5.6）', async () => {
+    // 回歸：此前 run 失敗的 cause 只進 errors 數組，未進 diagnostics——
+    // popup 只剩後續佔位策略（M2/M3 not implemented）的原因，真實根因被吞。
+    const s1 = new FakeStrategy({ origin: 'native', applicable: true, throwOnRun: true });
+    const s2 = new FakeStrategy({ origin: 'realtime-asr', applicable: false, diagMessage: 'realtime-asr: not implemented (M2)' });
+    const events: PipelineEvent[] = [];
+    const chain = new CaptionStrategyChain([s1, s2], (e) => events.push(e));
+
+    await chain.runWithFallback(ctx);
+    const err = events.find(
+      (e): e is Extract<PipelineEvent, { type: 'pipeline-error' }> => e.type === 'pipeline-error'
+    );
+    expect(err).toBeDefined();
+    const msg = (err!.error.cause as Error).message;
+    expect(msg).toContain('native: run failed — native run failed');
+    expect(msg).toContain('realtime-asr: not implemented (M2)');
+  });
+
   it('全部策略失敗時 origin 為 undefined', async () => {
     const s1 = new FakeStrategy({ origin: 'native', applicable: false });
     const s2 = new FakeStrategy({ origin: 'realtime-asr', applicable: false });
