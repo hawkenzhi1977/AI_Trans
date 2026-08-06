@@ -507,7 +507,7 @@
       const finalUrl = this.withJson3Format(url);
       let res;
       try {
-        res = await this.fetchFn(finalUrl, { credentials: "omit" });
+        res = await this.fetchFn(finalUrl, { credentials: "include" });
       } catch (err) {
         const msg = `timedtext fetch failed: ${err instanceof Error ? err.message : String(err)} (url: ${finalUrl})`;
         this.lastTrackDiagnostic = msg;

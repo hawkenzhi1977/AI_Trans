@@ -111,7 +111,7 @@ export class FetchCaptionSource implements CaptionSource {
     // 避免「fetch 失敗」與「parse 失敗」混在同一條 run failed 裡無法定位。
     let res: Response;
     try {
-      res = await this.fetchFn(finalUrl, { credentials: 'omit' });
+      res = await this.fetchFn(finalUrl, { credentials: 'include' });
     } catch (err) {
       const msg = `timedtext fetch failed: ${err instanceof Error ? err.message : String(err)} (url: ${finalUrl})`;
       this.lastTrackDiagnostic = msg;
