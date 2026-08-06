@@ -160,3 +160,48 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
     expect(stripReasoning('plain')).toBe('plain');
   });
 });
+
+describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退原文）', () => {
+  it('HTTP 200 但 body 非 JSON（HTML 錯誤頁）→ 拋「非合法 JSON」錯誤而非 SyntaxError', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError('Unexpected token < in JSON at position 0');
+      },
+    }) as Response);
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await expect(provider.translate(req())).rejects.toThrow(/response is not valid JSON/);
+  });
+
+  it('HTTP 200 但 choices 缺失（限流返回 {error}）→ 拋錯走降級而非靜默回退原文', async () => {
+    const fetchFn = vi.fn(async () => okResponse({ error: { message: 'rate limited' } }));
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    // 必須 reject（觸發 pipeline fallback/降級事件），不許帶 degraded=false 回退原文。
+    await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
+  });
+
+  it('HTTP 200 但 choices[0].message.content 非字符串 → 拋錯不靜默', async () => {
+    const fetchFn = vi.fn(async () => okResponse({ choices: [{ message: { content: 42 } }] }));
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
+  });
+});

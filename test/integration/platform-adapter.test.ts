@@ -172,6 +172,65 @@ describe('FetchCaptionSource — R1 fetch 綁定 / R2 URL 絕對化 / R7 JSON �
   });
 });
 
+describe('FetchCaptionSource — §5.6 拉取失敗診斷證據化', () => {
+  it('HTTP 非 2xx → 診斷與錯誤含 status 與 URL', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: false, status: 403 }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await expect(src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en')).rejects.toThrow(
+      /timedtext fetch HTTP 403/
+    );
+    expect(src.getLastTrackDiagnostic()).toMatch(/HTTP 403/);
+  });
+
+  it('網絡層失敗 → 診斷與錯誤含原始錯誤與 URL（可區分 fetch vs parse）', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await expect(
+      src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en')
+    ).rejects.toThrow(/timedtext fetch failed: Failed to fetch/);
+    expect(src.getLastTrackDiagnostic()).toContain('Failed to fetch');
+    expect(src.getLastTrackDiagnostic()).toContain('timedtext');
+  });
+
+  it('200 但 body 為 HTML 錯誤頁 → 診斷含 content-type 與片段證據', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+      text: async () => '<!DOCTYPE html><html><head><title>Sign in</title></head><body>...</body></html>',
+    }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    // jsdom DOMParser 對完整 HTML 走「missing transcript root」分支，但必須帶證據。
+    await expect(src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en')).rejects.toThrow(
+      /body snippet/
+    );
+    expect(src.getLastTrackDiagnostic()).toContain('text/html');
+    expect(src.getLastTrackDiagnostic()).toContain('actual root <html>');
+  });
+
+  it('200 但 body 為非法 JSON → 診斷含 json parse failed 與片段', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: async () => '{ "events": [{"tStartMs":',
+    }) as Response);
+    const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch);
+    await expect(src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en')).rejects.toThrow(
+      /timedtext JSON parse failed/
+    );
+    expect(src.getLastTrackDiagnostic()).toContain('application/json');
+  });
+
+  it('非法 baseUrl（new URL 拋錯）→ 診斷標記 URL 構造失敗（而非裸冒泡）', async () => {
+    const src = new FetchCaptionSource(document);
+    // jsdom 對 '%zz...' 不會拋錯（會百分比編碼），改用會真拋錯的輸入。
+    await expect(src.fetchTracks('http://[::1', 'en')).rejects.toThrow(/URL construct failed/);
+  });
+});
+
 describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {
   function mountVideo(): HTMLVideoElement {
     document.body.innerHTML = '<video class="html5-main-video"></video>';
@@ -217,5 +276,14 @@ describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {
     const adapter = new YouTubePlatformAdapter({ doc: document });
     const unsub = adapter.observePlayback(() => {});
     expect(() => unsub()).not.toThrow();
+  });
+
+  it('[§5.6] 播放器 <video> 缺失時 observePlayback 打麵包屑警告（不靜默）', () => {
+    document.body.innerHTML = '';
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new YouTubePlatformAdapter({ doc: document });
+    adapter.observePlayback(() => {});
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('video element not found'));
+    warnSpy.mockRestore();
   });
 });

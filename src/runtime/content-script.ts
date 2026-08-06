@@ -159,11 +159,13 @@ class SubtitleController {
   private async ensureMounted(): Promise<void> {
     if (!document.querySelector(PLAYER_SELECTOR)) {
       // R4/R5：存 observer 句柄可被 stop 中斷；加超時避免播放器永不出現時 Promise 永久懸掛。
+      let timedOut = false;
       await new Promise<void>((resolve) => {
         let settled = false;
-        const finish = () => {
+        const finish = (fromTimeout: boolean) => {
           if (settled) return;
           settled = true;
+          if (fromTimeout) timedOut = true;
           this.pendingMountObserver?.disconnect();
           this.pendingMountObserver = null;
           if (this.mountWaitTimer !== null) {
@@ -173,13 +175,28 @@ class SubtitleController {
           resolve();
         };
         const mo = new MutationObserver(() => {
-          if (document.querySelector(PLAYER_SELECTOR)) finish();
+          if (document.querySelector(PLAYER_SELECTOR)) finish(false);
         });
         this.pendingMountObserver = mo;
         mo.observe(document.body, { childList: true, subtree: true });
         // 15s 超時：超時後放棄等待（mountOverlay 會因無播放器安全跳過）。
-        this.mountWaitTimer = setTimeout(finish, MOUNT_WAIT_TIMEOUT_MS);
+        this.mountWaitTimer = setTimeout(() => finish(true), MOUNT_WAIT_TIMEOUT_MS);
       });
+      // §5.6：播放器 15s 未出現屬關鍵節點失敗，不允許靜默——落診斷讓 popup「最近失敗」可查。
+      // （正常情況播放器會出現；超時說明播放器被移除/SPA 切頁/頁面變體，字幕不出的原因必須可見。）
+      if (timedOut) {
+        this.onEvent({
+          type: 'pipeline-error',
+          error: {
+            port: 'platform',
+            code: 'player-not-found',
+            recoverable: true,
+            cause: new Error(
+              `player not found within ${MOUNT_WAIT_TIMEOUT_MS}ms (selector: ${PLAYER_SELECTOR})`
+            ),
+          },
+        });
+      }
     }
     this.mountOverlay();
   }

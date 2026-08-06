@@ -96,4 +96,42 @@ describe('popup 診斷顯示', () => {
     expect(document.getElementById('status-asr')!.textContent).toBe('ASR: 本地 Whisper (base)');
     expect(document.getElementById('status-lang')!.textContent).toContain('目標語言: zh-Hant');
   });
+
+  it('配置讀取失敗 → 顯示錯誤狀態而非空白（§5.6 不靜默）', async () => {
+    // 讓 storage.get 拋錯，模擬存儲不可用。
+    (chrome.storage.local.get as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('storage unavailable')
+    );
+    await loadPopup();
+
+    const diagEl = document.getElementById('status-diagnostic')!;
+    expect(diagEl.textContent).toContain('配置讀取失敗');
+    expect(diagEl.textContent).toContain('storage unavailable');
+    expect(diagEl.classList.contains('warn')).toBe(true);
+    // 其他元素仍可用（不整頁空白）
+    expect(document.getElementById('btn-test')).not.toBeNull();
+  });
+
+  it('重新載入：無活動 tab 時顯示反饋而非無聲無反應（§5.6）', async () => {
+    (chrome.tabs.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    await loadPopup();
+    document.getElementById('btn-reload')!.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const el = document.getElementById('status-connection')!;
+    expect(el.textContent).toContain('重新載入: 未找到活動標籤頁');
+    expect(el.classList.contains('warn')).toBe(true);
+  });
+
+  it('重新載入：有活動 tab → 調用 tabs.reload 並清空狀態', async () => {
+    const reloadSpy = vi.spyOn(chrome.tabs, 'reload');
+    (chrome.tabs.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{ id: 42 }]);
+    await loadPopup();
+    document.getElementById('btn-reload')!.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(reloadSpy).toHaveBeenCalledWith(42);
+    const el = document.getElementById('status-connection')!;
+    expect(el.textContent).not.toContain('未找到');
+  });
 });

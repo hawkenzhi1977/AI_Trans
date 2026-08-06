@@ -33,6 +33,7 @@ const chromeMock = {
   tabs: {
     query: vi.fn(async () => []),
     sendMessage: vi.fn(),
+    reload: vi.fn(async () => {}),
   },
 };
 

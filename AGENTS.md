@@ -20,6 +20,7 @@
 | `doc/requirements-design.md` | 新增功能/需求（新 F 編號）、里程碑範圍變化 |
 | `doc/architecture-design.md` | 新增接口/數據結構/適配器/性能機制 |
 | `doc/system-test-design.md` | 新增測試用例（新 TC 編號）、測試策略變化 |
+| `doc/diagnostics-design.md` | 新增/修改診斷信息、錯誤消息、降級邏輯、診斷碼 |
 | `doc/project-progress.md` | 每次代碼變更後（狀態/技術點/優先級） |
 | `README.md` / `README.zh-Hant.md` | 功能特性（已實現/待實現）、安裝/構建步驟、命令、配置項變化；兩份必須同步（內容等價，僅語言不同） |
 | `release/`（發布件） + `release/README.md` | 用戶可見行為/構建產物結構/加載步驟變化；發布件須用當前源碼重新生成（`npm run release`） |

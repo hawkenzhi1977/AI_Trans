@@ -152,19 +152,35 @@
     return el;
   }
   async function init() {
-    const config = await store.get();
+    let config;
+    try {
+      config = await store.get();
+    } catch (err) {
+      $("status-diagnostic").textContent = `\u6700\u8FD1\u5931\u6557: \u932F\u8AA4: \u914D\u7F6E\u8B80\u53D6\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
+      $("status-diagnostic").classList.add("warn");
+      bindActions(configFallback());
+      return;
+    }
     $("status-translation").textContent = describeTranslation(config);
     $("status-asr").textContent = describeAsr(config);
     $("status-lang").textContent = `\u76EE\u6A19\u8A9E\u8A00: ${config.targetLang} \xB7 ${config.displayMode === "mono" ? "\u50C5\u8B6F\u6587" : "\u96D9\u8A9E"}`;
-    const diag = await readLastDiagnostic();
+    let diagText;
+    try {
+      const diag = await readLastDiagnostic();
+      diagText = formatDiagnostic(diag);
+    } catch {
+      diagText = void 0;
+    }
     const diagEl = $("status-diagnostic");
-    const text = formatDiagnostic(diag);
-    if (text) {
-      diagEl.textContent = `\u6700\u8FD1\u5931\u6557: ${text}`;
+    if (diagText) {
+      diagEl.textContent = `\u6700\u8FD1\u5931\u6557: ${diagText}`;
       diagEl.classList.add("warn");
     } else {
       diagEl.textContent = "\u6700\u8FD1\u5931\u6557: \u7121";
     }
+    bindActions(config);
+  }
+  function bindActions(config) {
     $("btn-options").addEventListener("click", () => {
       void chrome.runtime.openOptionsPage();
     });
@@ -172,20 +188,48 @@
       const connEl = $("status-connection");
       connEl.textContent = "\u9023\u63A5\u6E2C\u8A66: \u6E2C\u8A66\u4E2D\u2026";
       connEl.classList.remove("warn", "ok");
-      const apiKey = await store.getApiKey("llm") ?? "";
-      const status = await testConnection(config, apiKey);
-      if (status.ok) {
-        connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.detail}`;
-        connEl.classList.add("ok");
-      } else {
-        connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.error}`;
+      try {
+        const apiKey = await store.getApiKey("llm") ?? "";
+        const status = await testConnection(config, apiKey);
+        if (status.ok) {
+          connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.detail}`;
+          connEl.classList.add("ok");
+        } else {
+          connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${status.error}`;
+          connEl.classList.add("warn");
+        }
+      } catch (err) {
+        connEl.textContent = `\u9023\u63A5\u6E2C\u8A66: ${err instanceof Error ? err.message : String(err)}`;
         connEl.classList.add("warn");
       }
     });
     $("btn-reload").addEventListener("click", async () => {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) void chrome.tabs.reload(tab.id);
+      const connEl = $("status-connection");
+      try {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tab = tabs[0];
+        if (!tab?.id) {
+          connEl.textContent = "\u91CD\u65B0\u8F09\u5165: \u672A\u627E\u5230\u6D3B\u52D5\u6A19\u7C64\u9801";
+          connEl.classList.remove("ok");
+          connEl.classList.add("warn");
+          return;
+        }
+        await chrome.tabs.reload(tab.id);
+      } catch (err) {
+        connEl.textContent = `\u91CD\u65B0\u8F09\u5165: ${err instanceof Error ? err.message : String(err)}`;
+        connEl.classList.remove("ok");
+        connEl.classList.add("warn");
+      }
     });
+  }
+  function configFallback() {
+    return {
+      translation: { type: "mt" },
+      asr: { type: "cloud" },
+      targetLang: "zh-Hant",
+      displayMode: "mono",
+      performanceProfile: "balanced"
+    };
   }
   function describeTranslation(c) {
     const type = c.translation.type;

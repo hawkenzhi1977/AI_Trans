@@ -56,14 +56,22 @@ void store.get();
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const msg = message;
   if (msg.topic === "config:get") {
-    void store.get().then(sendResponse);
+    void store.get().then((config) => sendResponse({ ok: true, config })).catch(
+      (err) => sendResponse({
+        ok: false,
+        error: `config:get failed: ${err instanceof Error ? err.message : String(err)}`
+      })
+    );
     return true;
   }
   if (msg.topic === "config:set") {
     const patch = msg.payload ?? {};
-    void store.set(patch).then(() => {
-      sendResponse({ ok: true });
-    });
+    void store.set(patch).then(() => sendResponse({ ok: true })).catch(
+      (err) => sendResponse({
+        ok: false,
+        error: `config:set failed: ${err instanceof Error ? err.message : String(err)}`
+      })
+    );
     return true;
   }
   return false;

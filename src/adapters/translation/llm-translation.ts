@@ -78,10 +78,31 @@ export class LLMTranslationProvider implements TranslationProvider {
     if (!res.ok) {
       throw new Error(`LLM translation failed: HTTP ${res.status}`);
     }
-    const data = (await res.json()) as {
+    // §5.6：HTTP 200 但 body 非 JSON（本地服務返回 HTML 錯誤頁/代理返回純文本）時，
+    // res.json() 的 SyntaxError 不含語義——必須 try/catch 並把「解析失敗」與響應片段
+    // 寫進錯誤信息，否則用戶只看到 `SyntaxError: Unexpected token` 無法定位。
+    let data: {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const content = stripReasoning(data.choices?.[0]?.message?.content ?? '');
+    try {
+      data = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+    } catch (err) {
+      throw new Error(
+        `LLM translation response is not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    const choice = data.choices?.[0];
+    // §5.6：choices 缺失（如被限流返回 {error}、結構變更）時**不允許靜默回退原文**——
+    // 那是翻譯靜默失效且 degraded=false 的最典型漏洞（字幕出來但是原文，用戶查不到原因）。
+    // 必須拋錯走降級機制（fallback / engine-degraded + pipeline-error）。
+    if (!choice || typeof choice.message?.content !== 'string') {
+      throw new Error(
+        `LLM translation response has no valid choices[0].message.content (possibly rate-limited or schema changed)`
+      );
+    }
+    const content = stripReasoning(choice.message.content);
 
     // 解析 "ID<TAB>translation" 行。
     const map = new Map<string, string>();

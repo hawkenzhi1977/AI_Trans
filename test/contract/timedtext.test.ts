@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseTimedText } from '../../src/adapters/platform/youtube/timedtext';
+import { parseTimedText, snippet } from '../../src/adapters/platform/youtube/timedtext';
 import {
   TIMEDTEXT_JSON,
   TIMEDTEXT_XML,
@@ -65,5 +65,30 @@ describe('timedtext 契約：格式識別', () => {
   it('以 { 開頭識別為 JSON，否則 XML', () => {
     expect(parseTimedText(TIMEDTEXT_JSON, 'en')).toHaveLength(2);
     expect(parseTimedText(TIMEDTEXT_XML, 'en')).toHaveLength(2);
+  });
+});
+
+describe('timedtext 契約：§5.6 解析失敗證據化', () => {
+  it('非法 JSON → 拋「json parse failed」並附 body 片段證據', () => {
+    expect(() => parseTimedText('{ "events": [{"tStartMs":', 'en')).toThrow(/timedtext JSON parse failed/);
+    expect(() => parseTimedText('{ "events": [{"tStartMs":', 'en')).toThrow(/body snippet/);
+  });
+
+  it('HTML 錯誤/登錄頁 → 錯誤含根元素名與片段證據（不再只是猜測性措辭）', () => {
+    // jsdom DOMParser 對完整 HTML（<!DOCTYPE>）不產 parsererror，而是根 <html>；
+    // 無論走 parsererror 還是 missing root 分支，錯誤都必須附證據而非猜測。
+    const html = `<!DOCTYPE html><html><head><title>Sign in</title></head><body>Please sign in to continue</body></html>`;
+    expect(() => parseTimedText(html, 'en')).toThrow(/body snippet/);
+    expect(() => parseTimedText(html, 'en')).toThrow(/actual root <html>/);
+    // 真 malformed XML（無 <html> 根）→ parsererror 分支，同樣帶證據。
+    const bad = '<timedtext><body><p t="1">';
+    expect(() => parseTimedText(bad, 'en')).toThrow(/parse error/);
+    expect(() => parseTimedText(bad, 'en')).toThrow(/body snippet/);
+  });
+
+  it('snippet 去除控制字符並截斷', () => {
+    expect(snippet('hello\nworld\t\nagain', 100)).toBe('"hello world again"');
+    expect(snippet('', 100)).toBe('(empty body)');
+    expect(snippet('abcdefghij', 4)).toBe('"abcd"');
   });
 });

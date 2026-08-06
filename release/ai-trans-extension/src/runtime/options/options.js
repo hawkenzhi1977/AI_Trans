@@ -152,9 +152,19 @@
     }, 2e3);
   }
   async function init() {
-    const config = await store.get();
+    let config;
+    try {
+      config = await store.get();
+    } catch (err) {
+      showStatus(`\u8B80\u53D6\u914D\u7F6E\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      config = DEFAULT_CONFIG;
+    }
     fillForm(config);
-    await loadKeysIntoForm();
+    try {
+      await loadKeysIntoForm();
+    } catch (err) {
+      showStatus(`\u8B80\u53D6\u5BC6\u9470\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+    }
     $("performance-profile").addEventListener("change", () => {
       const prof = PROFILE_DEFAULTS[$("performance-profile").value];
       if (prof) {

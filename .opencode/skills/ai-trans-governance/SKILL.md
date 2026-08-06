@@ -14,6 +14,7 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 | `doc/requirements-design.md` | 需求、功能（F-01~F-09）、里程碑 M1~M4 | 新功能沒有 F 編號或里程碑條目 |
 | `doc/architecture-design.md` | 端口/適配器/數據結構/實時性/里程碑映射 | 新增代碼結構沒有對應章節落點 |
 | `doc/system-test-design.md` | 測試策略、分層、用例 TC-*、CI 閉環 | 新增測試沒有對應用例編號 |
+| `doc/diagnostics-design.md` | 診斷信息、錯誤消息、降級邏輯、診斷碼 | 新增/修改診斷點沒有對應文檔條目 |
 | `doc/project-progress.md` | 進度狀態（✅/🟡/⬜）、優先級、開發順序 | 代碼已存在但進度表未更新 |
 | `README.md` / `README.zh-Hant.md` | 功能特性（已實現/待實現）、安裝/構建步驟、命令、配置項 | README 描述與實際代碼/里程碑狀態不符 |
 | `release/`（發布件）+ `release/README.md` | 用戶可加載的擴充產物與快速安裝說明 | 發布件與源碼版本不一致 |
@@ -74,6 +75,7 @@ description: AI_Trans 項目文檔治理與進度同步。使用時機：任何�
 | requirements-design.md | §2 功能需求表（新 F 編號）、§3 流程、§6 模塊、§8 里程碑 |
 | architecture-design.md | §5 目錄結構、§6 數據結構、§7 接口、§12 里程碑映射、§13 開放問題 |
 | system-test-design.md | §7 測試用例表（新 TC 編號）、§5 測試分層 |
+| diagnostics-design.md | 對應業務流程章節（新診斷碼、錯誤消息、降級邏輯） |
 
 ### Step 4 — 校驗
 

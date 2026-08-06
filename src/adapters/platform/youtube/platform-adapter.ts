@@ -91,17 +91,56 @@ export class FetchCaptionSource implements CaptionSource {
 
   async fetchTracks(baseUrl: string, lang: string): Promise<SubtitleSegment[]> {
     // baseUrl 可能為相對路徑（Mock 站點），統一解析為絕對 URL。
-    const url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
+    // §5.2/R2：new URL 可能因 baseUrl 非法而拋錯——拆出語義（URL 構造失敗）而非裸冒泡。
+    let url: string;
+    try {
+      url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
+    } catch (err) {
+      throw new Error(
+        `timedtext URL construct failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     // 真實 YouTube 的 captionTracks[].baseUrl 不帶 fmt 時默認回 srv3 XML
     // （根為 <timedtext format="3">，子節點 body>p>s，非傳統 <transcript><text>），
     // 舊解析器會誤判「missing transcript root」或解析為空。強制 fmt=json3 取穩定 JSON
     // （{"events":[{tStartMs,dDurationMs,segs:[{utf8}]}]}），與解析器 JSON 分支對齊。
     // Mock 站點的相對 URL（無 host）不加 fmt，避免破壞既有契約。
     const finalUrl = this.withJson3Format(url);
-    const res = await this.fetchFn(finalUrl, { credentials: 'omit' });
-    if (!res.ok) throw new Error(`timedtext fetch failed: ${res.status}`);
-    const raw = await res.text();
-    return parseTimedText(raw, lang);
+    // §5.6：網絡層失敗（DNS/CORS/mixed-content/斷網）與 HTTP 非 2xx、body 解析失敗
+    // 要**可區分**——統一記入 lastTrackDiagnostic 並攜帶實際證據（status/content-type/片段），
+    // 避免「fetch 失敗」與「parse 失敗」混在同一條 run failed 裡無法定位。
+    let res: Response;
+    try {
+      res = await this.fetchFn(finalUrl, { credentials: 'omit' });
+    } catch (err) {
+      const msg = `timedtext fetch failed: ${err instanceof Error ? err.message : String(err)} (url: ${finalUrl})`;
+      this.lastTrackDiagnostic = msg;
+      throw new Error(msg);
+    }
+    if (!res.ok) {
+      const msg = `timedtext fetch HTTP ${res.status} (url: ${finalUrl})`;
+      this.lastTrackDiagnostic = msg;
+      throw new Error(msg);
+    }
+    let raw: string;
+    try {
+      raw = await res.text();
+    } catch (err) {
+      const msg = `timedtext body read failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.lastTrackDiagnostic = msg;
+      throw new Error(msg);
+    }
+    try {
+      return parseTimedText(raw, lang);
+    } catch (err) {
+      // §5.6：解析失敗（非法 JSON/XML/HTML 錯誤頁）記錄含響應證據的診斷，
+      // 同時把 content-type 帶上（HTML 錯誤頁常為 text/html）。
+      const msg = `${err instanceof Error ? err.message : String(err)} (content-type: ${
+        res.headers.get('content-type') ?? 'unknown'
+      })`;
+      this.lastTrackDiagnostic = msg;
+      throw new Error(msg);
+    }
   }
 
   /** 為真實 YouTube timedtext URL 追加 fmt=json3（Mock 相對路徑不動）。 */
@@ -114,8 +153,11 @@ export class FetchCaptionSource implements CaptionSource {
         return u.href;
       }
       return url;
-    } catch {
-      return url;
+    } catch (err) {
+      // §5.2/P3：URL 構造失敗（url 本身非法）拋出語義明確的錯誤，不靜默回落原 url。
+      throw new Error(
+        `timedtext URL parse failed in withJson3Format: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
 }
@@ -153,7 +195,15 @@ export class YouTubePlatformAdapter implements PlatformAdapter {
 
   observePlayback(cb: (state: PlaybackState) => void): () => void {
     const video = this.doc.querySelector<HTMLVideoElement>(this.videoSelector);
-    if (!video) return () => {};
+    if (!video) {
+      // §5.6：播放器 <video> 缺失時不能靜默返回空訂閱——字幕時間對齊會無聲失效。
+      // 此處無法發事件（observePlayback 僅回調），以日誌麵包屑留痕；
+      // content-script/orchestrator 側另有顯式判空診斷兜底。
+      console.warn(
+        `[AI_Trans] observePlayback: video element not found (selector: ${this.videoSelector})`
+      );
+      return () => {};
+    }
 
     const readState = (): PlaybackState => ({
       currentTime: Math.round(video.currentTime * 1000),

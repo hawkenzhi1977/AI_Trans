@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-06（§7 補翻譯失敗診斷可見性 F-11：diagnostics 模塊 + lastDiagnostic + Popup 常駐診斷行 + 測試連接按鈕 +「全鏈不適用」診斷 §5.6 + 軌列表三態診斷 `getLastTrackDiagnostic` + Options 保存失敗可見 + M2/M3 佔位診斷；endpoint.ts 抽離）
+> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性）
 
 ---
 
@@ -488,6 +488,15 @@ export interface MessageBus {
 > **「全鏈不適用」診斷（§5.6 對齊，F-11 改進）**：此前 `NativeCaptionStrategy.isApplicable` 內 `listCaptionTracks` 失敗/為空被 `catch { return false }` 靜默吞掉，`CaptionStrategyChain` 對 `isApplicable=false` 只壓入 errors 數組不發事件——「字幕軌抓不到」與「翻譯失敗」無法區分，診斷行恆為「無」。改進：(1) `StrategyContext` 新增可選 `diagnostics?: string[]` 累加器；(2) `NativeCaptionStrategy.isApplicable` 把軟失敗原因（空軌 / 抓取異常詳情）寫入其中；(3) `CaptionStrategyChain` 全鏈無策略接管時統一發 `pipeline-error`（code `no-caption-strategy`，cause 為 Error 且 message 含各策略診斷，以 ` | ` 連接）→ content-script `recordDiagnostic` → popup 顯示真實原因。測試：單元 `caption-strategy-chain.test.ts`（全鏈診斷 2）+ `native-caption-strategy.test.ts`（軌抓取診斷 4）。
 >
 > **軌列表三態診斷（M1-39，F-11 細化）**：`fetchTrackList` 返回空數組必須能區分**三個根因**——(a) 找不到數據源 JSON（`#ytInitialPlayerResponse` 缺失/為空）、(b) 外部 JSON 解析失敗（§5.7 不冒泡但不得誤判「無字幕」）、(c) 確實無字幕軌（`captionTracks` 結構不存在）。實現：`FetchCaptionSource` 增 `lastTrackDiagnostic` 字段，三態分別寫入 `player response JSON not found (…)` / `player response JSON parse failed: …` / `player response has no captionTracks (…)`，經新增端口方法 `getLastTrackDiagnostic()`（可選，`YouTubePlatformAdapter` 轉發）暴露；`NativeCaptionStrategy` 空軌時把平台診斷帶入 `ctx.diagnostics`（`native: no caption tracks found — <平台診斷>`），使全鏈失敗 cause 能解釋「為什麼」。另（§5.6 收口）：Options `save()` 保存失敗顯示錯誤狀態（不靜默）；M2/M3 佔位策略 `isApplicable` 寫入 `not implemented (M2/M3)` 診斷——「未實現（預期跳過）」與「真失敗」可區分。測試：集成 `platform-adapter.test.ts`（三態 4）+ 單元 `placeholder-strategies.test.ts`（3）+ `native-caption-strategy.test.ts`（+1 平台診斷帶入）。
+>
+> **外部接口調用節點診斷全掃描補齊（M1-41，§5.6 全面收口）**：以「用戶遇到功能失效時，popup『最近失敗』/Options 必須能告訴他原因；開發者從診斷/事件流必須能定位到具體節點」為判斷標準，全庫審計**所有外部接口調用節點**並補齊診斷證據。分類與修復：
+> - **P0 LLM 響應結構（最典型靜默失效）**：`LLMTranslationProvider.translate` 原以 `choices?.[0]?.message?.content ?? ''` 可選鏈靜默回退原文（字幕出來但是原文、degraded=false、無事件）。修復：`res.json()` 加 try/catch（HTTP 200 但 body 非 JSON → 拋「response is not valid JSON」）；choices 缺失/非字符串 → 拋錯走降級機制（fallback / `engine-degraded` + `pipeline-error`），不再靜默回退原文。
+> - **P1 timedtext 拉取**：`fetchTracks` 拆分三階段診斷（fetch 網絡失敗 / HTTP 非 2xx / body 解析失敗），每階段寫入 `lastTrackDiagnostic` 並攜帶**實際證據**——HTTP status、content-type、body 片段（`snippet()` 截取去控制字符）。`parseTimedText` 的 `parseJson` 分支補 `JSON.parse` try/catch（附片段）；`parseXml` 的 parsererror 與 missing-transcript-root 兩分支均附「實際根元素名 + body 片段」（jsdom DOMParser 對完整 HTML 不產 parsererror，走 missing-root 分支，故兩處都要證據）。`new URL` 構造失敗拆出「URL construct failed」語義。
+> - **P1 播放器節點**：content-script `ensureMounted` 播放器 15s 超時後發 `pipeline-error`（code `player-not-found`，含 selector 與超時值）——此前 `mountOverlay` 靜默 return 無痕跡；`observePlayback` video 元素缺失時 console.warn 麵包屑（此前靜默返回 no-op，字幕時間對齊無聲失效）。
+> - **P2 頁面級 storage**：popup/options `init()` 的 `store.get()`/`getApiKey` 包 try/catch，失敗顯示錯誤狀態（「配置讀取失敗/讀取密鑰失敗」+ 詳情）而非整頁不可用；service-worker `config:get`/`config:set` 失敗必須 `sendResponse({ok:false,error})`（避免調用方 Promise 永久懸掛）。
+> - **P3 次要節點**：`ChromeMessageBus.publish` 空 `catch(()=>{})` 改為區分「無接收方（Receiving end does not exist，常態，靜默）」與「真實錯誤（console.warn 留痕）」；新增 `dispose()`（`removeListener` + 清空訂閱，§5.4）；popup 重新載入快捷鍵在無活動 tab / reload 失敗時顯示反饋（不無聲無反應）。
+>
+> 測試：契約 `timedtext.test.ts`（+3：非法 JSON 片段/HTML 證據/snippet）、集成 `platform-adapter.test.ts`（+6：HTTP 非 2xx/網絡失敗/HTML content-type/非法 JSON/URL 構造/observePlayback 麵包屑）、`popup.test.ts`（+3：配置讀取失敗/密鑰讀取失敗/重新載入反饋）、新增 `options.test.ts`（3）、新增 `service-worker.test.ts`（4）、新增 `chrome-message-bus.test.ts`（4）、單元 `llm-translation.test.ts`（+3：非 JSON/choices 缺失/choices 非字符串）。
 
 ---
 

@@ -102,9 +102,21 @@ function showStatus(msg: string): void {
 }
 
 async function init(): Promise<void> {
-  const config = await store.get();
+  // §5.6：storage 讀取失敗不能使 Options 頁無聲不可用（void init 的 rejection 會靜默消失）。
+  let config: EngineConfig;
+  try {
+    config = await store.get();
+  } catch (err) {
+    showStatus(`讀取配置失敗: ${err instanceof Error ? err.message : String(err)}`);
+    config = DEFAULT_CONFIG;
+  }
   fillForm(config);
-  await loadKeysIntoForm();
+  try {
+    await loadKeysIntoForm();
+  } catch (err) {
+    // 密鑰讀取失敗：頁面仍可用（保存會覆蓋），但必須可見，避免用戶以為 key 已填。
+    showStatus(`讀取密鑰失敗: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // 性能檔位變更時自動提示（不強制改值，避免覆蓋用戶微調）。
   $<HTMLSelectElement>('performance-profile').addEventListener('change', () => {
