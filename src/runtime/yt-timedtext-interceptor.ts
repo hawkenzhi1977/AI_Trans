@@ -11,6 +11,9 @@
 // addEventListener）一律綁定接收者；hook 內部用 apply 保留實例接收者（brand check）。
 // §5.3/R3：不改動任何宿主容器/DOM 節點，僅 hook 原型方法與監聽消息，對頁面零侵入。
 // §5.4/R4：臨時監聽器（XHR load）用完自除；fetch 包裝無持久監聽器。
+// M1-51：本腳本運行在 MAIN world，無法訪問 chrome.storage——調試日誌開關由
+// content-script 通過 CustomEvent 中繼（'ai-trans:set-debug-flags'）。
+import { diagLog, setDebugFlags } from '../infrastructure/debug-log';
 
 /** 消息通道常量：content-script 與 MAIN world 之間的事件名。 */
 export const TIMEDTEXT_CAPTURE_EVENT = 'ai-trans:timedtext-capture';
@@ -18,6 +21,8 @@ export const TIMEDTEXT_CAPTURE_EVENT = 'ai-trans:timedtext-capture';
 export const TIMEDTEXT_REQUEST_EVENT = 'ai-trans:timedtext-request';
 /** 消息通道常量（M1-47）：content-script 通知目標字幕語言（isolated world → MAIN world）。 */
 export const SET_TARGET_LANG_EVENT = 'ai-trans:set-target-lang';
+/** 消息通道常量（M1-51）：content-script 中繼調試日誌開關（isolated world → MAIN world）。 */
+export const SET_DEBUG_FLAGS_EVENT = 'ai-trans:set-debug-flags';
 
 /** 發送給 content-script 的捕獲結果。 */
 export interface TimedTextCapture {
@@ -50,10 +55,11 @@ function isTimedText(url: string): boolean {
 }
 
 /**
- * 安全讀取 XHR 響應文本（M1-47 硬化）。
+ * 安全讀取 XHR 響應文本（M1-47 硬化 + arraybuffer 支援）。
  * 真實瀏覽器中，若播放器把 `responseType` 設為 'json'/'arraybuffer'/'blob'，
  * 讀 `xhr.responseText` 會拋 `InvalidStateError`（jsdom 不拋，故此 bug 只在真實環境暴露）。
- * 此時改從 `xhr.response` 取值：json → JSON.stringify；字符串 → 原樣；其他（二進制）→ 空串跳過。
+ * 此時改從 `xhr.response` 取值：json → JSON.stringify；arraybuffer → UTF-8 解碼；
+ * 字符串 → 原樣；其他（blob/document）→ 空串跳過。
  */
 function readXhrResponseText(xhr: XMLHttpRequest): string {
   const responseType = (xhr as unknown as { responseType?: string }).responseType ?? '';
@@ -70,7 +76,15 @@ function readXhrResponseText(xhr: XMLHttpRequest): string {
       return '';
     }
   }
-  // arraybuffer/blob/document 等二進制或非文本類型：本輪不複用（返回空，emitCapture 會跳過）。
+  // arraybuffer：YouTube 可能使用 binary 傳輸，解碼為 UTF-8 文本
+  if (responseType === 'arraybuffer' && response instanceof ArrayBuffer) {
+    try {
+      return new TextDecoder('utf-8').decode(new Uint8Array(response));
+    } catch {
+      return '';
+    }
+  }
+  // blob/document 等二進制或非文本類型：本輪不複用（返回空，emitCapture 會跳過）。
   return '';
 }
 
@@ -92,7 +106,7 @@ function emitCapture(
   location: Location
 ): void {
   if (!responseText) {
-    console.log('[AI_Trans Interceptor] emitCapture: empty response, skipping');
+    diagLog('interceptor', 'emitCapture: empty response, skipping');
     return; // 空響應（無登錄態/無字幕）不轉發，也不更新 lastCapture（重播不發空）。
   }
   captureRequestCount++;
@@ -103,7 +117,7 @@ function emitCapture(
     capturedAt: Date.now(),
     videoId: extractVideoId(url),
   };
-  console.log('[AI_Trans Interceptor] emitCapture: success, captureRequestCount:', captureRequestCount, 'videoId:', capture.videoId);
+  diagLog('interceptor', 'emitCapture: success, captureRequestCount:', captureRequestCount, 'videoId:', capture.videoId);
   // M1-46：更新 lastCapture 供重播，並更新調試輔助全局變量。
   lastCapture = capture;
   Reflect.set(globalThis, '__aiTransTimedtextRequests', captureRequestCount);
@@ -193,11 +207,11 @@ function ensureCaptionModuleLoaded(): void {
   
   // 診斷日誌
   if (!player) {
-    console.log('[AI_Trans Interceptor] Player element not found');
+    diagLog('interceptor', 'Player element not found');
     return;
   }
   if (typeof player.loadModule !== 'function' || typeof player.getOption !== 'function' || typeof player.setOption !== 'function') {
-    console.log('[AI_Trans Interceptor] Player API not available');
+    diagLog('interceptor', 'Player API not available');
     return; // 播放器未就緒/API 未暴露：由重試定時器稍後再試。
   }
   
@@ -210,21 +224,21 @@ function ensureCaptionModuleLoaded(): void {
   let tracklist: YtCaptionTrack[] | undefined;
   try {
     const raw = player.getOption('captions', 'tracklist');
-    console.log('[AI_Trans Interceptor] Tracklist:', raw, 'isArray:', Array.isArray(raw));
+    diagLog('interceptor', 'Tracklist:', raw, 'isArray:', Array.isArray(raw));
     if (Array.isArray(raw)) tracklist = raw as YtCaptionTrack[];
   } catch (err) {
-    console.log('[AI_Trans Interceptor] getOption error:', err);
+    diagLog('interceptor', 'getOption error:', err);
     return; // 讀軌列表拋錯：播放器尚未就緒，稍後重試。
   }
   
   if (!tracklist || tracklist.length === 0) {
-    console.log('[AI_Trans Interceptor] No caption tracks available');
+    diagLog('interceptor', 'No caption tracks available');
     // 無字幕軌：可能真無字幕，或軌列表尚未就緒。標記調試碼，讓重試繼續（真無字幕時無害）。
     Reflect.set(globalThis, '__aiTransCaptionTracks', 0);
     return;
   }
   
-  console.log('[AI_Trans Interceptor] Found', tracklist.length, 'caption tracks');
+  diagLog('interceptor', 'Found', tracklist.length, 'caption tracks');
   Reflect.set(globalThis, '__aiTransCaptionTracks', tracklist.length);
   const track = pickTargetTrack(tracklist);
   
@@ -232,19 +246,19 @@ function ensureCaptionModuleLoaded(): void {
     // 選軌 → 播放器發帶 pot 的 timedtext 請求（被 XHR/fetch hook 捕獲）。
     player.setOption('captions', 'track', track);
     captionModuleDriven = true;
-    console.log('[AI_Trans Interceptor] Caption module driven successfully, selected track:', track);
+    diagLog('interceptor', 'Caption module driven successfully, selected track:', track);
     // M1-48：增加延遲到 3000ms，確保 timedtext 請求完成後再復位（避免取消請求）。
     // 原生字幕可能短暫顯示，但捕獲成功後可接受。
     setTimeout(() => {
       try {
         player.setOption!('captions', 'track', {});
-        console.log('[AI_Trans Interceptor] Caption track reset to suppress native rendering');
+        diagLog('interceptor', 'Caption track reset to suppress native rendering');
       } catch {
         /* 復位失敗無害：原生字幕可能短暫顯示，不影響捕獲。 */
       }
     }, 3000);
   } catch (err) {
-    console.log('[AI_Trans Interceptor] setOption error:', err);
+    diagLog('interceptor', 'setOption error:', err);
     // 選軌失敗：不標記成功，重試定時器會再試。
   }
 }
@@ -286,11 +300,19 @@ function install(): void {
     targetLang = typeof detail?.targetLang === 'string' ? detail.targetLang : null;
     // 調試輔助：暴露目標語言，供真實環境確認消息通道已通。
     Reflect.set(globalThis, '__aiTransTargetLang', targetLang);
-    console.log('[AI_Trans Interceptor] Received set-target-lang message, targetLang:', targetLang);
+    diagLog('interceptor', 'Received set-target-lang message, targetLang:', targetLang);
     // 收到語言後（重）啟動驅動：涵蓋首次啟動與 SPA 換視頻後 restart 重發。
     resetAndRedriveCaptionModule();
   };
   document.addEventListener('ai-trans:set-target-lang', onSetTargetLang);
+  // M1-51：接收 content-script 中繼的調試日誌開關（MAIN world 無法訪問 chrome.storage，
+  // 只能靠 CustomEvent 同步；content-script 每次 start/restart 都會重發）。
+  const onSetDebugFlags = (ev: Event): void => {
+    const detail = (ev as CustomEvent).detail as { flags?: Record<string, boolean> } | undefined;
+    setDebugFlags(detail?.flags);
+    diagLog('interceptor', 'debug flags updated:', detail?.flags);
+  };
+  document.addEventListener(SET_DEBUG_FLAGS_EVENT, onSetDebugFlags);
   // 即使未收到語言消息也啟動一次驅動（用第一/人工軌），避免消息時序問題導致完全不驅動。
   startCaptionModuleDriver();
   // 調試輔助（M1-27 真實環境驗證）：暴露計數器與最近捕獲對象到 window。
@@ -310,7 +332,7 @@ function install(): void {
   ): void {
     const urlStr = typeof url === 'string' ? url : url.href;
     if (isTimedText(urlStr)) {
-      console.log('[AI_Trans Interceptor] XHR timedtext request detected:', urlStr);
+      diagLog('interceptor', 'XHR timedtext request detected:', urlStr);
       (this as unknown as { __aiTransUrl?: string }).__aiTransUrl = urlStr;
     }
     return origOpen.apply(this, [method, url, async ?? true, username, password]);
@@ -321,16 +343,19 @@ function install(): void {
   ): void {
     const urlStr = (this as unknown as { __aiTransUrl?: string }).__aiTransUrl;
     if (urlStr) {
-      console.log('[AI_Trans Interceptor] XHR timedtext request sending:', urlStr);
+      diagLog('interceptor', 'XHR timedtext request sending:', urlStr);
       // R4：load 監聽器在請求完成後移除自身，不產生累積洩漏。
       const onLoad = (): void => {
         this.removeEventListener('load', onLoad);
         try {
+          const responseType = (this as unknown as { responseType?: string }).responseType ?? '';
+          const status = (this as unknown as { status?: number }).status ?? 0;
+          diagLog('interceptor', 'XHR timedtext onLoad: status:', status, 'responseType:', responseType);
           const responseText = readXhrResponseText(this);
           const contentType =
             (this as unknown as { getResponseHeader?: (h: string) => string | null })
               .getResponseHeader?.('content-type') ?? 'unknown';
-          console.log('[AI_Trans Interceptor] XHR timedtext response received, length:', responseText.length, 'content-type:', contentType);
+          diagLog('interceptor', 'XHR timedtext response received, length:', responseText.length, 'content-type:', contentType);
           emitCapture(urlStr, responseText, contentType, globalThis.location);
         } catch {
           // §5.7：外部響應解析失敗不允許冒泡破壞播放器——吞掉（捕獲失敗僅意味著本輪不複用）。
@@ -360,15 +385,15 @@ function install(): void {
     }
     if (!isTimedText(urlStr)) return origFetch(input, init);
 
-    console.log('[AI_Trans Interceptor] fetch timedtext request detected:', urlStr);
+    diagLog('interceptor', 'fetch timedtext request detected:', urlStr);
     const captured = origFetch(input, init);
     // 透傳原響應（不阻塞播放器）；另克隆 body 讀取以捕獲響應文本（§5.4：無持久監聽器）。
     void captured.then((res) => {
-      console.log('[AI_Trans Interceptor] fetch timedtext response received, status:', res.status);
+      diagLog('interceptor', 'fetch timedtext response received, status:', res.status);
       try {
         const clone = res.clone();
         void clone.text().then((text) => {
-          console.log('[AI_Trans Interceptor] fetch timedtext response body length:', text.length);
+          diagLog('interceptor', 'fetch timedtext response body length:', text.length);
           emitCapture(
             urlStr,
             text,

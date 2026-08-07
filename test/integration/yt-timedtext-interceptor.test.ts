@@ -392,6 +392,41 @@ describe('yt-timedtext-interceptor — fetch hook（M1-43）', () => {
     expect(msg.payload.responseText).toBe(JSON.stringify({ events: [{ segs: [] }] }));
   });
 
+  // ── M1-50：arraybuffer 響應支援（timedtext 空響應根因修復）──
+  // 真實 YouTube 可能以 arraybuffer 傳輸 timedtext，原實現對非文本類型返回空串 → 字幕被誤丟。
+  // 硬化後應從 xhr.response（ArrayBuffer）以 TextDecoder 解碼為 UTF-8 文本，仍能捕獲（含中文）。
+  it('[M1-50] responseType=arraybuffer 時 TextDecoder 解碼 UTF-8（含中文）', async () => {
+    await loadInterceptor();
+    const xhr = new XMLHttpRequest();
+    const url = 'https://www.youtube.com/api/timedtext?v=abc&pot=xyz&fmt=json3';
+    xhr.open('GET', url);
+    const body = JSON.stringify({ events: [{ segs: [{ utf8: '你好' }] }] });
+    const encoded = new TextEncoder().encode(body);
+    // 用 ArrayBuffer 構造器產生真實 ArrayBuffer（避免 TypedArray.buffer 的跨 realm instanceof 陷阱）。
+    const buf = new ArrayBuffer(encoded.byteLength);
+    new Uint8Array(buf).set(encoded);
+    Object.defineProperty(xhr, 'responseType', { value: 'arraybuffer', configurable: true });
+    Object.defineProperty(xhr, 'response', { value: buf, configurable: true });
+    Object.defineProperty(xhr, 'responseText', {
+      get() {
+        throw new DOMException('InvalidStateError', 'InvalidStateError');
+      },
+      configurable: true,
+    });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+
+    expect(postMessageSpy).toHaveBeenCalled();
+    const msg = postMessageSpy.mock.calls[0][0] as { payload: { responseText: string } };
+    expect(msg.payload.responseText).toBe(body);
+    expect(msg.payload.responseText).toContain('你好');
+  });
+
   it('[M1-47] responseType=blob（二進制）時跳過，不 postMessage', async () => {
     await loadInterceptor();
     const xhr = new XMLHttpRequest();
@@ -406,6 +441,77 @@ describe('yt-timedtext-interceptor — fetch hook（M1-43）', () => {
     }
     xhr.dispatchEvent(new Event('load'));
     expect(postMessageSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('yt-timedtext-interceptor — 調試日誌開關中繼（M1-51）', () => {
+  const INSTALL_FLAG_3 = '__aiTransTimedtextInterceptorInstalled';
+  let origOpen: typeof XMLHttpRequest.prototype.open;
+  let origSend: typeof XMLHttpRequest.prototype.send;
+
+  beforeEach(() => {
+    origOpen = XMLHttpRequest.prototype.open;
+    origSend = XMLHttpRequest.prototype.send;
+    Reflect.deleteProperty(globalThis, INSTALL_FLAG_3);
+    // 假計時器：攔截器 install/重驅動會掛 setInterval，統一用假時間驅動並清空。
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    // 推進超過字幕驅動重試上限（60 × 1s），確保所有 interval 自行 clearInterval。
+    vi.advanceTimersByTime(60_001);
+    XMLHttpRequest.prototype.open = origOpen;
+    XMLHttpRequest.prototype.send = origSend;
+    Reflect.deleteProperty(globalThis, INSTALL_FLAG_3);
+    vi.useRealTimers();
+    vi.resetModules();
+  });
+
+  async function loadInterceptor(): Promise<void> {
+    await import('../../src/runtime/yt-timedtext-interceptor?t=' + Date.now());
+  }
+
+  it('收到 set-debug-flags CustomEvent 後更新 MAIN world 旗標', async () => {
+    await loadInterceptor();
+    // MAIN world 無法訪問 chrome.storage：content-script 通過 CustomEvent 中繼旗標。
+    document.dispatchEvent(
+      new CustomEvent('ai-trans:set-debug-flags', {
+        detail: { flags: { interceptor: true, overlay: false } },
+      })
+    );
+    const { getDebugFlags } = await import('../../src/infrastructure/debug-log');
+    expect(getDebugFlags().interceptor).toBe(true);
+    expect(getDebugFlags().overlay).toBe(false);
+  });
+
+  it('旗標開啟後 interceptor 日誌可見，關閉時靜默（門控生效）', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await loadInterceptor();
+      document.dispatchEvent(
+        new CustomEvent('ai-trans:set-debug-flags', {
+          detail: { flags: { interceptor: true } },
+        })
+      );
+      // 觸發一次 diagLog 路徑：發送 set-target-lang（install 已安裝監聽器）。
+      document.dispatchEvent(
+        new CustomEvent('ai-trans:set-target-lang', { detail: { targetLang: 'zh-Hant' } })
+      );
+      const interceptorLogs = logSpy.mock.calls.filter((c) => String(c[0]).includes('interceptor'));
+      expect(interceptorLogs.length).toBeGreaterThan(0);
+
+      // 關掉旗標 → 同類事件不再輸出。
+      document.dispatchEvent(
+        new CustomEvent('ai-trans:set-debug-flags', { detail: { flags: {} } })
+      );
+      const before = logSpy.mock.calls.length;
+      document.dispatchEvent(
+        new CustomEvent('ai-trans:set-target-lang', { detail: { targetLang: 'ja' } })
+      );
+      expect(logSpy.mock.calls.length).toBe(before);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 

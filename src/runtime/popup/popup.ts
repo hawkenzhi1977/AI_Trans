@@ -6,6 +6,7 @@ import { ChromeStorageConfigStore } from '../../infrastructure/chrome-config-sto
 import { readLastDiagnostic, formatDiagnostic } from '../../infrastructure/diagnostics';
 import { testConnection } from './connection-test';
 import type { EngineConfig } from '../../domain/models/config';
+import { DEFAULT_CONFIG } from '../../domain/models/config';
 
 const store = new ChromeStorageConfigStore();
 
@@ -102,13 +103,7 @@ function bindActions(config: EngineConfig): void {
 
 /** 配置讀取失敗時的簡單兜底（允許手動操作、避免整頁不可用）。 */
 function configFallback(): EngineConfig {
-  return {
-    translation: { type: 'mt' },
-    asr: { type: 'cloud' },
-    targetLang: 'zh-Hant',
-    displayMode: 'mono',
-    performanceProfile: 'balanced',
-  };
+  return DEFAULT_CONFIG;
 }
 
 function describeTranslation(c: EngineConfig): string {

@@ -17,7 +17,20 @@ const HTML = `
   <select id="performance-profile"><option value="streaming">streaming</option><option value="balanced">balanced</option><option value="quality">quality</option></select>
   <input id="style-font-size" />
   <input id="style-color" />
-  <input id="style-bg" />
+  <select id="style-bg-preset"><option value="none">無背景</option><option value="gray">半透明灰黑</option><option value="black">半透明黑</option><option value="custom">自定義</option></select>
+  <div id="style-bg-custom" style="display:none;">
+    <input id="style-bg-color" type="color" value="#202020" />
+    <input id="style-bg-opacity" type="range" min="0" max="100" value="70" />
+    <span id="style-bg-opacity-val">70</span>
+  </div>
+  <input type="checkbox" id="dbg-overlay" />
+  <input type="checkbox" id="dbg-llm" />
+  <input type="checkbox" id="dbg-capture" />
+  <input type="checkbox" id="dbg-pipeline" />
+  <input type="checkbox" id="dbg-strategy" />
+  <input type="checkbox" id="dbg-content" />
+  <input type="checkbox" id="dbg-bridge" />
+  <input type="checkbox" id="dbg-interceptor" />
   <input id="translation-api-key" />
   <input id="asr-api-key" />
   <span id="status"></span>
@@ -31,6 +44,16 @@ const SAVED_CONFIG: EngineConfig = {
   targetLang: 'zh-Hant',
   displayMode: 'mono',
   performanceProfile: 'balanced',
+  debugLog: {
+    overlay: false,
+    llm: true,
+    capture: false,
+    pipeline: false,
+    strategy: false,
+    content: false,
+    bridge: false,
+    interceptor: false,
+  },
 };
 
 async function loadOptions(): Promise<void> {
@@ -81,5 +104,47 @@ describe('Options — §5.6 配置讀取失敗可見', () => {
     expect(document.getElementById('status')!.textContent).toContain('讀取密鑰失敗');
     expect(document.getElementById('status')!.textContent).toContain('keys unavailable');
     expect(document.getElementById('btn-save')).not.toBeNull();
+  });
+});
+
+describe('Options — M1-51 調試日誌開關區', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('讀取配置後 checkbox 回顯 debugLog 狀態', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    // SAVED_CONFIG.debugLog 僅 llm 開啟
+    expect((document.getElementById('dbg-llm') as HTMLInputElement).checked).toBe(true);
+    expect((document.getElementById('dbg-overlay') as HTMLInputElement).checked).toBe(false);
+    expect((document.getElementById('dbg-interceptor') as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('保存後 debugLog checkbox 狀態被持久化到配置', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    // 用戶勾選 overlay 與 interceptor
+    (document.getElementById('dbg-overlay') as HTMLInputElement).checked = true;
+    (document.getElementById('dbg-interceptor') as HTMLInputElement).checked = true;
+    (document.getElementById('dbg-llm') as HTMLInputElement).checked = false;
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('engineConfig');
+    const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
+    expect(saved.debugLog.overlay).toBe(true);
+    expect(saved.debugLog.interceptor).toBe(true);
+    expect(saved.debugLog.llm).toBe(false);
+    expect(document.getElementById('status')!.textContent).toContain('配置已保存');
+  });
+
+  it('重置默認後全部調試日誌開關歸零（DEBUG_LOG_OFF）', async () => {
+    await loadOptions();
+    (document.getElementById('dbg-overlay') as HTMLInputElement).checked = true;
+    (document.getElementById('btn-reset') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 0));
+    expect((document.getElementById('dbg-overlay') as HTMLInputElement).checked).toBe(false);
+    expect((document.getElementById('dbg-llm') as HTMLInputElement).checked).toBe(false);
   });
 });

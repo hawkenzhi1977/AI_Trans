@@ -1,9 +1,32 @@
 "use strict";
 (() => {
+  // src/domain/models/config.ts
+  var DEBUG_LOG_OFF = {
+    overlay: false,
+    llm: false,
+    capture: false,
+    pipeline: false,
+    strategy: false,
+    content: false,
+    bridge: false,
+    interceptor: false
+  };
+
+  // src/infrastructure/debug-log.ts
+  var flags = { ...DEBUG_LOG_OFF };
+  function setDebugFlags(next) {
+    flags = { ...DEBUG_LOG_OFF, ...next ?? {} };
+  }
+  function diagLog(category, ...args) {
+    if (!flags[category]) return;
+    console.log(`[AI_Trans:diag][${category}]`, ...args);
+  }
+
   // src/runtime/yt-timedtext-interceptor.ts
   var TIMEDTEXT_CAPTURE_EVENT = "ai-trans:timedtext-capture";
   var TIMEDTEXT_REQUEST_EVENT = "ai-trans:timedtext-request";
   var SET_TARGET_LANG_EVENT = "ai-trans:set-target-lang";
+  var SET_DEBUG_FLAGS_EVENT = "ai-trans:set-debug-flags";
   var INSTALL_FLAG = "__aiTransTimedtextInterceptorInstalled";
   function isTimedText(url) {
     try {
@@ -28,6 +51,13 @@
         return "";
       }
     }
+    if (responseType === "arraybuffer" && response instanceof ArrayBuffer) {
+      try {
+        return new TextDecoder("utf-8").decode(new Uint8Array(response));
+      } catch {
+        return "";
+      }
+    }
     return "";
   }
   function extractVideoId(url) {
@@ -40,7 +70,7 @@
   }
   function emitCapture(url, responseText, contentType, location) {
     if (!responseText) {
-      console.log("[AI_Trans Interceptor] emitCapture: empty response, skipping");
+      diagLog("interceptor", "emitCapture: empty response, skipping");
       return;
     }
     captureRequestCount++;
@@ -51,7 +81,7 @@
       capturedAt: Date.now(),
       videoId: extractVideoId(url)
     };
-    console.log("[AI_Trans Interceptor] emitCapture: success, captureRequestCount:", captureRequestCount, "videoId:", capture.videoId);
+    diagLog("interceptor", "emitCapture: success, captureRequestCount:", captureRequestCount, "videoId:", capture.videoId);
     lastCapture = capture;
     Reflect.set(globalThis, "__aiTransTimedtextRequests", captureRequestCount);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", capture);
@@ -84,11 +114,11 @@
     if (captionModuleDriven) return;
     const player = document.getElementById("movie_player");
     if (!player) {
-      console.log("[AI_Trans Interceptor] Player element not found");
+      diagLog("interceptor", "Player element not found");
       return;
     }
     if (typeof player.loadModule !== "function" || typeof player.getOption !== "function" || typeof player.setOption !== "function") {
-      console.log("[AI_Trans Interceptor] Player API not available");
+      diagLog("interceptor", "Player API not available");
       return;
     }
     try {
@@ -98,33 +128,33 @@
     let tracklist;
     try {
       const raw = player.getOption("captions", "tracklist");
-      console.log("[AI_Trans Interceptor] Tracklist:", raw, "isArray:", Array.isArray(raw));
+      diagLog("interceptor", "Tracklist:", raw, "isArray:", Array.isArray(raw));
       if (Array.isArray(raw)) tracklist = raw;
     } catch (err) {
-      console.log("[AI_Trans Interceptor] getOption error:", err);
+      diagLog("interceptor", "getOption error:", err);
       return;
     }
     if (!tracklist || tracklist.length === 0) {
-      console.log("[AI_Trans Interceptor] No caption tracks available");
+      diagLog("interceptor", "No caption tracks available");
       Reflect.set(globalThis, "__aiTransCaptionTracks", 0);
       return;
     }
-    console.log("[AI_Trans Interceptor] Found", tracklist.length, "caption tracks");
+    diagLog("interceptor", "Found", tracklist.length, "caption tracks");
     Reflect.set(globalThis, "__aiTransCaptionTracks", tracklist.length);
     const track = pickTargetTrack(tracklist);
     try {
       player.setOption("captions", "track", track);
       captionModuleDriven = true;
-      console.log("[AI_Trans Interceptor] Caption module driven successfully, selected track:", track);
+      diagLog("interceptor", "Caption module driven successfully, selected track:", track);
       setTimeout(() => {
         try {
           player.setOption("captions", "track", {});
-          console.log("[AI_Trans Interceptor] Caption track reset to suppress native rendering");
+          diagLog("interceptor", "Caption track reset to suppress native rendering");
         } catch {
         }
       }, 3e3);
     } catch (err) {
-      console.log("[AI_Trans Interceptor] setOption error:", err);
+      diagLog("interceptor", "setOption error:", err);
     }
   }
   function startCaptionModuleDriver() {
@@ -154,10 +184,16 @@
       const detail = ev.detail;
       targetLang = typeof detail?.targetLang === "string" ? detail.targetLang : null;
       Reflect.set(globalThis, "__aiTransTargetLang", targetLang);
-      console.log("[AI_Trans Interceptor] Received set-target-lang message, targetLang:", targetLang);
+      diagLog("interceptor", "Received set-target-lang message, targetLang:", targetLang);
       resetAndRedriveCaptionModule();
     };
     document.addEventListener("ai-trans:set-target-lang", onSetTargetLang);
+    const onSetDebugFlags = (ev) => {
+      const detail = ev.detail;
+      setDebugFlags(detail?.flags);
+      diagLog("interceptor", "debug flags updated:", detail?.flags);
+    };
+    document.addEventListener(SET_DEBUG_FLAGS_EVENT, onSetDebugFlags);
     startCaptionModuleDriver();
     Reflect.set(globalThis, "__aiTransTimedtextRequests", 0);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);
@@ -166,7 +202,7 @@
     XMLHttpRequest.prototype.open = function(method, url, async, username, password) {
       const urlStr = typeof url === "string" ? url : url.href;
       if (isTimedText(urlStr)) {
-        console.log("[AI_Trans Interceptor] XHR timedtext request detected:", urlStr);
+        diagLog("interceptor", "XHR timedtext request detected:", urlStr);
         this.__aiTransUrl = urlStr;
       }
       return origOpen.apply(this, [method, url, async ?? true, username, password]);
@@ -174,13 +210,16 @@
     XMLHttpRequest.prototype.send = function(...args) {
       const urlStr = this.__aiTransUrl;
       if (urlStr) {
-        console.log("[AI_Trans Interceptor] XHR timedtext request sending:", urlStr);
+        diagLog("interceptor", "XHR timedtext request sending:", urlStr);
         const onLoad = () => {
           this.removeEventListener("load", onLoad);
           try {
+            const responseType = this.responseType ?? "";
+            const status = this.status ?? 0;
+            diagLog("interceptor", "XHR timedtext onLoad: status:", status, "responseType:", responseType);
             const responseText = readXhrResponseText(this);
             const contentType = this.getResponseHeader?.("content-type") ?? "unknown";
-            console.log("[AI_Trans Interceptor] XHR timedtext response received, length:", responseText.length, "content-type:", contentType);
+            diagLog("interceptor", "XHR timedtext response received, length:", responseText.length, "content-type:", contentType);
             emitCapture(urlStr, responseText, contentType, globalThis.location);
           } catch {
           }
@@ -198,14 +237,14 @@
         return origFetch(input, init);
       }
       if (!isTimedText(urlStr)) return origFetch(input, init);
-      console.log("[AI_Trans Interceptor] fetch timedtext request detected:", urlStr);
+      diagLog("interceptor", "fetch timedtext request detected:", urlStr);
       const captured = origFetch(input, init);
       void captured.then((res) => {
-        console.log("[AI_Trans Interceptor] fetch timedtext response received, status:", res.status);
+        diagLog("interceptor", "fetch timedtext response received, status:", res.status);
         try {
           const clone = res.clone();
           void clone.text().then((text) => {
-            console.log("[AI_Trans Interceptor] fetch timedtext response body length:", text.length);
+            diagLog("interceptor", "fetch timedtext response body length:", text.length);
             emitCapture(
               urlStr,
               text,

@@ -202,6 +202,14 @@
   - `__aiTransTimedtextRequests > 0` 但字幕仍不顯示 → 捕獲成功但下游斷：對照 `__aiTransTimedtextLastCapture.videoId` 是否為當前視頻（跨視頻 stale），或 content-script `parseTimedText` 解析失敗（見 §2.12），或消息未達 bridge（M1-46 前的競態，已由重播修復）。
 - **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`install`/`emitCapture`/`startReplay`）
 
+### 2.15 XHR arraybuffer 響應類型支援（M1-50，timedtext 空響應根因修復）
+
+- **現象**: 控制台顯示 `XHR timedtext response received, length: 0 content-type: text/html; charset=UTF-8`，隨後 `emitCapture: empty response, skipping`，最終 `parse error (not valid XML) — root <html>`。
+- **根因**: YouTube 播放器可能將 XHR `responseType` 設為 `arraybuffer`（二進制傳輸），`readXhrResponseText()` 原代碼對 arraybuffer 類型返回空串，導致字幕響應被丟棄。
+- **修復**: `readXhrResponseText()` 新增 `arraybuffer` 分支——當 `responseType === 'arraybuffer'` 且 `response instanceof ArrayBuffer` 時，用 `TextDecoder('utf-8')` 解碼為文本。
+- **診斷增強**: XHR onLoad 中新增 `xhr.status` 和 `xhr.responseType` 日誌，便於區分「空響應」是 HTTP 錯誤、responseType 不支援、還是真實無字幕。
+- **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`readXhrResponseText` arraybuffer 分支 + onLoad status/responseType 日誌）
+
 
 ---
 
@@ -330,6 +338,36 @@
 - **用戶響應**: 檢查 API 限流;等待後重試
 - **開發者響應**: 檢查響應結構;確認是否需要更新解析邏輯
 - **代碼落點**: src/adapters/translation/llm-translation.ts:100-104
+
+### 4.9 LLM 分塊瞬態失敗重試（M1-52）
+
+- **診斷碼**: (console.warn 麵包屑，不落 recordDiagnostic)
+- **用戶可見消息**: 無（重試對用戶透明；耗盡後該塊原文兜底，其餘塊正常翻譯）
+- **觸發條件**: 單塊翻譯遇瞬態錯誤（`LLMRequestError.transient=true`：網絡中止/超時、HTTP 429/5xx、body 讀取失敗、JSON 解析失敗），`translateChunkWithRetry` 重試 ≤2 次（500ms→1500ms 退避）
+- **根因**: 本地服務瞬時抖動;限流;推理超時;連接短暫中斷
+- **用戶響應**: 無需操作;若整片大量塊回退原文，檢查服務穩定性與 timeoutMs
+- **開發者響應**: 觀察重試麵包屑判斷抖動頻率;瞬態 vs 永久由 `LLMRequestError.transient` 判別（4xx 非 429 為永久，立即拋錯走管線降級，不重試）
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkWithRetry` / `LLMRequestError` / `MAX_RETRIES=2` / `RETRY_DELAYS_MS=[500,1500]`）
+
+### 4.10 LLM 分塊耗盡重試後原文兜底（M1-52）
+
+- **診斷碼**: (該塊 translatedText=sourceText，不拋錯不中斷)
+- **用戶可見消息**: 該塊字幕顯示原文（未翻譯），其餘塊正常
+- **觸發條件**: 單塊重試耗盡（3 次請求全敗）仍為瞬態錯誤
+- **根因**: 服務持續不可用但屬瞬態類別（未達永久失敗條件）
+- **用戶響應**: 檢查翻譯服務;個別塊原文屬預期降級行為，不阻塞整片
+- **開發者響應**: 與永久失敗區分——永久失敗（choices 缺失、4xx 非 429）立即拋錯降級整條管線;此處為單塊軟降級
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkWithRetry` 兜底分支）
+
+### 4.11 LLM 快取失效（配置變更，M1-52）
+
+- **診斷碼**: (invalidateLlmCache 全量清空，無錯誤)
+- **用戶可見消息**: 無（改配置後重新請求翻譯，非失敗）
+- **觸發條件**: `chrome.storage.onChanged` 偵測 `engineConfig` 變更 → `invalidateLlmCache()`
+- **根因**: 端點/模型/語言變更後舊快取鍵空間不再匹配，全量清空最安全
+- **用戶響應**: 無需操作
+- **開發者響應**: `ensureLlmCacheInvalidationHook` 以 once-guard 防重複註冊（§5.4）;非擴充環境無 `chrome.storage` 時 try/catch 守護後無操作
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`LruCache` / `invalidateLlmCache` / `ensureLlmCacheInvalidationHook`）
 
 
 ---
@@ -556,3 +594,23 @@ DiagnosticRecord 結構:
 4. **用戶可見**: Popup「最近失敗」和 Options 頁必須能告訴用戶原因
 5. **開發者可追蹤**: 診斷/事件流必須能定位到具體節點
 6. **不影響主流程**: 診斷記錄失敗不得阻塞翻譯/字幕流程
+
+---
+
+## 12. 調試日誌門控（M1-51，F-12）
+
+普通用戶的 console 不應被開發性日誌淹沒,但真實環境（content-script / MAIN world 攔截器）定位問題又依賴詳細日誌。M1-51 以中央門控分離「調試日誌」與「診斷/錯誤日誌」。
+
+### 12.1 分類與開關
+
+- **八分類**: `overlay` / `llm` / `capture` / `pipeline` / `strategy` / `content` / `bridge` / `interceptor`,各一個布爾開關。
+- **預設全關**: `DEBUG_LOG_OFF`——普通用戶零噪音。
+- **輸出格式**: `diagLog(category, ...)` 僅在對應分類開啟時 `console.log`,前綴 `[AI_Trans:diag][<category>]`,便於過濾。
+- **持久化與同步**: 開關存 `EngineConfig.debugLog`（`chrome.storage.local`）;Options 頁「調試日誌」分區勾選;content-script 讀取後 `setDebugFlags()` 寫入模組內存,並 `dispatchEvent(new CustomEvent('ai-trans:set-debug-flags'))` 同步給無法訪問 `chrome.storage` 的 MAIN world 攔截器。
+- **代碼落點**: src/infrastructure/debug-log.ts（`DebugLogCategory` / `diagLog` / `setDebugFlags` / `getDebugFlags`）、src/domain/models/config.ts（`DebugLogConfig` / `DEBUG_LOG_OFF` / `EngineConfig.debugLog`）、src/runtime/content-script.ts（讀配置 + CustomEvent 中繼）、src/runtime/yt-timedtext-interceptor.ts（監聽 `ai-trans:set-debug-flags`）、src/runtime/options/options.ts（`readDebugLog` / `fillDebugLog`）。
+
+### 12.2 與診斷/錯誤日誌的邊界（§5.6 紅線）
+
+- **錯誤/降級不受門控**: 所有失敗路徑的 `console.warn` + `recordDiagnostic`（本文件 §1–§11 全部診斷條目）**不經過 `diagLog`**,調試開關全關時仍照常輸出——「字幕沒出來」的原因永遠可見。
+- **`diagLog` 僅承載正常流轉的觀測日誌**（掛載/渲染/捕獲複用/塊流轉等），關閉不損失任何失敗痕跡。
+- **判斷標準**: 關閉全部調試日誌後,用戶遇功能失效仍能在 Popup「最近失敗」/Options 頁看到原因;開發者開啟對應分類即可補足流轉細節。

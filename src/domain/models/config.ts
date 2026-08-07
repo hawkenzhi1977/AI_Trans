@@ -17,6 +17,36 @@ export interface ASRConfig {
   apiKeyRef?: string;
 }
 
+/**
+ * 調試日誌分類開關（M1-51）。
+ * 全預設 false——非必要的流程診斷日誌默認關閉，避免控制台洪水；
+ * 錯誤/降級診斷（recordDiagnostic/console.warn）不受此開關影響（§5.6 紅線不靜默）。
+ */
+export type DebugLogCategory =
+  | 'overlay' // 覆蓋層渲染器（render/draw/cue 切換）
+  | 'llm' // LLM 翻譯適配器（fetch/解析/快取）
+  | 'capture' // timedtext 捕獲鏈路（bridge 等待/複用）與平台抓軌
+  | 'pipeline' // 翻譯管線（primary/fallback 流轉）
+  | 'strategy' // 字幕策略鏈（native-strategy 抓軌/翻譯/推送）
+  | 'content' // content-script 總控（掛載/事件/熱重啟）
+  | 'bridge' // timedtext 消息橋（waitForCapture/輪詢）
+  | 'interceptor'; // MAIN world 攔截器（XHR/fetch hook/字幕模組驅動）
+
+/** 調試日誌開關配置（每類一個布爾開關）。 */
+export type DebugLogConfig = Record<DebugLogCategory, boolean>;
+
+/** 全關的調試旗標（預設值）。 */
+export const DEBUG_LOG_OFF: DebugLogConfig = {
+  overlay: false,
+  llm: false,
+  capture: false,
+  pipeline: false,
+  strategy: false,
+  content: false,
+  bridge: false,
+  interceptor: false,
+};
+
 /** 引擎整體配置（單一配置實體）。 */
 export interface EngineConfig {
   translation: TranslationConfig;
@@ -25,6 +55,8 @@ export interface EngineConfig {
   displayMode: 'mono' | 'bilingual';
   performanceProfile: 'streaming' | 'balanced' | 'quality';
   subtitleStyle?: Record<string, string>;
+  /** 調試日誌分類開關（M1-51；缺省全關）。 */
+  debugLog: DebugLogConfig;
 }
 
 /** 預設配置檔位。 */
@@ -53,4 +85,10 @@ export const DEFAULT_CONFIG: EngineConfig = {
   targetLang: 'zh-Hant',
   displayMode: 'bilingual',
   performanceProfile: 'balanced',
+  subtitleStyle: {
+    'font-size': '24px',
+    color: '#ffffff',
+    'background-color': 'rgba(32, 32, 32, 0.7)',
+  },
+  debugLog: DEBUG_LOG_OFF,
 };

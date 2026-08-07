@@ -22,6 +22,8 @@ AI_Trans grabs a video's captions (or, later, transcribes its audio), translates
 - **Reliability-hardened content script** — host-method binding (no "Illegal invocation"), leak-free subscriptions on config hot-reload, tolerant external JSON parsing (see `AGENTS.md` §5).
 - **Translation-failure diagnostics** — degrade/error events are no longer silently swallowed by the pipeline: the failure reason is persisted to `chrome.storage.local` and **always shown** on the Popup's "last failure" line (no record → shows "none", so you can always confirm it's working), plus a `console.warn` breadcrumb. When **no caption strategy can take over** (e.g. the video's native caption track can't be fetched — different from a translation failure), that's also reported with the underlying reason, so "no captions found" and "translation failed" are distinguishable. A **"Test Connection" button** in the Popup sends a minimal live request to the configured endpoint — verifying reachability, model name, and response structure in one click. The Popup's translation status line also shows the **actual model name in effect** (local mode), making it easy to confirm whether a save actually updated storage. Every external interface call leaves **evidence-based diagnostics** instead of guesswork: caption fetch failures report the actual HTTP status, content-type, and a body snippet; a malformed LLM response (non-JSON body, missing/empty `choices`) is treated as a failure and downgraded with a traceable event rather than silently falling back to the original text; a player that never appears after 15s raises a `player-not-found` error; and configuration/API-key read failures in the Popup, Options page, and service worker are shown explicitly instead of failing silently.
 - **Translation-failure fallback** — when the LLM translation service fails (e.g. connection lost, timeout), the extension **falls back to displaying the original (source) subtitles** instead of showing nothing. An `engine-degraded` event is emitted so the Popup can display the degradation reason. Users prefer seeing original subtitles over a blank screen.
+- **Low-latency chunked translation** — long videos are translated in chunks (`CHUNK_SIZE=60` segments) that stream in progressively: the first chunk appears within seconds and later chunks update the overlay incrementally, instead of waiting minutes for the whole video. Chunk results are cached (LRU, up to 100 entries, keyed by model + language + content hash) so replays, language switches, and tab reloads don't re-request; the cache is invalidated automatically when engine config changes. Transient failures (network aborts, timeouts, HTTP 429/5xx, body read or JSON errors) are retried up to 2× with backoff, and a chunk that exhausts retries falls back to showing its **original text** without blocking the rest of the video — while permanent errors (e.g. HTTP 400, malformed response) still fail fast and trigger the pipeline degradation with a traceable diagnostic.
+- **Debug logging gate** — console logs are organized into eight categories (overlay / llm / capture / pipeline / strategy / content / bridge / interceptor) that are **all off by default**; enable individual categories in Settings → Debug logging when diagnosing an issue. Logged lines are prefixed `[AI_Trans:diag][category]` for easy filtering. Error and degradation messages are **not** gated — they always appear, so the "last failure" line and `console.warn` breadcrumbs stay reliable even with debug logging disabled.
 
 ### Planned (later milestones)
 
@@ -110,6 +112,7 @@ Open the extension's **Settings** (Options page) to set:
 - **ASR engine** (for future M2): local Whisper / cloud, model tier, endpoint.
 - **Target language**, **display mode** (mono/bilingual), **performance profile**.
 - **Subtitle style**: font size, color, background.
+- **Debug logging** (for diagnosing issues): toggle individual categories (overlay / llm / capture / pipeline / strategy / content / bridge / interceptor). All off by default.
 
 API keys are written to a separate secure storage slot and are never embedded into the plain config object.
 
@@ -132,7 +135,7 @@ Hexagonal (ports & adapters): a stable `domain` core, pluggable `adapters`, an `
 
 Full design lives in [`doc/`](./doc/):
 
-- `doc/requirements-design.md` — requirements, features (F-01…F-09), milestones.
+- `doc/requirements-design.md` — requirements, features (F-01…F-13), milestones.
 - `doc/architecture-design.md` — ports, adapters, data structures, real-time analysis.
 - `doc/system-test-design.md` — test strategy, layered test cases (TC-*).
 - `doc/project-progress.md` — live progress table.

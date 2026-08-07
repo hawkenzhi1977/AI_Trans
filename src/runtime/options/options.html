@@ -10,6 +10,7 @@
     fieldset { border: none; margin: 0 0 12px; padding: 0; }
     label { display: block; font-size: 13px; margin: 8px 0 2px; color: #444; }
     input, select { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px; }
+    input[type="checkbox"] { width: auto; padding: 0; vertical-align: middle; }
     .row { display: flex; gap: 12px; }
     .row > div { flex: 1; }
     .actions { margin-top: 20px; display: flex; gap: 10px; }
@@ -103,9 +104,43 @@
         <label for="style-color">文字顏色</label>
         <input id="style-color" type="text" placeholder="#ffffff" />
       </div>
+    </div>
+    <label for="style-bg-preset">背景預設</label>
+    <select id="style-bg-preset">
+      <option value="none">無背景</option>
+      <option value="gray" selected>半透明灰黑（推薦）</option>
+      <option value="black">半透明黑</option>
+      <option value="custom">自定義</option>
+    </select>
+    <div id="style-bg-custom" style="display:none; margin-top:8px;">
+      <div class="row">
+        <div>
+          <label for="style-bg-color">背景顏色</label>
+          <input id="style-bg-color" type="color" value="#202020" />
+        </div>
+        <div>
+          <label for="style-bg-opacity">透明度 <span id="style-bg-opacity-val">70</span>%</label>
+          <input id="style-bg-opacity" type="range" min="0" max="100" value="70" />
+        </div>
+      </div>
+    </div>
+  </fieldset>
+
+  <h2>調試日誌</h2>
+  <fieldset id="debug-log">
+    <p class="hint">非必要流程日誌默認關閉（錯誤與降級提示不受開關影響）。按分類開啟後保存，可在 YouTube 頁面 DevTools 控制台看到對應診斷輸出。</p>
+    <div class="row">
       <div>
-        <label for="style-bg">背景</label>
-        <input id="style-bg" type="text" placeholder="transparent" />
+        <label><input type="checkbox" id="dbg-overlay" /> overlay（覆蓋層渲染）</label>
+        <label><input type="checkbox" id="dbg-llm" /> llm（LLM 翻譯）</label>
+        <label><input type="checkbox" id="dbg-capture" /> capture（字幕抓取）</label>
+        <label><input type="checkbox" id="dbg-pipeline" /> pipeline（翻譯管線）</label>
+      </div>
+      <div>
+        <label><input type="checkbox" id="dbg-strategy" /> strategy（字幕策略鏈）</label>
+        <label><input type="checkbox" id="dbg-content" /> content（content-script 總控）</label>
+        <label><input type="checkbox" id="dbg-bridge" /> bridge（timedtext 消息橋）</label>
+        <label><input type="checkbox" id="dbg-interceptor" /> interceptor（MAIN world 攔截器）</label>
       </div>
     </div>
   </fieldset>

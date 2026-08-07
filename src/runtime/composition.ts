@@ -6,7 +6,7 @@ import {
   RealtimeASRStrategy,
 } from '../application';
 import { YouTubePlatformAdapter, FetchCaptionSource } from '../adapters';
-import { LLMTranslationProvider } from '../adapters/translation/llm-translation';
+import { LLMTranslationProvider, ensureLlmCacheInvalidationHook } from '../adapters/translation/llm-translation';
 import { MTTranslationProvider } from '../adapters/translation/mt-translation';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import type { CaptionCaptureProvider } from '../adapters/platform/youtube/platform-adapter';
@@ -42,6 +42,10 @@ export async function buildDefaultRegistry(
 
   // 依配置構建翻譯引擎集合（LLM + MT 字典兜底）。
   const translation = await buildTranslationProviders(config, opts.apiKeyStore);
+
+  // M1-52：安裝 LLM 塊級快取失效監聽（engineConfig 變更 → 清空快取）。
+  // 非擴充環境（無 chrome.storage）內部 try/catch 守護為無操作。
+  ensureLlmCacheInvalidationHook();
 
   return {
     platforms: [youtube],

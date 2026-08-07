@@ -1,6 +1,16 @@
 "use strict";
 (() => {
   // src/domain/models/config.ts
+  var DEBUG_LOG_OFF = {
+    overlay: false,
+    llm: false,
+    capture: false,
+    pipeline: false,
+    strategy: false,
+    content: false,
+    bridge: false,
+    interceptor: false
+  };
   var PROFILE_DEFAULTS = {
     streaming: {
       asr: { type: "local-whisper", modelTier: "tiny" },
@@ -20,7 +30,13 @@
     asr: { type: "local-whisper", modelTier: "base" },
     targetLang: "zh-Hant",
     displayMode: "bilingual",
-    performanceProfile: "balanced"
+    performanceProfile: "balanced",
+    subtitleStyle: {
+      "font-size": "24px",
+      color: "#ffffff",
+      "background-color": "rgba(32, 32, 32, 0.7)"
+    },
+    debugLog: DEBUG_LOG_OFF
   };
 
   // src/infrastructure/chrome-config-store.ts
@@ -61,7 +77,9 @@
         ...base,
         ...patch,
         translation: { ...base.translation, ...patch.translation ?? {} },
-        asr: { ...base.asr, ...patch.asr ?? {} }
+        asr: { ...base.asr, ...patch.asr ?? {} },
+        // M1-51：debugLog 深合併——舊配置缺 debugLog 時補全鍵，避免 undefined 崩壞。
+        debugLog: { ...DEFAULT_CONFIG.debugLog, ...patch.debugLog ?? {} }
       };
     }
   };
@@ -73,11 +91,67 @@
     if (!el) throw new Error(`missing #${id}`);
     return el;
   }
+  var BG_PRESETS = {
+    none: "transparent",
+    gray: "rgba(32, 32, 32, 0.7)",
+    black: "rgba(0, 0, 0, 0.7)"
+  };
+  function parseRgba(value) {
+    const match = value.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/);
+    if (!match) return null;
+    const r = parseInt(match[1], 10);
+    const g = parseInt(match[2], 10);
+    const b = parseInt(match[3], 10);
+    const a = match[4] ? parseFloat(match[4]) : 1;
+    const hex = "#" + [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("");
+    return { color: hex, opacity: Math.round(a * 100) };
+  }
+  function matchPreset(value) {
+    for (const [key, preset] of Object.entries(BG_PRESETS)) {
+      if (value === preset) return key;
+    }
+    return "custom";
+  }
+  var DEBUG_CATEGORY_IDS = [
+    ["overlay", "dbg-overlay"],
+    ["llm", "dbg-llm"],
+    ["capture", "dbg-capture"],
+    ["pipeline", "dbg-pipeline"],
+    ["strategy", "dbg-strategy"],
+    ["content", "dbg-content"],
+    ["bridge", "dbg-bridge"],
+    ["interceptor", "dbg-interceptor"]
+  ];
+  function readDebugLog() {
+    const out = { ...DEBUG_LOG_OFF };
+    for (const [category, id] of DEBUG_CATEGORY_IDS) {
+      out[category] = $(id).checked;
+    }
+    return out;
+  }
+  function fillDebugLog(config) {
+    const merged = { ...DEBUG_LOG_OFF, ...config };
+    for (const [category, id] of DEBUG_CATEGORY_IDS) {
+      $(id).checked = merged[category];
+    }
+  }
   function readForm() {
     const translationType = $("translation-type").value;
     const asrType = $("asr-type").value;
     const modelTier = $("asr-tier").value;
     const profile = $("performance-profile").value;
+    const preset = $("style-bg-preset").value;
+    let bgColor;
+    if (preset === "custom") {
+      const color = $("style-bg-color").value;
+      const opacity = parseInt($("style-bg-opacity").value, 10);
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+      bgColor = `rgba(${r}, ${g}, ${b}, ${opacity / 100})`;
+    } else {
+      bgColor = BG_PRESETS[preset] ?? "transparent";
+    }
     const config = {
       translation: {
         type: translationType,
@@ -96,8 +170,9 @@
       subtitleStyle: {
         "font-size": $("style-font-size").value,
         color: $("style-color").value,
-        "background-color": $("style-bg").value || "transparent"
-      }
+        "background-color": bgColor
+      },
+      debugLog: readDebugLog()
     };
     const prof = PROFILE_DEFAULTS[profile];
     if (prof) {
@@ -121,7 +196,22 @@
     $("performance-profile").value = config.performanceProfile;
     $("style-font-size").value = config.subtitleStyle?.["font-size"] ?? "24px";
     $("style-color").value = config.subtitleStyle?.color ?? "#ffffff";
-    $("style-bg").value = config.subtitleStyle?.["background-color"] ?? "transparent";
+    const bgColor = config.subtitleStyle?.["background-color"] ?? "transparent";
+    const preset = matchPreset(bgColor);
+    $("style-bg-preset").value = preset;
+    const customArea = document.getElementById("style-bg-custom");
+    if (preset === "custom") {
+      const parsed = parseRgba(bgColor);
+      if (parsed) {
+        $("style-bg-color").value = parsed.color;
+        $("style-bg-opacity").value = String(parsed.opacity);
+        $("style-bg-opacity-val").textContent = String(parsed.opacity);
+      }
+      if (customArea) customArea.style.display = "";
+    } else {
+      if (customArea) customArea.style.display = "none";
+    }
+    fillDebugLog(config.debugLog);
   }
   async function loadKeysIntoForm() {
     const llmKey = await store.getApiKey("llm");
@@ -171,6 +261,14 @@
         $("asr-tier").value = prof.asr.modelTier ?? "base";
         $("display-mode").value = prof.displayMode;
       }
+    });
+    const customArea = document.getElementById("style-bg-custom");
+    $("style-bg-preset").addEventListener("change", () => {
+      const preset = $("style-bg-preset").value;
+      if (customArea) customArea.style.display = preset === "custom" ? "" : "none";
+    });
+    $("style-bg-opacity").addEventListener("input", () => {
+      $("style-bg-opacity-val").textContent = $("style-bg-opacity").value;
     });
     $("btn-save").addEventListener("click", () => void save());
     $("btn-reset").addEventListener("click", () => {

@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-06（新增 TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43 時序修復）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45 注入時序 document_start + 跨視頻捕獲失效）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、**TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）**；測試合計 113→139→153→164→168→175→182→183）
+> 最後更新：2026-08-07（**回填治理缺口**：新增 TC-F26 LLM 直接 fetch 架構（F-04/M1-48，SW 代理移除 + 僅配置管理）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50），TC-F09 字幕樣式從佔位升級為已實裝（F-09/M1-49，三重對比默認樣式 + 背景預設/自定義雙模式 + transparent 向後兼容）。新增 **TC-F24 調試日誌門控（F-12/M1-51，八分類開關 + 錯誤日誌不受門控）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52，CHUNK_SIZE=60 分塊 + translateStream 漸進 emit + LRU 快取 100 條 + 瞬態重試 ≤2 次 + 超時覆蓋 body 讀取）**；先前：TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）；測試合計 113→139→153→164→168→175→182→183→…→unit 87 + integration 116(+1 M1-50 arraybuffer)=117 + contract 11 + E2E 15）
 
 ---
 
@@ -436,6 +436,52 @@ jobs:
 - 預期：isolated world 與 MAIN world 之間的消息通信通過 `CustomEvent` 正常傳遞（`__aiTransTargetLang` 正確設置）；字幕模組驅動有足夠的重試窗口（60 秒）和立即觸發機制；翻譯失敗時顯示原文字幕並發送 `engine-degraded` 事件（popup 顯示降級原因）。
 - 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+1：`set-target-lang` 消息測試改用 `CustomEvent`）。
 
+#### TC-F26 LLM 直接 fetch 架構（對應 F-04/M1-48，已實裝）
+- 前置：MV3 service worker 掛起後 `chrome.runtime.sendMessage`/port 響應被延遲到 SW 喚醒（實測延遲 138s+），`alarms` keepalive + port 長連接無法根治。M1-48 改為 content script（ISOLATED world）以 `globalThis.fetch` 直接調用 `LLMTranslationProvider`（host_permissions 授予跨域、無需 CORS 預檢、不受 SW 掛起影響）;移除 SW `translation:fetch` 消息處理 / `alarms` keepalive / `onConnect` port proxy / manifest `alarms` 權限，SW 精簡為僅 `config:get`/`config:set`。
+- 步驟：
+  - A（content script 直接 fetch）：`LLMTranslationProvider.translate()` 經 `vi.stubGlobal('fetch', mockFetch)` 直接調用 `globalThis.fetch`，斷言不經任何 message-bus/SW 層;mock 返回 OpenAI 兼容響應 → 解析成功。
+  - B（fetch 綁定接收者）：mock fetch 以裸函數斷言能成功調用（內部 `globalThis.fetch.bind(globalThis)`，§5.1）。
+  - C（SW 僅配置管理）：`service-worker.test.ts` 斷言 SW 只處理 `config:get`/`config:set`，無 `translation:fetch`/port 監聽。
+- 預期：翻譯請求不再依賴 SW 喚醒，實測延遲 23ms（原 138s+）;SW 職責收斂。
+- 落點：單元 `test/unit/llm-translation.test.ts`（直接 fetch 契約）、集成 `test/integration/composition.test.ts`（組裝注入）、`test/support/setup-dom.ts`（`vi.stubGlobal('fetch')` 測試模式）。
+
+#### TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（對應 F-01/F-11/M1-50，已實裝）
+- 前置：YouTube 可能將 timedtext XHR `responseType` 設為 `arraybuffer`（二進制傳輸），原 `readXhrResponseText()` 對非文本類型返回空串 → 字幕響應被丟棄（`emitCapture: empty response` → 解析 `root <html>`）。M1-50 新增 arraybuffer 分支（`TextDecoder('utf-8')` 解碼）+ onLoad 記錄 `xhr.status`/`xhr.responseType`;併 overlay-renderer 日誌降壓（`render()` 僅 cues 數量變化時記錄、`draw()` no-cue 5s 節流、active cue 僅切換時記錄）。
+- 步驟：
+  - A（arraybuffer 解碼，已測）：構造 `responseType='arraybuffer'`、`response` 為 `ArrayBuffer`、`responseText` 存取器拋 `InvalidStateError` 的 XHR 模擬 → `readXhrResponseText` 以 `TextDecoder('utf-8')` 正確解碼含中文的 UTF-8 文本，`postMessage` 捕獲成功。
+  - B（status/responseType 診斷，門控日誌）：onLoad 經 `diagLog('interceptor', ...)` 記錄 `xhr.status` 與 `xhr.responseType`（麵包屑留痕，受 M1-51 調試門控，非功能斷言）。
+  - C（渲染日誌降壓，門控日誌）：`render()` 僅 cues 數量變化時記錄、`draw()` no-cue 5s 節流、active cue 僅切換時記錄——純日誌行為，不改變渲染輸出。
+- 預期：arraybuffer timedtext 響應不再被誤丟;控制台不再每幀洪水;「空響應」原因可區分（HTTP 錯誤/類型不支援/真實無字幕）。
+- 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（`[M1-50] responseType=arraybuffer` 用例，緊鄰既有 M1-47 json/blob 硬化用例）;B/C 為純日誌行為不改變功能輸出，無獨立功能斷言（受既有渲染測試與門控測試 TC-F24 間接覆蓋）。
+
+#### TC-F24 調試日誌門控（對應 F-12/M1-51，已實裝）
+- 前置：`src/infrastructure/debug-log.ts` 中央門控——八分類（overlay/llm/capture/pipeline/strategy/content/bridge/interceptor）布爾開關，預設全關（`DEBUG_LOG_OFF`）；`diagLog(category, ...)` 僅在對應分類開啟時輸出（前綴 `[AI_Trans:diag][category]`）；開關經 `EngineConfig.debugLog` 持久化並以 `CustomEvent('ai-trans:set-debug-flags')` 同步給 MAIN world 攔截器。**錯誤/降級（console.warn + recordDiagnostic）不受開關影響**。
+- 步驟：
+  - A（默認全關不輸出）：`setDebugFlags(undefined)` → `diagLog('llm', 'x')` 不輸出（spy console.log 計數 0）。
+  - B（開啟分類帶前綴輸出）：`setDebugFlags({ llm: true })` → `diagLog('llm', 'x')` 輸出且含 `[AI_Trans:diag][llm]` 前綴。
+  - C（分類隔離）：僅開 `llm` 時 `diagLog('overlay', 'y')` 不輸出。
+  - D（getDebugFlags 返回獨立副本）：外部修改返回值不影響內部狀態。
+  - E（setDebugFlags 部分旗標補全）：只傳 `{ llm: true }` → 其餘分類補全為 false。
+  - F（setDebugFlags(undefined) 重置全關）。
+  - G（八分類全覆蓋）：枚舉所有分類均有對應開關。
+- 預期：調試日誌按分類可控開關，普通用戶零噪音；開發者按需開啟定位；錯誤/降級信息始終可見（§5.6 不靜默）。
+- 落點：單元 `test/unit/debug-log.test.ts`（+7）；`test/unit/config.test.ts`（DEFAULT_CONFIG 含 `debugLog`）、`test/unit/config-store.test.ts`（merge 保留 debugLog）、`test/integration/options.test.ts`（HTML 模板含調試日誌分區）。
+
+#### TC-F25 字幕翻譯分塊/快取/重試（對應 F-13/M1-52，已實裝）
+- 前置：`LLMTranslationProvider` 五項機制——`CHUNK_SIZE=60` 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取（key=`model|targetLang|djb2Hash(塊源文)`，上限 100）、瞬態失敗重試 ≤2 次（500ms→1500ms 退避）、超時覆蓋 body 讀取。模塊級快取跨測試共享，測試須 `beforeEach/afterEach` 調 `invalidateLlmCache()` 防命中污染。
+- 步驟：
+  - A（分塊邊界）：130 段 → `chunkSegments` 為 [60,60,10] 三塊；恰 60 段 → 一塊；空輸入 → `[[]]`。
+  - B（漸進 emit）：130 段 `translateStream` → emit 序列長度遞增 [60,120,130]（每塊完成 emit 累計全量）。
+  - C（首塊 ready / 後續 updated）：`NativeCaptionStrategy` 走 `translateStream` 時首個 emit 映射 `segments-ready`、後續映射 `segments-updated`；`stop()` 後不再 emit。
+  - D（快取命中）：同 key 二次請求零 fetch（mock fetch 計數不增）；換模型/換目標語言 → miss。
+  - E（LRU 逐出）：110 個不同 key 依序寫入 → 快取大小收斂至 100（最舊被淘汰）。
+  - F（瞬態重試）：HTTP 500 / 超時 / body 非 JSON / body 讀取 `Failed to fetch` → fake timers 下 3 請求後回退原文（不拋錯）；HTTP 429 首敗後成功 → 2 請求取成功結果。
+  - G（永久失敗 fail-fast）：HTTP 400（非 429）→ 立即拋 `LLMRequestError` 且僅 1 請求；choices 缺失/content 非字符串 → 拋錯走降級。
+  - H（超時覆蓋 body 掛死）：`res.text()` 掛死 → AbortController 超時中斷（fake timers 推進）→ 瞬態重試。
+  - I（配置變更失效）：`ensureLlmCacheInvalidationHook` 註冊 once-guard；`invalidateLlmCache()` 全量清空（重播零請求→清空後重新請求）。
+- 預期：長視頻首塊秒級可見、後續增量替換；重播/切配置免重複請求；瞬態抖動自動恢復、單塊失敗原文兜底不阻塞；永久失敗立即降級可診斷。
+- 落點：單元 `test/unit/llm-translation.test.ts`（重寫，27 用例）+ `test/unit/native-caption-strategy.test.ts`（+3 流式）。
+
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。
 - 步驟：
@@ -463,9 +509,15 @@ jobs:
 - 步驟 B：模擬預取失效（`changed-dom.html`）→ 觸發降級。
 - 預期：A 中字幕領先播放頭；B 中發射 `strategy-degraded(lookahead→realtime)`，字幕不中斷、下游數據結構不變。
 
-#### TC-F09 字幕樣式設置（對應 F-09）
-- 步驟：修改字號/顏色/位置/背景透明度。
-- 預期：覆蓋層樣式即時生效；配置持久化。
+#### TC-F09 字幕樣式設置（對應 F-09，M1-49 已實裝）
+- 前置：M1-49 默認樣式「白字 + 黑色環繞描邊（`text-shadow`）+ 灰黑半透明背景 `rgba(32,32,32,0.7)`」;Options 背景設置為「預設下拉（無背景/半透明灰黑推薦/半透明黑/自定義）+ 自定義區域（`<input type=color>` + 透明度滑桿）」。
+- 步驟：
+  - A（默認值）：`DEFAULT_CONFIG.subtitleStyle` 含白字 + 描邊 + 灰黑半透明背景。
+  - B（背景預設 UI）：Options HTML 模板含背景預設下拉與自定義顏色/透明度控件;選「自定義」展開控件。
+  - C（向後兼容）：舊配置 `background: transparent` → `matchPreset` 映射為「無背景」預設。
+  - D（rgba 解析）：`parseRgba('rgba(32,32,32,0.7)')` 正確拆出顏色與透明度。
+- 預期：極亮/極暗視頻字幕均清晰;預設覆蓋常見場景、自定義滿足特殊需求;舊用戶配置不破壞。
+- 落點：單元 `test/unit/config.test.ts`（DEFAULT_CONFIG.subtitleStyle 默認值：白字 #ffffff + 描邊 + rgba(32,32,32,0.7)）、集成 `test/integration/options.test.ts`（背景預設下拉 HTML 模板含 none/gray/black/custom 選項；§5.6 配置讀取失敗可見）。`BG_PRESETS`/`parseRgba`/`matchPreset` 為 options.ts 模組私有函數，無直接單測——由 Options 讀取/保存集成測試間接覆蓋（標記：模組私有純函數如需單測可後續抽出）。E2E 樣式即時生效由 TC-E01 覆蓋層掛載鏈路兜底。
 
 #### TC-DEGRADE 引擎兜底（對應架構第 10 章）
 - 步驟：`StubLLM` 模擬超時/超額。

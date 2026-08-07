@@ -2,7 +2,7 @@
 
 > 版本：v0.1（草案）
 > 狀態：需求與可行性方案討論結論
-> 最後更新：2026-08-06（F-01 補 YouTube pot token 防護兼容：MAIN world 攔截播放器 timedtext 響應複用——真實 YouTube 對 timedtext 引入 pot 防護後，content-script 直接 fetch 無 pot 的 baseUrl 一律空響應；M1-43 捕獲時序修復——注入提前至頁面加載早期、等待捕獲窗口（waitForCapture 15s）、XHR+fetch 雙 hook、stop 保留緩存；M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗；**M1-46 攔截器重播 lastCapture（1.5s）修復「捕獲早於 bridge 監聽器註冊」競態 + 放寬 timedtext hostname 匹配 + 調試輔助**；F-11 範圍擴展：外部接口調用節點診斷全掃描——LLM 響應結構不靜默回退原文、timedtext 拉取證據化、播放器節點超時/缺失診斷、popup/options/service-worker storage 失敗可見、message-bus 異常留痕）
+> 最後更新：2026-08-07（**回填治理缺口**：F-04 補 M1-48 LLM 直接 fetch 實裝、F-09 補 M1-49 字幕背景樣式三重對比 + 預設/自定義雙模式、F-11 補 M1-50 interceptor arraybuffer 支援 + 渲染日誌降壓。新增 F-12 調試日誌門控（M1-51，八分類中央開關，預設全關，錯誤/降級不受門控）、F-13 字幕翻譯延遲優化（M1-52，分塊翻譯 + 漸進交付 segments-ready/updated + LRU 快取 + 瞬態失敗重試 + 超時覆蓋 body 讀取）；M1 範圍增列 F-12/F-13。先前：F-01 補 YouTube pot token 防護兼容：MAIN world 攔截播放器 timedtext 響應複用；M1-43 捕獲時序修復；M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗；M1-46 攔截器重播 lastCapture（1.5s）修復「捕獲早於 bridge 監聽器註冊」競態 + 放寬 timedtext hostname 匹配 + 調試輔助；F-11 範圍擴展：外部接口調用節點診斷全掃描）
 
 ---
 
@@ -46,14 +46,16 @@ AI_Trans 是一款 **Chrome 瀏覽器擴充（Manifest V3）**，為在線視頻
 | F-01 | 原生字幕翻譯 | 檢測並抓取 YouTube 原生字幕軌，翻譯後以覆蓋層顯示。**pot token 防護兼容（M1-42）**：真實 YouTube 對 `/api/timedtext` 引入 `pot`（proof-of-origin token）防護後，content-script（isolated world）直接用無 pot 的 `captionTracks[].baseUrl` fetch 一律返回空 body（HTTP 200 + text/html），M1-40 的格式兼容被誤判為「HTML 錯誤頁」。方案：向 MAIN world 注入 `yt-timedtext-interceptor` hook 播放器 `XMLHttpRequest`（**M1-43 補 `window.fetch` 雙 hook**），捕獲播放器**已成功**（含 pot、已過驗證）的 timedtext 響應，經 `window.postMessage` 橋回 content-script（`timedtext-bridge`），`FetchCaptionSource` 優先複用捕獲響應（解析 srv3/json3），無捕獲/解析失敗時回退直接 fetch。**M1-43 時序修復**：攔截器在 content-script `start()` 第一行注入（早於播放器就緒，不漏早期請求）；`fetchTracks` 有 15s 等待捕獲窗口（`waitForCapture`），播放器請求在前仍能複用；restart 熱重啟走 `stop()` 保留捕獲緩存。**M1-45 注入時序終極修復**：content-script `run_at: document_idle` 導致整段 content-script 在頁面加載完成後才運行，帶緩存二次加載/SPA 導航時播放器 timedtext 請求早於攔截器裝好（`waitForCapture(15s)` 超時 → 回退直接 fetch → 空 body → 永久失敗）；改為 manifest 直接聲明 `world: "MAIN"` + `run_at: "document_start"` 的 content_scripts 條目注入攔截器（頁面最早階段 hook 就位），保留動態注入作兜底（`INSTALL_FLAG` 冪等共用）。**M1-45 SPA 換視頻**：YouTube 換視頻是 pushState（SPA），content-script 不重載——監聽 `popstate` + patch `history.pushState/replaceState` 偵測 URL `v` 變化後熱重啟字幕管線。**M1-45 跨視頻捕獲失效**：捕獲帶 `videoId`（從 timedtext URL 提取），`waitForCapture(expectedVideoId)`/`tryReuseCapture` 校驗捕獲屬於當前視頻，stale 跳過留診斷。**M1-46 攔截器重播**：M1-45 的 document_start 注入引入新競態——攔截器捕獲後 postMessage，但 bridge 監聽器在 content-script（document_idle）才註冊，帶緩存二次加載時播放器請求在 document_idle 前發出、捕獲消息發在監聽器就位之前而永久丟失（連首次都失敗）；修復為攔截器維護 `lastCapture` 並以 1.5s 定時器周期重播，晚註冊的監聽器最遲 1.5s 內收到；並放寬 `isTimedText` 只匹配 pathname（不限 hostname），暴露 `__aiTransTimedtextRequests`/`__aiTransTimedtextLastCapture` 調試輔助。繞過 pot 生成——不重新請求，直接使用播放器響應 | P0 |
 | F-02 | 覆蓋層字幕渲染 | 在播放器上方渲染字幕，支持單語/雙語（原文+譯文） | P0 |
 | F-03 | 播放狀態同步 | 字幕隨播放進度、暫停、快進、倍速同步 | P0 |
-| F-04 | 翻譯引擎配置 | 用戶可選擇雲端 LLM / 本地模型，並填寫端點與密鑰（Options 頁詳配 + Popup 快捷開關；密鑰以獨立安全存儲，不明文入配置）。端點兼容「Base URL（如 `/v1`）」與「完整 `/chat/completions` 路徑」兩種填法；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效（見 F-10） | P0 |
+| F-04 | 翻譯引擎配置 | 用戶可選擇雲端 LLM / 本地模型，並填寫端點與密鑰（Options 頁詳配 + Popup 快捷開關；密鑰以獨立安全存儲，不明文入配置）。端點兼容「Base URL（如 `/v1`）」與「完整 `/chat/completions` 路徑」兩種填法；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效（見 F-10）。**實裝（M1-48）**：LLM 翻譯改為 content script 直接 `fetch`（移除 service worker 代理與 `alarms` keepalive），解決 MV3 SW 掛起導致的消息投遞延遲 138s+ 問題——SW 精簡為僅 `config:get`/`config:set` 配置管理 | P0 |
 | F-05 | 目標語言選擇 | 用戶指定目標語言（多語言支持） | P0 |
 | F-06 | 實時擷取 ASR | 對無字幕視頻，擷取標籤頁音頻做實時 ASR + 翻譯 | P1 |
 | F-07 | ASR 引擎配置 | 用戶可選擇本地 Whisper / 雲端 ASR API | P1 |
 | F-08 | 預緩衝提前處理 | 對無字幕但可預取音頻的視頻，提前 ASR+翻譯（**高風險**） | P2 |
-| F-09 | 字幕樣式設置 | 字號、顏色、位置、背景透明度等 | P2 |
+| F-09 | 字幕樣式設置 | 字號、顏色、位置、背景透明度等。**實裝（M1-49）**：默認樣式改為「白字 + 黑色環繞描邊 + 灰黑半透明背景」三重對比保障（極亮/極暗視頻均清晰）；Options 背景設置改為「預設下拉 + 自定義（顏色 + 透明度滑桿）」雙模式，舊配置 `transparent` 向後兼容自動映射 | P2 |
 | F-10 | 本地 LLM 服務兼容 | 兼容本地 OpenAI 兼容服務（如 mlx/omlx/LM Studio/Ollama）：端點自動規範化（Base URL 或完整路徑均可）；`http://127.0.0.1/*` 與 `http://localhost/*` 主機權限；reasoning 模型的 `<think>` 思考塊剝離；長思考請求超時（默認 30s）後降級兜底；配置變更跨上下文熱重啟 | P0 |
-| F-11 | 翻譯失敗診斷可見性 | 翻譯降級/錯誤不再被管線無聲吞掉：content-script 記錄最近一次失敗原因（`lastDiagnostic`，含時間戳）至 `chrome.storage.local` 並打 `console.warn` 麵包屑；**「字幕軌抓不到」與「翻譯失敗」均可診斷**——策略鏈全鏈無接管時發 `pipeline-error`（含各策略軟失敗原因）；Popup **常駐顯示**「最近失敗」行（無記錄顯示「無」），並提供**「測試連接」按鈕**——一鍵向配置端點發最小請求，驗證端點可達/模型存在/響應有效，讓用戶/開發者能直接定位「字幕沒出來」的原因（端點/模型名/CORS/字幕軌）。**外部接口調用節點診斷全掃描（M1-41）**：全部外部接口調用節點失敗都留下證據化診斷——LLM 響應非 JSON/choices 缺失不再靜默回退原文、timedtext 拉取攜帶 HTTP status/content-type/body 片段、播放器超時發 `player-not-found`、popup/options/service-worker storage 失敗可見、message-bus 異常留痕。**M1-44 細化**：LLM body 讀取失敗與 JSON 解析失敗必須區分——`Failed to fetch`（連接中斷）報「connection lost」而非誤報「not valid JSON」 | P0 |
+| F-11 | 翻譯失敗診斷可見性 | 翻譯降級/錯誤不再被管線無聲吞掉：content-script 記錄最近一次失敗原因（`lastDiagnostic`，含時間戳）至 `chrome.storage.local` 並打 `console.warn` 麵包屑；**「字幕軌抓不到」與「翻譯失敗」均可診斷**——策略鏈全鏈無接管時發 `pipeline-error`（含各策略軟失敗原因）；Popup **常駐顯示**「最近失敗」行（無記錄顯示「無」），並提供**「測試連接」按鈕**——一鍵向配置端點發最小請求，驗證端點可達/模型存在/響應有效，讓用戶/開發者能直接定位「字幕沒出來」的原因（端點/模型名/CORS/字幕軌）。**外部接口調用節點診斷全掃描（M1-41）**：全部外部接口調用節點失敗都留下證據化診斷——LLM 響應非 JSON/choices 缺失不再靜默回退原文、timedtext 拉取攜帶 HTTP status/content-type/body 片段、播放器超時發 `player-not-found`、popup/options/service-worker storage 失敗可見、message-bus 異常留痕。**M1-44 細化**：LLM body 讀取失敗與 JSON 解析失敗必須區分——`Failed to fetch`（連接中斷）報「connection lost」而非誤報「not valid JSON」。**M1-50 細化**：interceptor 支援 `arraybuffer` responseType（`TextDecoder` 解碼），避免二進制傳輸的 timedtext 響應被誤判為空；XHR onLoad 記錄 `status`/`responseType` 使空響應可區分為 HTTP 錯誤/類型不支援/真實無字幕；併 overlay 渲染日誌降壓（每幀洪水 → 條件/節流記錄） | P0 |
+| F-12 | 調試日誌門控（M1-51） | 流程診斷日誌（render/draw/fetch/capture 等）在真實環境每幀/每塊輸出會淹沒控制台、對普通用戶無意義。提供**中央分類門控**：八分類（`overlay`/`llm`/`capture`/`pipeline`/`strategy`/`content`/`bridge`/`interceptor`）各一開關，預設**全關**（`DEBUG_LOG_OFF`），Options 頁「調試日誌」分區逐類 checkbox 開啟；開關持久化（`EngineConfig.debugLog`）、跨上下文與跨 world 同步（content-script 經 `CustomEvent` 中繼給 MAIN world 攔截器）。**錯誤與降級信息（console.warn + `recordDiagnostic`）始終可見、不受開關影響**（§5.6 不靜默紅線）——門控只針對流程診斷（`console.log`），不掩蓋失敗痕跡 | P1 |
+| F-13 | 字幕翻譯延遲優化（M1-52） | 長視頻（數百段字幕）不再「整片翻譯完才顯示」——**分塊翻譯**（每 60 段一塊逐塊請求）+ **漸進交付**（首塊譯完即顯示 `segments-ready`，後續塊 `segments-updated` 增量替換，5-10s 內先見首屏）+ **LRU 快取**（相同視頻/語言/模型重播免請求，100 條上限，配置變更全量失效）+ **瞬態失敗重試**（網絡抖動/429/5xx 自動重試 ≤2 次退避，單塊失敗僅該塊原文兜底、不阻塞其餘塊）+ **請求超時覆蓋響應 body 讀取全程**（避免本地服務發完響應頭後 body 掛死導致字幕永久卡住） | P1 |
 
 ### 2.2 非功能需求
 
@@ -253,7 +255,7 @@ interface TranslationEngine {
 
 | 里程碑 | 範圍 | 說明 |
 |---|---|---|
-| **M1 — 原生字幕翻譯** | F-01, F-02, F-03, F-04, F-05, F-10, F-11 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 + 本地 LLM 服務兼容 + 翻譯失敗診斷可見性。風險低，優先交付。 |
+| **M1 — 原生字幕翻譯** | F-01, F-02, F-03, F-04, F-05, F-10, F-11, F-12, F-13 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 + 本地 LLM 服務兼容 + 翻譯失敗診斷可見性 + 調試日誌門控 + 字幕翻譯延遲優化。風險低，優先交付。 |
 | **M2 — 實時擷取 ASR** | F-06, F-07 | 三級策略：tabCapture 音頻 → ASR（雲端/本地可配）→ 翻譯 → 顯示。打通實時管線。 |
 | **M3 — 預緩衝提前處理** | F-08 | 二級策略（高風險優化）：在 M2 管線上做音頻來源前置；失效自動降級 M2。 |
 | **M4 — 體驗與穩定性** | F-09 及優化 | 多語言優化、字幕樣式、性能檔位、YouTube 改版適配加固。 |

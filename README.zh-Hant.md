@@ -22,6 +22,8 @@ English version: [README.md](./README.md).
 - **可靠性加固的內容腳本**——宿主方法綁定（避免 "Illegal invocation"）、配置熱重載時無訂閱洩漏、外部 JSON 容錯解析（詳見 `AGENTS.md` §5）。
 - **翻譯失敗診斷可見性**——翻譯降級/錯誤不再被管線無聲吞掉：失敗原因持久化至 `chrome.storage.local`，並在 Popup 的「最近失敗」行**常駐顯示**（無記錄時顯示「無」，確保可見性）；同時輸出 `console.warn` 麵包屑。**當無任何字幕策略可接管時**（例如視頻原生字幕軌抓取失敗——與「翻譯失敗」不同），也會帶原因報告，讓「抓不到字幕」與「翻譯失敗」可區分。Popup 新增**「測試連接」按鈕**——一鍵向配置端點發最小實時請求，驗證端點可達/模型名/響應結構，直接終結「配置對不對」的猜測。Popup 的翻譯狀態行也會顯示**實際生效的模型名**（本地模式），便於確認保存後 storage 是否真正更新。**所有外部接口調用節點**都留下**證據化診斷**而非猜測：字幕拉取失敗會報告實際 HTTP 狀態、content-type 與 body 片段；LLM 響應異常（body 非 JSON、`choices` 缺失/為空）會被當作失敗並發降級事件留痕，而非靜默回退原文；播放器 15 秒仍未出現會發 `player-not-found` 錯誤；Popup、Options 頁與 service worker 的配置/密鑰讀取失敗都會明確顯示而非無聲失效。
 - **翻譯失敗降級顯示原文**——當 LLM 翻譯服務失敗時（如連接中斷、超時），擴充**降級顯示原文字幕**而非完全不顯示。同時發送 `engine-degraded` 事件，Popup 可顯示降級原因。用戶寧可看到原文字幕也不願看到空白。
+- **低延遲分塊翻譯**——長視頻按塊翻譯（`CHUNK_SIZE=60` 段）並漸進流式交付：首塊數秒內出現、後續塊增量更新覆蓋層，而非等待整片翻譯數分鐘。塊結果以 LRU 快取（上限 100 條，key = 模型 + 語言 + 內容哈希），重播、切換語言、重載分頁均免重複請求；引擎配置變更時快取自動失效。瞬態失敗（網絡中止、超時、HTTP 429/5xx、body 讀取或 JSON 錯誤）以退避重試 ≤2 次，重試耗盡的塊**回退顯示原文**而不阻塞其餘塊；永久錯誤（如 HTTP 400、響應結構異常）則 fail-fast，觸發管線降級並留下可追蹤診斷。
+- **調試日誌門控**——console 日誌分為八個分類（overlay / llm / capture / pipeline / strategy / content / bridge / interceptor），**預設全部關閉**；排查問題時在「設定 → 調試日誌」按需開啟個別分類。輸出行帶 `[AI_Trans:diag][分類]` 前綴便於過濾。錯誤與降級信息**不受門控**——始終顯示，即使關閉調試日誌，「最近失敗」行與 `console.warn` 麵包屑仍可靠可見。
 
 ### 待實現（後續里程碑）
 
@@ -110,6 +112,7 @@ npm run test:e2e     # Playwright E2E（需先構建）
 - **ASR 引擎**（供未來 M2）：本地 Whisper / 雲端，模型檔位，端點。
 - **目標語言**、**顯示模式**（單語/雙語）、**性能檔位**。
 - **字幕樣式**：字號、顏色、背景。
+- **調試日誌**（用於排查問題）：按需開啟個別分類（overlay / llm / capture / pipeline / strategy / content / bridge / interceptor）。預設全部關閉。
 
 API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 
@@ -132,7 +135,7 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 
 完整設計見 [`doc/`](./doc/)：
 
-- `doc/requirements-design.md` — 需求、功能（F-01…F-09）、里程碑。
+- `doc/requirements-design.md` — 需求、功能（F-01…F-13）、里程碑。
 - `doc/architecture-design.md` — 端口、適配器、數據結構、實時性分析。
 - `doc/system-test-design.md` — 測試策略、分層用例（TC-*）。
 - `doc/project-progress.md` — 實時進度表。

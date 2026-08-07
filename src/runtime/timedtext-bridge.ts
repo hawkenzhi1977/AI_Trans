@@ -10,6 +10,7 @@
 //
 // 與內容腳本的生命週期綁定：start 注入並啟動輪詢、stop/dispose 清理（R4 洩漏零容忍）。
 import type { TimedTextCapture } from './yt-timedtext-interceptor';
+import { diagLog } from '../infrastructure/debug-log';
 
 /** content-script 注入 MAIN world 腳本時使用的 runtime URL（web_accessible_resources 聲明）。 */
 export const INTERCEPTOR_SCRIPT_URL = 'src/runtime/yt-timedtext-interceptor.js';
@@ -73,10 +74,10 @@ export class TimedTextBridge {
     * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
     */
    waitForCapture(timeoutMs: number, expectedVideoId?: string): Promise<TimedTextCapture | null> {
-     console.log('[AI_Trans Bridge] waitForCapture called, timeoutMs:', timeoutMs, 'expectedVideoId:', expectedVideoId, 'hasLatest:', !!this.latest);
+     diagLog('bridge', 'waitForCapture called, timeoutMs:', timeoutMs, 'expectedVideoId:', expectedVideoId, 'hasLatest:', !!this.latest);
      const current = this.latest;
      if (current && this.matchesVideo(current, expectedVideoId)) {
-       console.log('[AI_Trans Bridge] waitForCapture: latest available, returning immediately');
+       diagLog('bridge', 'waitForCapture: latest available, returning immediately');
        return Promise.resolve(current);
      }
      return new Promise<TimedTextCapture | null>((resolve) => {
@@ -85,7 +86,7 @@ export class TimedTextBridge {
          if (settled) return;
          settled = true;
          this.waiters.delete(onCapture);
-         console.log('[AI_Trans Bridge] waitForCapture: timeout after', timeoutMs, 'ms, returning null');
+          diagLog('bridge', 'waitForCapture: timeout after', timeoutMs, 'ms, returning null');
          // §5.4/M1-45：超時只解除本次等待，不釋放輪詢器引用（輪詢器由
          // ensurePolling/stop 統一管理；此處置 null 會讓 stop 無法清理 interval）。
          resolve(null);
@@ -97,7 +98,7 @@ export class TimedTextBridge {
          settled = true;
          clearTimeout(timer);
          this.waiters.delete(onCapture);
-         console.log('[AI_Trans Bridge] waitForCapture: capture received, videoId:', latest.videoId);
+          diagLog('bridge', 'waitForCapture: capture received, videoId:', latest.videoId);
          resolve(latest);
        };
        // 註冊等待者（message 事件與輪詢都會通知）。

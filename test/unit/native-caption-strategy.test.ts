@@ -121,4 +121,57 @@ describe('NativeCaptionStrategy 診斷可見性（§5.6）', () => {
     await s.run(ctx, (e) => events.push(e));
     expect(events.some((e) => e.type === 'segments-ready')).toBe(true);
   });
+
+  it('[M1-52] 引擎支持 translateStream 時走流式：首塊 segments-ready，後續 segments-updated', async () => {
+    const s = new NativeCaptionStrategy();
+    const ctx = makeCtx(mockPlatform('tracks'), []);
+    ctx.translation = {
+      engineId: 'llm',
+      location: 'local' as const,
+      translate: async () => ({ segments: [], targetLang: 'zh-Hant' }),
+      // 模擬分塊漸進：連續 emit 兩次累計結果。
+      translateStream: async (
+        input: { segments: SubtitleSegment[]; targetLang: string },
+        emit: (r: { segments: SubtitleSegment[]; engineId: string; degraded: boolean }) => void
+      ) => {
+        const first = input.segments.map((seg) => ({ ...seg, translatedText: '第一塊', targetLang: 'zh-Hant' }));
+        emit({ segments: first, engineId: 'llm', degraded: false });
+        const second = input.segments.map((seg) => ({ ...seg, translatedText: '第二塊', targetLang: 'zh-Hant' }));
+        emit({ segments: second, engineId: 'llm', degraded: false });
+      },
+    } as TranslationProvider;
+
+    const events: PipelineEvent[] = [];
+    await s.run(ctx, (e) => events.push(e));
+
+    const ready = events.filter((e) => e.type === 'segments-ready');
+    const updated = events.filter((e) => e.type === 'segments-updated');
+    expect(ready).toHaveLength(1);
+    expect(updated).toHaveLength(1);
+    // 首次為 ready（第一塊），後續為 updated（第二塊）。
+    expect((ready[0] as { segments: SubtitleSegment[] }).segments[0].translatedText).toBe('第一塊');
+    expect((updated[0] as { segments: SubtitleSegment[] }).segments[0].translatedText).toBe('第二塊');
+  });
+
+  it('[M1-52] 流式路徑 stop() 後不再 emit（訂閱清理 §5.4）', async () => {
+    const s = new NativeCaptionStrategy();
+    const ctx = makeCtx(mockPlatform('tracks'), []);
+    ctx.translation = {
+      engineId: 'llm',
+      location: 'local' as const,
+      translate: async () => ({ segments: [], targetLang: 'zh-Hant' }),
+      translateStream: async (
+        input: { segments: SubtitleSegment[]; targetLang: string },
+        emit: (r: { segments: SubtitleSegment[]; engineId: string; degraded: boolean }) => void
+      ) => {
+        s.stop(); // 模擬翻譯途中被停止（SPA 導航/改配置 restart）。
+        emit({ segments: input.segments, engineId: 'llm', degraded: false });
+      },
+    } as TranslationProvider;
+
+    const events: PipelineEvent[] = [];
+    await s.run(ctx, (e) => events.push(e));
+    // stopped 後 emit 被忽略：無 segments-ready/updated。
+    expect(events.some((e) => e.type === 'segments-ready' || e.type === 'segments-updated')).toBe(false);
+  });
 });

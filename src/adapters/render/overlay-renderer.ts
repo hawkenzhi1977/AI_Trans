@@ -1,20 +1,26 @@
 import type { RenderableCue } from '../../domain/ports/subtitle-renderer';
 import type { SubtitleRenderer } from '../../domain/ports/subtitle-renderer';
 import type { Millis } from '../../domain/models/subtitle';
+import { diagLog } from '../../infrastructure/debug-log';
 
 /**
  * 覆蓋層字幕渲染器——注入播放器容器上方的透明層。
  * 支持單語/雙語、provisional 原地更新、rAF 對齊播放時間。
  */
+const NO_CUE_LOG_INTERVAL_MS = 5_000;
+
 export class OverlayRenderer implements SubtitleRenderer {
   private root: HTMLElement | null = null;
   private style: Record<string, string> = {};
   private cues: RenderableCue[] = [];
   private currentId: string | null = null;
+  // 日誌降壓欄位：避免每幀列印日誌造成控制台洪水洪災
+  private lastLoggedCueCount = -1;
+  private lastLoggedActiveId: string | null = null;
+  private lastNoCueLogTime = 0;
 
   mount(container: HTMLElement, style: Record<string, string> = {}): void {
-    console.log('[AI_Trans:diag] overlay-renderer: mount() called, container:', container.tagName, container.className);
-    console.log('[AI_Trans:diag] overlay-renderer: container computed position:', getComputedStyle(container).position, 'overflow:', getComputedStyle(container).overflow);
+    diagLog('overlay', 'mount() called, container:', container.tagName, container.className);
     this.style = style;
 
     const root = document.createElement('div');
@@ -40,11 +46,15 @@ export class OverlayRenderer implements SubtitleRenderer {
 
     container.appendChild(root);
     this.root = root;
-    console.log('[AI_Trans:diag] overlay-renderer: mount() completed, root appended to container');
+    diagLog('overlay', 'mount() completed, root appended to container');
   }
 
   render(cues: RenderableCue[], currentTime: Millis): void {
-    console.log('[AI_Trans:diag] overlay-renderer: render() called, cues:', cues.length, 'currentTime:', currentTime);
+    // 降壓：只在 cues 數量變化時才記錄 render() 調用
+    if (cues.length !== this.lastLoggedCueCount) {
+      diagLog('overlay', 'render() called, cues:', cues.length, 'currentTime:', currentTime);
+      this.lastLoggedCueCount = cues.length;
+    }
     this.cues = cues;
     this.draw(currentTime);
   }
@@ -72,20 +82,28 @@ export class OverlayRenderer implements SubtitleRenderer {
       (c) => currentTime >= c.start && currentTime < c.end
     );
     if (active) {
-      console.log('[AI_Trans:diag] overlay-renderer: draw() found active cue:', active.id, 'start:', active.start, 'end:', active.end);
+      // 降壓：只在切換到新 cue 時才記錄
+      if (active.id !== this.lastLoggedActiveId) {
+        diagLog('overlay', 'draw() found active cue:', active.id, 'start:', active.start, 'end:', active.end);
+        this.lastLoggedActiveId = active.id;
+      }
       this.currentId = active.id;
       this.renderActive(active);
     } else {
-      console.log('[AI_Trans:diag] overlay-renderer: draw() no active cue found for currentTime:', currentTime, 'cues:', this.cues.length);
-      if (this.cues.length > 0) {
-        console.log('[AI_Trans:diag] overlay-renderer: first cue range:', this.cues[0].start, '-', this.cues[0].end);
+      // 降壓：沒有 active cue 時，每 5 秒最多記錄一次
+      const now = Date.now();
+      if (now - this.lastNoCueLogTime >= NO_CUE_LOG_INTERVAL_MS) {
+        diagLog('overlay', 'draw() no active cue for currentTime:', currentTime, 'cues:', this.cues.length);
+        if (this.cues.length > 0) {
+          diagLog('overlay', 'first cue range:', this.cues[0].start, '-', this.cues[0].end);
+        }
+        this.lastNoCueLogTime = now;
       }
       this.clear();
     }
   }
 
   private renderActive(cue: RenderableCue): void {
-    console.log('[AI_Trans:diag] overlay-renderer: renderActive() called, root exists:', !!this.root);
     if (!this.root) return;
     const bilingual = this.style['display-mode'] !== 'mono';
     const parts: string[] = [];
@@ -95,26 +113,6 @@ export class OverlayRenderer implements SubtitleRenderer {
     parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
     this.root.innerHTML = parts.join('<br/>');
     this.root.dataset.provisional = String(cue.provisional);
-    
-    // 詳細診斷
-    const rect = this.root.getBoundingClientRect();
-    const computed = getComputedStyle(this.root);
-    console.log('[AI_Trans:diag] overlay-renderer: === RENDER DIAGNOSTICS ===');
-    console.log('[AI_Trans:diag] overlay-renderer: innerHTML:', this.root.innerHTML.substring(0, 150));
-    console.log('[AI_Trans:diag] overlay-renderer: bounding rect:', { top: rect.top, left: rect.left, width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right });
-    console.log('[AI_Trans:diag] overlay-renderer: computed styles:', {
-      display: computed.display,
-      visibility: computed.visibility,
-      opacity: computed.opacity,
-      zIndex: computed.zIndex,
-      position: computed.position,
-      pointerEvents: computed.pointerEvents,
-      color: computed.color,
-      fontSize: computed.fontSize,
-      backgroundColor: computed.backgroundColor
-    });
-    console.log('[AI_Trans:diag] overlay-renderer: parent element:', this.root.parentElement?.tagName, this.root.parentElement?.className?.substring(0, 50));
-    console.log('[AI_Trans:diag] overlay-renderer: === END DIAGNOSTICS ===');
   }
 
   private clear(): void {

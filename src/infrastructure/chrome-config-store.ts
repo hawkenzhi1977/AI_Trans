@@ -52,6 +52,8 @@ export class ChromeStorageConfigStore implements ConfigStore, ApiKeyStore {
       ...patch,
       translation: { ...base.translation, ...(patch.translation ?? {}) },
       asr: { ...base.asr, ...(patch.asr ?? {}) },
+      // M1-51：debugLog 深合併——舊配置缺 debugLog 時補全鍵，避免 undefined 崩壞。
+      debugLog: { ...DEFAULT_CONFIG.debugLog, ...(patch.debugLog ?? {}) },
     };
   }
 }

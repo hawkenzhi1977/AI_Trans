@@ -1,10 +1,26 @@
 // src/domain/models/config.ts
+var DEBUG_LOG_OFF = {
+  overlay: false,
+  llm: false,
+  capture: false,
+  pipeline: false,
+  strategy: false,
+  content: false,
+  bridge: false,
+  interceptor: false
+};
 var DEFAULT_CONFIG = {
   translation: { type: "cloud-llm", fallbackType: "mt" },
   asr: { type: "local-whisper", modelTier: "base" },
   targetLang: "zh-Hant",
   displayMode: "bilingual",
-  performanceProfile: "balanced"
+  performanceProfile: "balanced",
+  subtitleStyle: {
+    "font-size": "24px",
+    color: "#ffffff",
+    "background-color": "rgba(32, 32, 32, 0.7)"
+  },
+  debugLog: DEBUG_LOG_OFF
 };
 
 // src/infrastructure/chrome-config-store.ts
@@ -45,7 +61,9 @@ var ChromeStorageConfigStore = class _ChromeStorageConfigStore {
       ...base,
       ...patch,
       translation: { ...base.translation, ...patch.translation ?? {} },
-      asr: { ...base.asr, ...patch.asr ?? {} }
+      asr: { ...base.asr, ...patch.asr ?? {} },
+      // M1-51：debugLog 深合併——舊配置缺 debugLog 時補全鍵，避免 undefined 崩壞。
+      debugLog: { ...DEFAULT_CONFIG.debugLog, ...patch.debugLog ?? {} }
     };
   }
 };

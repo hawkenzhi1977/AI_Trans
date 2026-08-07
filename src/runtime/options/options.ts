@@ -1,8 +1,8 @@
 // Options 頁面邏輯：加載/保存 EngineConfig，密鑰寫入獨立安全 key（apiKeyRef 指向）。
 // 擴充頁面環境：直接使用 chrome.storage，不經消息總線。
 import { ChromeStorageConfigStore } from '../../infrastructure/chrome-config-store';
-import type { EngineConfig } from '../../domain/models/config';
-import { DEFAULT_CONFIG, PROFILE_DEFAULTS } from '../../domain/models/config';
+import type { EngineConfig, DebugLogCategory } from '../../domain/models/config';
+import { DEFAULT_CONFIG, PROFILE_DEFAULTS, DEBUG_LOG_OFF } from '../../domain/models/config';
 
 const store = new ChromeStorageConfigStore();
 
@@ -12,11 +12,81 @@ function $<T extends HTMLElement>(id: string): T {
   return el as T;
 }
 
+/** 預設背景值映射 */
+const BG_PRESETS: Record<string, string> = {
+  none: 'transparent',
+  gray: 'rgba(32, 32, 32, 0.7)',
+  black: 'rgba(0, 0, 0, 0.7)',
+};
+
+/** 將 rgba 字符串解析為 {color, opacity}，失敗返回 null */
+function parseRgba(value: string): { color: string; opacity: number } | null {
+  const match = value.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/);
+  if (!match) return null;
+  const r = parseInt(match[1], 10);
+  const g = parseInt(match[2], 10);
+  const b = parseInt(match[3], 10);
+  const a = match[4] ? parseFloat(match[4]) : 1;
+  const hex = '#' + [r, g, b].map((c) => c.toString(16).padStart(2, '0')).join('');
+  return { color: hex, opacity: Math.round(a * 100) };
+}
+
+/** 根據背景值匹配預設，無匹配返回 'custom' */
+function matchPreset(value: string): string {
+  for (const [key, preset] of Object.entries(BG_PRESETS)) {
+    if (value === preset) return key;
+  }
+  return 'custom';
+}
+
+/** 調試日誌分類 → Options 頁面 checkbox 元素 id（M1-51，順序與 UI 展示對齊）。 */
+const DEBUG_CATEGORY_IDS: Array<[DebugLogCategory, string]> = [
+  ['overlay', 'dbg-overlay'],
+  ['llm', 'dbg-llm'],
+  ['capture', 'dbg-capture'],
+  ['pipeline', 'dbg-pipeline'],
+  ['strategy', 'dbg-strategy'],
+  ['content', 'dbg-content'],
+  ['bridge', 'dbg-bridge'],
+  ['interceptor', 'dbg-interceptor'],
+];
+
+/** 讀取調試日誌 checkbox 狀態。 */
+function readDebugLog(): EngineConfig['debugLog'] {
+  const out = { ...DEBUG_LOG_OFF };
+  for (const [category, id] of DEBUG_CATEGORY_IDS) {
+    out[category] = $<HTMLInputElement>(id).checked;
+  }
+  return out;
+}
+
+/** 回填調試日誌 checkbox 狀態。 */
+function fillDebugLog(config: EngineConfig['debugLog']): void {
+  const merged = { ...DEBUG_LOG_OFF, ...config };
+  for (const [category, id] of DEBUG_CATEGORY_IDS) {
+    $<HTMLInputElement>(id).checked = merged[category];
+  }
+}
+
 function readForm(): EngineConfig {
   const translationType = $<HTMLSelectElement>('translation-type').value as EngineConfig['translation']['type'];
   const asrType = $<HTMLSelectElement>('asr-type').value as EngineConfig['asr']['type'];
   const modelTier = $<HTMLSelectElement>('asr-tier').value as 'tiny' | 'base' | 'small';
   const profile = $<HTMLSelectElement>('performance-profile').value as EngineConfig['performanceProfile'];
+
+  // 背景色：根據預設選擇決定
+  const preset = $<HTMLSelectElement>('style-bg-preset').value;
+  let bgColor: string;
+  if (preset === 'custom') {
+    const color = $<HTMLInputElement>('style-bg-color').value;
+    const opacity = parseInt($<HTMLInputElement>('style-bg-opacity').value, 10);
+    const r = parseInt(color.slice(1, 3), 16);
+    const g = parseInt(color.slice(3, 5), 16);
+    const b = parseInt(color.slice(5, 7), 16);
+    bgColor = `rgba(${r}, ${g}, ${b}, ${opacity / 100})`;
+  } else {
+    bgColor = BG_PRESETS[preset] ?? 'transparent';
+  }
 
   // 性能檔位會覆蓋 asr/displayMode 默認（見 PROFILE_DEFAULTS），但保留用戶手動微調。
   const config: EngineConfig = {
@@ -37,8 +107,9 @@ function readForm(): EngineConfig {
     subtitleStyle: {
       'font-size': $<HTMLInputElement>('style-font-size').value,
       color: $<HTMLInputElement>('style-color').value,
-      'background-color': $<HTMLInputElement>('style-bg').value || 'transparent',
+      'background-color': bgColor,
     },
+    debugLog: readDebugLog(),
   };
 
   // 檔位默認值合併：未手動指定 tier 時依檔位。
@@ -65,7 +136,25 @@ function fillForm(config: EngineConfig): void {
   $<HTMLSelectElement>('performance-profile').value = config.performanceProfile;
   $<HTMLInputElement>('style-font-size').value = config.subtitleStyle?.['font-size'] ?? '24px';
   $<HTMLInputElement>('style-color').value = config.subtitleStyle?.color ?? '#ffffff';
-  $<HTMLInputElement>('style-bg').value = config.subtitleStyle?.['background-color'] ?? 'transparent';
+
+  // 背景色：匹配預設或設為自定義
+  const bgColor = config.subtitleStyle?.['background-color'] ?? 'transparent';
+  const preset = matchPreset(bgColor);
+  $<HTMLSelectElement>('style-bg-preset').value = preset;
+
+  const customArea = document.getElementById('style-bg-custom');
+  if (preset === 'custom') {
+    const parsed = parseRgba(bgColor);
+    if (parsed) {
+      $<HTMLInputElement>('style-bg-color').value = parsed.color;
+      $<HTMLInputElement>('style-bg-opacity').value = String(parsed.opacity);
+      $<HTMLSpanElement>('style-bg-opacity-val').textContent = String(parsed.opacity);
+    }
+    if (customArea) customArea.style.display = '';
+  } else {
+    if (customArea) customArea.style.display = 'none';
+  }
+  fillDebugLog(config.debugLog);
 }
 
 async function loadKeysIntoForm(): Promise<void> {
@@ -125,6 +214,18 @@ async function init(): Promise<void> {
       $<HTMLSelectElement>('asr-tier').value = prof.asr.modelTier ?? 'base';
       $<HTMLSelectElement>('display-mode').value = prof.displayMode;
     }
+  });
+
+  // 背景預設切換：控制自定義區域顯示
+  const customArea = document.getElementById('style-bg-custom');
+  $<HTMLSelectElement>('style-bg-preset').addEventListener('change', () => {
+    const preset = $<HTMLSelectElement>('style-bg-preset').value;
+    if (customArea) customArea.style.display = preset === 'custom' ? '' : 'none';
+  });
+
+  // 透明度滑塊：即時顯示數值
+  $<HTMLInputElement>('style-bg-opacity').addEventListener('input', () => {
+    $<HTMLSpanElement>('style-bg-opacity-val').textContent = $<HTMLInputElement>('style-bg-opacity').value;
   });
 
   $<HTMLButtonElement>('btn-save').addEventListener('click', () => void save());

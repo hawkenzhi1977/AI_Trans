@@ -1,6 +1,7 @@
 import type { PipelineEvent } from '../../domain/models/events';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
 import type { CaptionStrategy, StrategyContext } from '../../domain/ports/caption-strategy';
+import { diagLog } from '../../infrastructure/debug-log';
 
 /**
  * 一級策略：原生字幕。抓取平台原生字幕軌 → 翻譯 → 推送 segments-ready。
@@ -50,24 +51,50 @@ export class NativeCaptionStrategy implements CaptionStrategy {
       return;
     }
 
-    console.log('[AI_Trans:diag] native-strategy: track.fetch() starting');
+    diagLog('strategy', 'track.fetch() starting');
     const segments = await track.fetch();
-    console.log('[AI_Trans:diag] native-strategy: track.fetch() returned', segments.length, 'segments');
+    diagLog('strategy', 'track.fetch() returned', segments.length, 'segments');
     if (this.stopped) return;
 
     try {
-      console.log('[AI_Trans:diag] native-strategy: translation starting, targetLang:', ctx.config.targetLang);
+      diagLog('strategy', 'translation starting, targetLang:', ctx.config.targetLang);
+      // M1-52：引擎支持流式（分塊漸進）時優先走流式——首塊完成即 emit segments-ready，
+      // 後續塊累計替換 emit segments-updated，渲染層 5-10s 內先見首塊（降低感知延遲）。
+      // 無流式能力的引擎（如 MT stub）退回落原非流式路徑。
+      if (ctx.translation.translateStream) {
+        let firstEmit = true;
+        diagLog('strategy', 'using translateStream (chunked progressive)');
+        await ctx.translation.translateStream(
+          { segments, targetLang: ctx.config.targetLang },
+          (result) => {
+            if (this.stopped) return;
+            if (firstEmit) {
+              firstEmit = false;
+              diagLog('strategy', 'emit segments-ready,', result.segments.length, 'segments');
+              emit({ type: 'segments-ready', segments: result.segments });
+            } else {
+              diagLog('strategy', 'emit segments-updated,', result.segments.length, 'segments');
+              emit({ type: 'segments-updated', segments: result.segments });
+            }
+          }
+        );
+        if (this.stopped) return;
+        return;
+      }
+
       const result = await ctx.translation.translate({
         segments,
         targetLang: ctx.config.targetLang,
       });
-      console.log('[AI_Trans:diag] native-strategy: translation succeeded,', result.segments.length, 'translated segments');
+      diagLog('strategy', 'translation succeeded,', result.segments.length, 'translated segments');
       if (this.stopped) return;
 
-      console.log('[AI_Trans:diag] native-strategy: emitting segments-ready');
+      diagLog('strategy', 'emitting segments-ready');
       emit({ type: 'segments-ready', segments: result.segments });
     } catch (err) {
-      console.log('[AI_Trans:diag] native-strategy: translation FAILED:', err instanceof Error ? err.message : String(err));
+      // §5.6 關鍵節點：翻譯失敗必須留痕——diagLog('strategy') 為流程級門控日誌，
+      // 但同時發出 engine-degraded 降級事件（recordDiagnostic 無條件落盤 + console.warn）。
+      diagLog('strategy', 'translation FAILED:', err instanceof Error ? err.message : String(err));
       // 翻譯失敗時顯示原文字幕作為降級（§5.6：不靜默失敗）
       if (this.stopped) return;
       emit({

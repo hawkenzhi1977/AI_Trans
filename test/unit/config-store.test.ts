@@ -72,4 +72,18 @@ describe('ChromeStorageConfigStore', () => {
     expect(config.asr.endpoint).toBe('https://asr.example.com');
     expect(await store.getApiKey('asr')).toBe('key-asr');
   });
+
+  it('M1-51：debugLog 深合併——部分旗標與默認補全共存，舊配置缺 debugLog 不崩壞', async () => {
+    const store = new ChromeStorageConfigStore();
+    // 部分旗標寫入：其餘分類由 DEFAULT_CONFIG 補全為 false。
+    await store.set({ debugLog: { ...DEFAULT_CONFIG.debugLog, llm: true } });
+    let config = await store.get();
+    expect(config.debugLog.llm).toBe(true);
+    expect(config.debugLog.overlay).toBe(false);
+    // 舊版本存儲（無 debugLog 鍵）讀取後鍵被補全。
+    memory.set('engineConfig', { targetLang: 'en' });
+    config = await store.get();
+    expect(config.debugLog).toEqual(DEFAULT_CONFIG.debugLog);
+    expect(config.targetLang).toBe('en');
+  });
 });

@@ -4,6 +4,7 @@ import { Orchestrator } from '../application';
 import { buildDefaultRegistry } from './composition';
 import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store';
 import { recordDiagnostic } from '../infrastructure/diagnostics';
+import { diagLog, setDebugFlags } from '../infrastructure/debug-log';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import { TimedTextBridge } from './timedtext-bridge';
 import { isWatchPage } from './watch-url';
@@ -43,6 +44,8 @@ class SubtitleController {
   private unsubscribeConfig: (() => void) | null = null;
   private pendingMountObserver: MutationObserver | null = null;
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
+  // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
+  private debugFlagRelayTimer: ReturnType<typeof setInterval> | null = null;
   // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
   // 偵測 URL 的 v 參數變化後熱重啟字幕管線。dispose 時必須解除/恢復（R4）。
   private readonly onUrlChangedBound: () => void;
@@ -94,6 +97,10 @@ class SubtitleController {
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
   async start(): Promise<void> {
+    // M1-51：套用調試日誌分類開關（content-script 側），並中繼給 MAIN world 攔截器
+    // （interceptor 無法訪問 chrome.storage，靠 CustomEvent 同步旗標）。
+    this.applyDebugFlags();
+
     // MAIN world 攔截器：hook 播放器 XHR/fetch 捕獲 timedtext 響應（含 pot）。
     // 必須在字幕管線請求前注入並啟動監聽，否則播放器先發請求時捕獲會漏；
     // 提前到 ensureMounted 之前，讓攔截器儘早安裝（M1-43）。
@@ -109,7 +116,7 @@ class SubtitleController {
         detail: { targetLang: this.config.targetLang }
       })
     );
-    console.log('[AI_Trans] Sent set-target-lang message to MAIN world:', this.config.targetLang);
+    diagLog('content', 'Sent set-target-lang message to MAIN world:', this.config.targetLang);
 
     // M1-47：讀取當前 URL（會話恢復後 tab 先為首頁，之後 SPA 導航到 /watch）。
     // 非 watch 頁時靜默返回（不發降級事件），保持攔截器與 SPA 監聽存活，
@@ -166,6 +173,41 @@ class SubtitleController {
     return globalThis.location?.href ?? this.url;
   }
 
+  /**
+   * M1-51：套用調試日誌分類開關。
+   * - content-script（isolated world）：直接 setDebugFlags。
+   * - MAIN world 攔截器：無法訪問 chrome.storage，通過 CustomEvent 中繼旗標
+   *   （與 set-target-lang 同一模式，跨 world 通信走 DOM 事件——M1-47 教訓）。
+   *   攔截器 `<script>` 異步加載可能晚於首次 dispatch（監聽器未就位），
+   *   故短窗口內（6 × 0.5s）周期重發，確保晚就位的攔截器也能收到（M1-46 重播教訓）。
+   */
+  private applyDebugFlags(): void {
+    setDebugFlags(this.config.debugLog);
+    const dispatch = () =>
+      document.dispatchEvent(
+        new CustomEvent('ai-trans:set-debug-flags', {
+          detail: { flags: this.config.debugLog },
+        })
+      );
+    dispatch();
+    if (this.debugFlagRelayTimer !== null) {
+      clearInterval(this.debugFlagRelayTimer);
+      this.debugFlagRelayTimer = null;
+    }
+    let relayed = 0;
+    // R4：重播定時器句柄留存，重發 6 次（3s）後自清；restart/stop 會清理。
+    this.debugFlagRelayTimer = setInterval(() => {
+      relayed += 1;
+      dispatch();
+      if (relayed >= 6) {
+        if (this.debugFlagRelayTimer !== null) {
+          clearInterval(this.debugFlagRelayTimer);
+          this.debugFlagRelayTimer = null;
+        }
+      }
+    }, 500);
+  }
+
   /** 配置變更後熱重啟：停止舊管線 → 讀新配置 → 重新啟動。 */
   async restart(): Promise<void> {
     this.stop();
@@ -181,6 +223,11 @@ class SubtitleController {
     if (this.mountWaitTimer !== null) {
       clearTimeout(this.mountWaitTimer);
       this.mountWaitTimer = null;
+    }
+    // M1-51：調試旗標中繼重播定時器（§5.4：註冊必配解除）。
+    if (this.debugFlagRelayTimer !== null) {
+      clearInterval(this.debugFlagRelayTimer);
+      this.debugFlagRelayTimer = null;
     }
     // R4：解除本控制器持有的 observePlayback 訂閱（Orchestrator 內另有一份自行清理）。
     this.unsubscribePlayback?.();
@@ -261,7 +308,7 @@ class SubtitleController {
 
   private onEvent(e: PipelineEvent): void {
     if (e.type === 'segments-ready' || e.type === 'segments-updated') {
-      console.log('[AI_Trans:diag] content-script: onEvent received', e.type, 'with', e.segments.length, 'segments');
+      diagLog('content', 'onEvent received', e.type, 'with', e.segments.length, 'segments');
       this.cues = e.segments.map((s) => ({
         id: s.id,
         sourceText: s.sourceText,
@@ -270,11 +317,11 @@ class SubtitleController {
         start: s.start,
         end: s.end,
       }));
-      console.log('[AI_Trans:diag] content-script: cues updated, count:', this.cues.length, 'calling scheduleDraw');
+      diagLog('content', 'cues updated, count:', this.cues.length, 'calling scheduleDraw');
       this.scheduleDraw();
       return;
     }
-    console.log('[AI_Trans:diag] content-script: onEvent received', e.type, e.type === 'engine-degraded' ? (e as any).reason : '');
+    diagLog('content', 'onEvent received', e.type, e.type === 'engine-degraded' ? e.reason : '');
     // 降級/錯誤事件：持久化診斷 + console 麵包屑，讓「字幕沒出來」的原因可被用戶查詢。
     // 異步寫入不阻塞事件處理；recordDiagnostic 內部已 try/catch 守護（§5.7）。
     void recordDiagnostic(e);
@@ -332,8 +379,8 @@ class SubtitleController {
     this.renderer.mount(player, {
       'font-size': this.config.subtitleStyle?.['font-size'] ?? '24px',
       color: this.config.subtitleStyle?.color ?? '#fff',
-      'text-shadow': '0 1px 3px rgba(0,0,0,.8)',
-      'background-color': this.config.subtitleStyle?.['background-color'] ?? 'transparent',
+      'text-shadow': '0 0 4px #000, 0 0 2px #000',
+      'background-color': this.config.subtitleStyle?.['background-color'] ?? 'rgba(32, 32, 32, 0.7)',
       'display-mode': this.config.displayMode,
     });
     this.mounted = true;

@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-06（§7 補外部接口調用節點診斷全掃描補齊 M1-41：LLM 響應結構不靜默回退原文、timedtext 拉取三階段證據化診斷、播放器超時/video 缺失診斷、popup/options/service-worker storage 失敗可見、ChromeMessageBus catch 區分+dispose；並延續 F-11 診斷可見性；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制與 M1-43 捕獲時序修復：注入提前/等待捕獲窗口/雙 hook/stop 保留緩存；M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗；M1-46 攔截器重播 lastCapture 修復「捕獲早於 bridge 監聽器註冊」競態 + 放寬 timedtext hostname 匹配 + 調試輔助；**M1-47 消息通信從 postMessage 改為 CustomEvent 修復 isolated world 與 MAIN world 通信失敗 + 字幕模組驅動重試增強（MAX_RETRIES 20→60 + 立即觸發）+ 翻譯失敗降級顯示原文字幕**）
+> 最後更新：2026-08-07（**回填治理缺口 M1-48/M1-49/M1-50**：§7.5 補 M1-48 LLM 直接 fetch 架構（service worker 代理移除、SW 精簡為配置管理、MV3 SW 不宜做實時代理教訓）、§7.6 補 M1-49 字幕背景樣式三重對比增強（F-09 實裝）與 M1-50 日誌降壓 + interceptor arraybuffer 支援、§12 里程碑映射增列 M1-48/49/50。並：§5.1 目錄樹 infrastructure 補 `debug-log.ts`、§6.6 配置補 `DebugLogCategory`/`DebugLogConfig`/`DEBUG_LOG_OFF`/`EngineConfig.debugLog` 與調試日誌門控機制（F-12/M1-51，CustomEvent 跨 world 同步、錯誤日誌不受門控）、§7.5 TranslationProvider 補字幕翻譯延遲優化（F-13/M1-52：CHUNK_SIZE=60 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取 100 條上限 + storage 變更失效、瞬態失敗重試 ≤2 次退避 + 永久失敗 fail-fast、AbortController 超時覆蓋 body 讀取）、§12 里程碑映射增列 F-12/F-13。先前：§7 補外部接口調用節點診斷全掃描補齊 M1-41；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制與 M1-43 捕獲時序修復；M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗；M1-46 攔截器重播 lastCapture 修復「捕獲早於 bridge 監聽器註冊」競態 + 放寬 timedtext hostname 匹配 + 調試輔助；**M1-47 消息通信從 postMessage 改為 CustomEvent 修復 isolated world 與 MAIN world 通信失敗 + 字幕模組驅動重試增強（MAX_RETRIES 20→60 + 立即觸發）+ 翻譯失敗降級顯示原文字幕**）
 
 ---
 
@@ -160,6 +160,8 @@ src/
 ├── infrastructure/              # 基礎設施
 │   ├── message-bus.ts
 │   ├── config-store.ts
+│   ├── debug-log.ts             # M1-51：中央調試日誌門控（八分類開關 + diagLog，content-script/Options/interceptor 共用）
+│   ├── diagnostics.ts           # F-11：診斷記錄（recordDiagnostic / readLastDiagnostic / formatDiagnostic）
 │   ├── vad.ts                   # 語音活動檢測
 │   └── perf/                    # 性能觀測（見第 11 章）
 │       └── metrics.ts
@@ -299,6 +301,25 @@ export interface PlaybackState {
 ### 6.6 配置
 
 ```typescript
+/** 調試日誌分類（M1-51）：每類一個布爾開關。 */
+export type DebugLogCategory =
+  | 'overlay'      // 覆蓋層渲染器（render/draw/cue 切換）
+  | 'llm'          // LLM 翻譯適配器（fetch/解析/快取）
+  | 'capture'      // timedtext 捕獲鏈路（bridge 等待/複用）與平台抓軌
+  | 'pipeline'     // 翻譯管線（primary/fallback 流轉）
+  | 'strategy'     // 字幕策略鏈（native-strategy 抓軌/翻譯/推送）
+  | 'content'      // content-script 總控（掛載/事件/熱重啟）
+  | 'bridge'       // timedtext 消息橋（waitForCapture/輪詢）
+  | 'interceptor'; // MAIN world 攔截器（XHR/fetch hook/字幕模組驅動）
+
+export type DebugLogConfig = Record<DebugLogCategory, boolean>;
+
+/** 全關的調試旗標（預設值）。 */
+export const DEBUG_LOG_OFF: DebugLogConfig = {
+  overlay: false, llm: false, capture: false, pipeline: false,
+  strategy: false, content: false, bridge: false, interceptor: false,
+};
+
 export interface EngineConfig {
   translation: {
     type: 'cloud-llm' | 'local' | 'mt';
@@ -317,8 +338,11 @@ export interface EngineConfig {
   displayMode: 'mono' | 'bilingual';
   performanceProfile: 'streaming' | 'balanced' | 'quality';
   subtitleStyle?: Record<string, string>;
+  debugLog: DebugLogConfig;   // M1-51：調試日誌分類開關（預設全關）
 }
 ```
+
+> **調試日誌門控（M1-51，F-12）**：`debugLog` 隨 `EngineConfig` 存 `chrome.storage.local`，content-script 啟動/熱重啟時讀取並 `setDebugFlags()` 寫入 `debug-log.ts` 模組內存旗標；**MAIN world 攔截器無法訪問 `chrome.storage`**，故 content-script 在設置旗標的同時 `dispatchEvent(new CustomEvent('ai-trans:set-debug-flags', { detail: { flags } }))`，interceptor 監聽後同步自己的旗標（與 M1-47 的 `set-target-lang` 同一跨 world 機制）。`diagLog(category, ...)` 僅在對應分類開啟時 `console.log`（前綴 `[AI_Trans:diag][category]`）；**錯誤/降級路徑（`console.warn` + `recordDiagnostic`）不經過門控**——§5.6 不靜默紅線不受調試開關影響。
 
 ### 6.7 管線事件
 
@@ -463,10 +487,19 @@ export interface TranslationProvider {
 
 **插拔說明**：LLM 與 MT 均實現此接口。混合策略在 `TranslationPipeline` 中組合：主用 LLM，失敗/超時降級 MT（見第 10 章）。
 
+> **LLM 翻譯直接 fetch 架構（M1-48，service worker 代理移除）**：初版 `LLMTranslationProvider` 經 `chrome.runtime.sendMessage` / port 走 service worker 代理翻譯，真實環境極慢（fetch 完成僅 19-25ms，但消息投遞延遲 138s+）。根因：MV3 service worker 被掛起後，`sendMessage`/`port.postMessage` 響應被延遲到 SW 喚醒（Chrome 對 SW 有 30s–5min 不等掛起策略），`alarms` keepalive + port 長連接均無法根治（SW 仍會被強制掛起）。**修復：content script 直接 fetch**——manifest 的 `host_permissions`（`http://127.0.0.1/*`、`http://localhost/*`）讓 ISOLATED world 的 content script 直接 fetch localhost 無需 CORS 預檢，且不受 SW 掛起影響。`LLMTranslationProvider` 改為 `globalThis.fetch` 直接調用；移除 service-worker `translation:fetch` 消息處理（~45 行）、`alarms` keepalive、`onConnect` port proxy（~60 行）與 manifest `alarms` 權限，SW 精簡為僅 `config:get`/`config:set` 配置管理。**架構教訓**：(1) MV3 SW 不適合做實時消息代理——SW 掛起不可控，任何依賴 SW 即時響應的設計都會在掛起後崩潰；(2) host_permissions 可讓 content script 繞過 CORS；(3) 架構選擇優先考慮「不依賴可掛起組件」。測試模式從 `fetchFn` 注入改為 `vi.stubGlobal('fetch', mockFetch)`。實測 `LLM: fetch completed in 23 ms`（原 138s+）。
+
 > **本地 LLM 服務兼容（F-10，實裝經驗）**：`LLMTranslationProvider` 同時服務雲端與本地 OpenAI 兼容服務（mlx/omlx/LM Studio/Ollama）。三個實裝要點：
 > 1. **端點規範化**：組裝時（`composition.ts` 的 `normalizeEndpoint`）兼容兩種填法——已含 `/chat/completions` 的完整路徑原樣保留；含 `/v{n}` 版本段（如 `http://127.0.0.1:8000/v1`）補 `/chat/completions`；裸 host 補 `/v1/chat/completions`；空值回落 OpenAI 默認端點。避免用戶填 Base URL 卻直接 POST 到 `/v1` 得 404。
 > 2. **reasoning `<think>` 剝離**：`stripReasoning` 在解析 `content` 前移除成對 `<think>...</think>`、殘留單邊標籤與前導空白。OpenAI 規範把思考放 `reasoning_content`（我們只讀 `content` 本不受影響），但部分本地 MLX 服務把 `<think>` 直接塞進 `content`，不剝離會污染 `ID<TAB>譯文` 行解析。
 > 3. **超時降級**：`timeoutMs`（默認 30_000）配 `AbortController`，reasoning 模型單次思考可能 30~40s，超時後拋錯，交由 `TranslationPipeline` 降級 MT 兜底（`finally` 清 timer，避免定時器洩漏——呼應 §7.1 R4）。本地 host 需 `manifest.json` 的 `host_permissions` 含 `http://127.0.0.1/*` 與 `http://localhost/*`。
+
+> **字幕翻譯延遲優化（M1-52，F-13）**：長視頻整片單次請求耗時數分鐘且任一失敗全片無字幕，`LLMTranslationProvider` 實裝五項機制：
+> 1. **分塊**：`chunkSegments()` 按 `CHUNK_SIZE=60` 段切片（空輸入返回 `[[]]` 保底），逐塊獨立請求——431 段 ≈ 8 塊，單塊 LLM 輸出控制在數十秒內。
+> 2. **漸進交付（流式）**：`translateStream()` 每塊完成即 emit **累計全量**譯文（`[...accumulated, ...chunkResult]`）——`NativeCaptionStrategy` 首個 emit 映射 `segments-ready`、後續映射 `segments-updated`，渲染層 5-10s 內先見首塊、後續塊增量替換（content-script `onEvent` 兩者均支持）。塊失敗不中斷後續塊與 emit。
+> 3. **LRU 快取**：key=`model|targetLang|djb2Hash(塊內全部源文)`（`djb2Hash` 為 32 位無符號 16 進制哈希）；`LruCache` 以 Map 迭代序實現最近使用提序，上限 `CACHE_MAX_ENTRIES=100`（~120B/條 ≈ 12KB），get 命中重插提序、set 溢出淘汰最舊。**模塊級單例**跨 restart/instance 持久——同視頻換語言/切檔重播免請求。失效策略：`ensureLlmCacheInvalidationHook()` 註冊 `chrome.storage.onChanged`（`once-guard` 防重複註冊，§5.4），`engineConfig` 變更 → `invalidateLlmCache()` 全量清空（端點/語言變更時鍵空間不同無法精確失效，全清最安全）；非擴充環境（無 `chrome.storage`）try/catch 守護後無操作。
+> 4. **瞬態失敗重試**：`translateChunkWithRetry()` 對瞬態錯誤（網絡中止/超時、HTTP 429/5xx、body 讀取失敗、JSON 解析失敗）重試 ≤2 次（`RETRY_DELAYS_MS=[500,1500]` 退避），耗盡後該塊**原文兜底**（`translatedText=sourceText`）不拋錯、不中斷其餘塊（總請求 1+2=3 次）；**永久失敗**（4xx 非 429、choices 缺失）立即拋 `LLMRequestError`（`transient=false`）走管線降級。`LLMRequestError` 攜帶 `status` 與 `transient` 旗標供重試與降級判斷。
+> 5. **超時覆蓋 body 讀取**：`fetchDirectly()` 用 `AbortController` + `finally` 統一清理——定時器在整個 `fetch` + `res.text()` 完成（或拋錯）後才 `clearTimeout`，舊實現「收到響應頭即取消」導致 body 流掛死（本地服務發 200 後斷連，M1-44 connection lost 場景）時超時永不觸發。Abort 判別用 `DOMException.name === 'AbortError'`（非瀏覽器環境 fallback 檢查 `name` 字段）。
 
 ### 7.6 SubtitleRenderer / ConfigStore / MessageBus
 
@@ -506,6 +539,12 @@ export interface MessageBus {
 ```
 
 **ApiKeyStore 說明**：`EngineConfig.translation.apiKeyRef` 僅為「密鑰存在性標記」，實際密鑰值存於獨立 storage key（`engineConfigKeys`），由 `ApiKeyStore` 讀寫。`ChromeStorageConfigStore` 同時實現 `ConfigStore` 與 `ApiKeyStore`。組裝時 `buildDefaultRegistry`（async）從 `ApiKeyStore.getApiKey` 解析密鑰注入 LLM 適配器，密鑰不隨配置對象散播。
+
+> **字幕背景樣式增強（M1-49，F-09 實裝）**：純白/純黑視頻上字幕難以辨識，默認樣式改為**三重對比保障**——白字（`#ffffff`）+ 黑色環繞描邊（`text-shadow: 0 0 4px #000, 0 0 2px #000`）+ 灰黑半透明背景（`rgba(32, 32, 32, 0.7)`）：極亮視頻靠黑色描邊凸顯白字，極暗視頻靠白字+深色背景對比。Options 背景設置 UI 從文本輸入重構為**預設下拉選擇器**（無背景 / 半透明灰黑「推薦」/ 半透明黑 / 自定義）+ 自定義區域（`<input type="color">` + `<input type="range">` 透明度 0-100%），選「自定義」時展開顏色+透明度控件。**向後兼容**：舊配置 `transparent` 自動映射為「無背景」預設，不影響已有用戶；`DEFAULT_CONFIG` 新增 `subtitleStyle` 默認值。落點：`config.ts`（`DEFAULT_CONFIG.subtitleStyle`）/ `options.html`+`options.ts`（`BG_PRESETS` 映射 + `parseRgba` + `matchPreset`）/ `content-script.ts`（text-shadow 環繞描邊 + 默認背景）。教訓：字幕可讀性需要「文字顏色 + 描邊 + 背景」多層保障，且設置界面提供「預設 + 自定義」雙模式比純文本輸入更友好。
+
+> **日誌降壓（M1-50，控制台洪水修復）**：`OverlayRenderer` 的 rAF 循環（每幀調用 `render()`/`draw()`）在真實環境把控制台淹沒——`draw()` 無 active cue 時每幀打「no active cue found」、同一 cue 持續顯示時每幀重複「found active cue」、`render()` 每幀重複記錄相同 cues 列表。降壓策略：`render()` 僅在 cues 數量變化時記錄（`lastLoggedCueCount`）；「no active cue」每 5s 最多輸出一次（`NO_CUE_LOG_INTERVAL_MS=5_000`）；「found active cue」僅在切換到新 cue id 時記錄（`lastLoggedActiveId`）；`renderActive()` 移除冗餘的 bounding rect / computed styles 日誌（mount 時已足以定位樣式問題）。**M1-51 之前**此為逐點降壓；M1-51 中央門控（`diagLog`）是根治。落點：`src/adapters/render/overlay-renderer.ts`（`lastLoggedCueCount`/`lastLoggedActiveId`/`lastNoCueLogTime`）。
+
+> **interceptor arraybuffer 響應支援（M1-50，timedtext 空響應根因修復）**：真實 YouTube 可能將 XHR `responseType` 設為 `arraybuffer`（二進制傳輸），`readXhrResponseText()` 原實現對非文本類型返回空串，導致字幕響應被丟棄（控制台 `emitCapture: empty response, skipping` → 解析 `root <html>`）。修復：新增 `arraybuffer` 分支——當 `responseType === 'arraybuffer'` 且 `response instanceof ArrayBuffer` 時用 `TextDecoder('utf-8')` 解碼；XHR onLoad 同時記錄 `xhr.status` 與 `xhr.responseType`，使「空響應」可區分為 HTTP 錯誤 / responseType 不支援 / 真實無字幕三種。落點：`src/runtime/yt-timedtext-interceptor.ts`（`readXhrResponseText` arraybuffer 分支 + onLoad 診斷）。
 
 > **跨上下文配置熱重啟（F-10，實裝經驗）**：Options 頁與 Content Script 各自持有獨立的 `ChromeStorageConfigStore` 實例，`store.subscribe` 只通知**本進程內**的回調——Options 保存配置後 content-script 收不到通知。因此 `SubtitleController` 改用 **`chrome.storage.onChanged.addListener`**（監聽 local area 的 `engineConfig` / `engineConfigKeys` 兩個 key），配置一變即觸發 `restart()` 完成熱重載；`unsubscribeConfig` 相應改為 `removeListener`。這也保證 `engineConfigKeys`（密鑰）變更同樣觸發重啟。詳見 AGENTS.md §5 R4 與 system-test-design TC-R8。
 
@@ -743,7 +782,7 @@ export interface PerfSample {
 
 | 里程碑 | 落地的適配器/模塊 | 先定義後實現的接口 |
 |---|---|---|
-| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容） | 全部端口先定義 |
+| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容）；LLM 直接 fetch + SW 精簡（M1-48）；字幕背景樣式增強（F-09/M1-49）；日誌降壓 + interceptor arraybuffer 支援（M1-50）；`debug-log.ts` 調試日誌門控（F-12/M1-51）；LLM 分塊翻譯 + `translateStream` 漸進交付 + LRU 快取 + 瞬態失敗重試（F-13/M1-52） | 全部端口先定義 |
 | M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD、`perf/metrics` | ASR 流式接口啟用 |
 | M3 預緩衝 | `BufferedAudioSource`、`LookAheadASRStrategy` | 復用 M2 管線，僅換音頻源 |
 | M4 優化 | 動態引擎選擇、性能檔位、樣式與多語言加固 | — |
