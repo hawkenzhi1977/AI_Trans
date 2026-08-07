@@ -261,6 +261,7 @@ class SubtitleController {
 
   private onEvent(e: PipelineEvent): void {
     if (e.type === 'segments-ready' || e.type === 'segments-updated') {
+      console.log('[AI_Trans:diag] content-script: onEvent received', e.type, 'with', e.segments.length, 'segments');
       this.cues = e.segments.map((s) => ({
         id: s.id,
         sourceText: s.sourceText,
@@ -269,9 +270,11 @@ class SubtitleController {
         start: s.start,
         end: s.end,
       }));
+      console.log('[AI_Trans:diag] content-script: cues updated, count:', this.cues.length, 'calling scheduleDraw');
       this.scheduleDraw();
       return;
     }
+    console.log('[AI_Trans:diag] content-script: onEvent received', e.type, e.type === 'engine-degraded' ? (e as any).reason : '');
     // 降級/錯誤事件：持久化診斷 + console 麵包屑，讓「字幕沒出來」的原因可被用戶查詢。
     // 異步寫入不阻塞事件處理；recordDiagnostic 內部已 try/catch 守護（§5.7）。
     void recordDiagnostic(e);

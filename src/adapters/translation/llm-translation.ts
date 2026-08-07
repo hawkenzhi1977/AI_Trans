@@ -5,11 +5,12 @@ import type { TranslationProvider } from '../../domain/ports/translation-provide
  * LLM 翻譯適配器（OpenAI 兼容 /chat/completions）。
  * 端點、模型、密鑰均來自配置；密鑰以 ref 指向本地存儲。
  * 新增供應商只需複製本模式並適配請求格式。
+ *
+ * M1-48：content script 無法直接 fetch localhost（CORS 限制），
+ * 翻譯請求通過 service worker 代理（chrome.runtime.sendMessage）。
  */
 export class LLMTranslationProvider implements TranslationProvider {
   readonly location = 'cloud' as const;
-  // R1：默認 fetch 必須綁定 globalThis，content-script 中裸 fetch 會拋 Illegal invocation。
-  private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
 
   constructor(
@@ -18,12 +19,10 @@ export class LLMTranslationProvider implements TranslationProvider {
       endpoint: string;
       model: string;
       apiKey: string;
-      fetchFn?: typeof fetch;
       /** 請求超時（毫秒）。reasoning 模型可能長時間思考，超時後降級 fallback 避免字幕卡死。 */
       timeoutMs?: number;
     }
   ) {
-    this.fetchFn = opts.fetchFn ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 30_000;
   }
 
@@ -52,55 +51,37 @@ export class LLMTranslationProvider implements TranslationProvider {
       ],
     };
 
-    // R4 配套：AbortController 超時。reasoning 模型單次可能 30~40s，超時拋錯 → pipeline 降級 fallback。
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    let res: Response;
-    try {
-      res = await this.fetchFn(this.opts.endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.opts.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      // AbortError 或網絡錯誤：統一拋出供上層降級。
-      throw new Error(
-        `LLM translation request failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    } finally {
-      clearTimeout(timer);
+    // M1-48：直接 fetch（content script 在 ISOLATED world 有 host_permissions）
+    const response = await this.fetchDirectly({
+      endpoint: this.opts.endpoint,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.opts.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    console.log('[AI_Trans:diag] LLM: response status =', response.status, ', ok =', response.ok);
+    if (!response.ok) {
+      throw new Error(`LLM translation failed: HTTP ${response.status}`);
     }
 
-    if (!res.ok) {
-      throw new Error(`LLM translation failed: HTTP ${res.status}`);
-    }
     // §5.6：HTTP 200 但 body 非 JSON（本地服務返回 HTML 錯誤頁/代理返回純文本）時，
-    // res.json() 的 SyntaxError 不含語義——必須 try/catch 並把「解析失敗」與響應片段
+    // JSON.parse 的 SyntaxError 不含語義——必須 try/catch 並把「解析失敗」與響應片段
     // 寫進錯誤信息，否則用戶只看到 `SyntaxError: Unexpected token` 無法定位。
     let data: {
       choices?: Array<{ message?: { content?: string } }>;
     };
     try {
-      data = (await res.json()) as {
+      data = JSON.parse(response.body) as {
         choices?: Array<{ message?: { content?: string } }>;
       };
+      console.log('[AI_Trans:diag] LLM: JSON parsed, choices count =', data.choices?.length);
     } catch (err) {
-      // §5.6：body 讀取失敗與 JSON 解析失敗是兩種不同的失敗，必須區分——
-      // 連接中斷（`Failed to fetch`，HTTP 頭已收到但 body 流被中止，常見於本地
-      // 服務發 200 後即斷連/推理異常）與「響應非 JSON」（真正返回了 HTML/文本）。
-      // 誤報「not valid JSON」會誤導用戶去查模型/格式，實際是網絡層問題。
       const msg = err instanceof Error ? err.message : String(err);
-      if (/Failed to fetch|NetworkError|network error/i.test(msg)) {
-        throw new Error(
-          `LLM translation response body read failed (connection lost): ${msg}`
-        );
-      }
+      console.error('[AI_Trans:diag] LLM: JSON parse failed, body snippet =', response.body.substring(0, 200));
       throw new Error(
-        `LLM translation response is not valid JSON: ${msg}`
+        `LLM translation response is not valid JSON: ${msg}. Body snippet: ${response.body.substring(0, 200)}`
       );
     }
     const choice = data.choices?.[0];
@@ -108,11 +89,13 @@ export class LLMTranslationProvider implements TranslationProvider {
     // 那是翻譯靜默失效且 degraded=false 的最典型漏洞（字幕出來但是原文，用戶查不到原因）。
     // 必須拋錯走降級機制（fallback / engine-degraded + pipeline-error）。
     if (!choice || typeof choice.message?.content !== 'string') {
+      console.error('[AI_Trans:diag] LLM: no valid choices[0].message.content, choice =', choice);
       throw new Error(
         `LLM translation response has no valid choices[0].message.content (possibly rate-limited or schema changed)`
       );
     }
     const content = stripReasoning(choice.message.content);
+    console.log('[AI_Trans:diag] LLM: content after stripReasoning =', content);
 
     // 解析 "ID<TAB>translation" 行。
     const map = new Map<string, string>();
@@ -120,14 +103,49 @@ export class LLMTranslationProvider implements TranslationProvider {
       const m = /^(\d+)\t(.+)$/.exec(line.trim());
       if (m) map.set(m[1], m[2]);
     }
+    console.log('[AI_Trans:diag] LLM: parsed map size =', map.size, ', map =', Object.fromEntries(map));
 
     const translated = req.segments.map((s, i) => ({
       ...s,
       translatedText: map.get(String(i)) ?? s.sourceText,
       targetLang: req.targetLang,
     }));
+    console.log('[AI_Trans:diag] LLM: translated segments =', translated.map(s => ({ id: s.id, translated: s.translatedText })));
 
     return { segments: translated, engineId: this.opts.engineId, degraded: false };
+  }
+
+  /**
+   * 直接 fetch 翻譯端點。
+   * content script 在 ISOLATED world 有 host_permissions（manifest.json），
+   * 可以直接 fetch localhost，不受 CORS 限制。
+   */
+  private async fetchDirectly(request: {
+    endpoint: string;
+    headers: Record<string, string>;
+    body: string;
+  }): Promise<{ ok: boolean; status: number; body: string }> {
+    console.log('[AI_Trans:diag] LLM: fetching directly to', request.endpoint);
+    const startTime = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const res = await globalThis.fetch(request.endpoint, {
+        method: 'POST',
+        headers: request.headers,
+        body: request.body,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const elapsed = Date.now() - startTime;
+      console.log('[AI_Trans:diag] LLM: fetch completed in', elapsed, 'ms, status =', res.status);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, body: text };
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
+    }
   }
 }
 

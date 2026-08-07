@@ -13,6 +13,8 @@ export class OverlayRenderer implements SubtitleRenderer {
   private currentId: string | null = null;
 
   mount(container: HTMLElement, style: Record<string, string> = {}): void {
+    console.log('[AI_Trans:diag] overlay-renderer: mount() called, container:', container.tagName, container.className);
+    console.log('[AI_Trans:diag] overlay-renderer: container computed position:', getComputedStyle(container).position, 'overflow:', getComputedStyle(container).overflow);
     this.style = style;
 
     const root = document.createElement('div');
@@ -38,9 +40,11 @@ export class OverlayRenderer implements SubtitleRenderer {
 
     container.appendChild(root);
     this.root = root;
+    console.log('[AI_Trans:diag] overlay-renderer: mount() completed, root appended to container');
   }
 
   render(cues: RenderableCue[], currentTime: Millis): void {
+    console.log('[AI_Trans:diag] overlay-renderer: render() called, cues:', cues.length, 'currentTime:', currentTime);
     this.cues = cues;
     this.draw(currentTime);
   }
@@ -68,14 +72,20 @@ export class OverlayRenderer implements SubtitleRenderer {
       (c) => currentTime >= c.start && currentTime < c.end
     );
     if (active) {
+      console.log('[AI_Trans:diag] overlay-renderer: draw() found active cue:', active.id, 'start:', active.start, 'end:', active.end);
       this.currentId = active.id;
       this.renderActive(active);
     } else {
+      console.log('[AI_Trans:diag] overlay-renderer: draw() no active cue found for currentTime:', currentTime, 'cues:', this.cues.length);
+      if (this.cues.length > 0) {
+        console.log('[AI_Trans:diag] overlay-renderer: first cue range:', this.cues[0].start, '-', this.cues[0].end);
+      }
       this.clear();
     }
   }
 
   private renderActive(cue: RenderableCue): void {
+    console.log('[AI_Trans:diag] overlay-renderer: renderActive() called, root exists:', !!this.root);
     if (!this.root) return;
     const bilingual = this.style['display-mode'] !== 'mono';
     const parts: string[] = [];
@@ -85,6 +95,26 @@ export class OverlayRenderer implements SubtitleRenderer {
     parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
     this.root.innerHTML = parts.join('<br/>');
     this.root.dataset.provisional = String(cue.provisional);
+    
+    // 詳細診斷
+    const rect = this.root.getBoundingClientRect();
+    const computed = getComputedStyle(this.root);
+    console.log('[AI_Trans:diag] overlay-renderer: === RENDER DIAGNOSTICS ===');
+    console.log('[AI_Trans:diag] overlay-renderer: innerHTML:', this.root.innerHTML.substring(0, 150));
+    console.log('[AI_Trans:diag] overlay-renderer: bounding rect:', { top: rect.top, left: rect.left, width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right });
+    console.log('[AI_Trans:diag] overlay-renderer: computed styles:', {
+      display: computed.display,
+      visibility: computed.visibility,
+      opacity: computed.opacity,
+      zIndex: computed.zIndex,
+      position: computed.position,
+      pointerEvents: computed.pointerEvents,
+      color: computed.color,
+      fontSize: computed.fontSize,
+      backgroundColor: computed.backgroundColor
+    });
+    console.log('[AI_Trans:diag] overlay-renderer: parent element:', this.root.parentElement?.tagName, this.root.parentElement?.className?.substring(0, 50));
+    console.log('[AI_Trans:diag] overlay-renderer: === END DIAGNOSTICS ===');
   }
 
   private clear(): void {

@@ -22,6 +22,7 @@ export class TranslationPipeline implements TranslationProvider {
   constructor(private readonly opts: TranslationPipelineOptions) {}
 
   async translate(req: TranslationRequest): Promise<TranslationResult> {
+    console.log('[AI_Trans:diag] translation-pipeline: translate() called,', req.segments.length, 'segments, targetLang:', req.targetLang ?? this.opts.targetLang);
     const request: TranslationRequest = {
       ...req,
       targetLang: req.targetLang ?? this.opts.targetLang,
@@ -29,7 +30,9 @@ export class TranslationPipeline implements TranslationProvider {
     };
 
     try {
+      console.log('[AI_Trans:diag] translation-pipeline: calling primary engine:', this.opts.primary.engineId);
       const result = await this.opts.primary.translate(request);
+      console.log('[AI_Trans:diag] translation-pipeline: primary engine succeeded, degraded:', result.degraded);
       if (result.degraded) {
         this.emit({
           type: 'engine-degraded',
@@ -39,7 +42,9 @@ export class TranslationPipeline implements TranslationProvider {
       }
       return result;
     } catch (primaryErr) {
+      console.log('[AI_Trans:diag] translation-pipeline: primary engine FAILED:', String(primaryErr));
       if (this.opts.fallback) {
+        console.log('[AI_Trans:diag] translation-pipeline: falling back to:', this.opts.fallback.engineId);
         // 同時通知降級與錯誤：觀測者需要看到「換引擎」與「為何換」。
         this.emit({
           type: 'engine-degraded',
@@ -48,6 +53,7 @@ export class TranslationPipeline implements TranslationProvider {
         });
         this.emitError(primaryErr);
         const result = await this.opts.fallback.translate(request);
+        console.log('[AI_Trans:diag] translation-pipeline: fallback engine succeeded');
         return {
           ...result,
           engineId: result.engineId,

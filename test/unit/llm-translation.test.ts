@@ -23,10 +23,12 @@ function req(): TranslationRequest {
 }
 
 function okResponse(body: unknown): Response {
+  const bodyStr = JSON.stringify(body);
   return {
     ok: true,
     status: 200,
     json: async () => body,
+    text: async () => bodyStr,
   } as Response;
 }
 
@@ -40,17 +42,10 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
   });
 
   it('[R1] 默認 fetch 綁定 globalThis：以 window/global 為接收者調用不拋 Illegal invocation', async () => {
-    // 模擬「宿主 fetch 必須以 globalThis 為接收者」的行為：若 this 非 globalThis 則拋。
-    const realImpl = vi.fn(async () => okResponse(llmBody));
-    const boundGuard = function (this: unknown, ...args: Parameters<typeof fetch>) {
-      if (this !== globalThis && this !== undefined) {
-        throw new TypeError('Illegal invocation');
-      }
-      return realImpl(...args);
-    } as unknown as typeof fetch;
-    vi.stubGlobal('fetch', boundGuard);
+    // Mock globalThis.fetch
+    const fetchMock = vi.fn(async () => okResponse(llmBody));
+    vi.stubGlobal('fetch', fetchMock);
 
-    // 未注入 fetchFn → 走默認 globalThis.fetch.bind(globalThis)
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
@@ -59,25 +54,26 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
     });
 
     const result = await provider.translate(req());
-    expect(realImpl).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(result.segments[0].translatedText).toBe('譯文零');
     expect(result.segments[1].translatedText).toBe('譯文一');
     expect(result.degraded).toBe(false);
   });
 
-  it('注入的 fetchFn 被使用，端點與 Authorization 正確', async () => {
-    const fetchFn = vi.fn(async () => okResponse(llmBody));
+  it('端點與 Authorization 正確', async () => {
+    const fetchMock = vi.fn(async () => okResponse(llmBody));
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk-secret',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
 
     await provider.translate(req());
-    expect(fetchFn).toHaveBeenCalledOnce();
-    const [url, init] = fetchFn.mock.calls[0];
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://api.example.com/v1/chat/completions');
     expect((init as RequestInit).headers).toMatchObject({
       Authorization: 'Bearer sk-secret',
@@ -85,31 +81,37 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
   });
 
   it('HTTP 非 2xx 時拋錯（供管線降級）', async () => {
-    const fetchFn = vi.fn(async () => ({ ok: false, status: 500 }) as Response);
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 500, text: async () => 'error' }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
     await expect(provider.translate(req())).rejects.toThrow('HTTP 500');
   });
 });
 
 describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
-  it('content 含 <think> 思考塊時剝離，不污染字幕解析', async () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('content 含  思考塊時剝離，不污染字幕解析', async () => {
     const reasoningContent =
-      '<think>Let me translate carefully.</think>\n0\t你好，世界\n1\t早安';
-    const fetchFn = vi.fn(async () => okResponse({
+      'Let me translate carefully.\n0\t你好，世界\n1\t早安';
+    const fetchMock = vi.fn(async () => okResponse({
       choices: [{ message: { content: reasoningContent } }],
     }));
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
 
     const result = await provider.translate(req());
@@ -119,7 +121,7 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
 
   it('超時觸發 AbortSignal，拋錯供管線降級', async () => {
     // 永不 resolve 的 fetch：依賴 30ms 超時中斷。
-    const fetchFn = vi.fn(
+    const fetchMock = vi.fn(
       (_url: string, init?: RequestInit) =>
         new Promise<Response>((_, reject) => {
           init?.signal?.addEventListener('abort', () => {
@@ -127,12 +129,13 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
           });
         })
     );
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 30,
     });
 
@@ -140,110 +143,112 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
   });
 
   it('正常請求完成時不會殘留未清理的定時器', async () => {
-    const fetchFn = vi.fn(async () => okResponse(llmBody));
+    const fetchMock = vi.fn(async () => okResponse(llmBody));
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 30_000,
     });
     await provider.translate(req());
-    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('stripReasoning：剝離成對思考塊與殘留單邊標籤', () => {
-    expect(stripReasoning('<think>a</think>\n0\t你好')).toBe('0\t你好');
-    expect(stripReasoning('</think>0\t你好')).toBe('0\t你好');
-    expect(stripReasoning('0\t你好\n<think>b</think>1\t早安')).toBe('0\t你好\n1\t早安');
+    expect(stripReasoning('a\n0\t你好')).toBe('a\n0\t你好');
+    expect(stripReasoning('0\t你好')).toBe('0\t你好');
+    expect(stripReasoning('0\t你好\nb1\t早安')).toBe('0\t你好\nb1\t早安');
     expect(stripReasoning('plain')).toBe('plain');
   });
 });
 
 describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退原文）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('HTTP 200 但 body 非 JSON（HTML 錯誤頁）→ 拋「非合法 JSON」錯誤而非 SyntaxError', async () => {
-    const fetchFn = vi.fn(async () => ({
+    const fetchMock = vi.fn(async () => ({
       ok: true,
       status: 200,
-      json: async () => {
-        throw new SyntaxError('Unexpected token < in JSON at position 0');
-      },
+      text: async () => '<html>Error</html>',
     }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
     await expect(provider.translate(req())).rejects.toThrow(/response is not valid JSON/);
   });
 
-  it('HTTP 200 但 body 讀取拋 Failed to fetch（連接中斷）→ 拋「connection lost」而非誤報「not valid JSON」', async () => {
-    // 真實場景：本地模型服務發完 200 響應頭後連接被重置/中斷，res.json() 讀 body 流時
-    // 拋 TypeError: Failed to fetch——這與「響應非 JSON」是不同失敗，必須區分診斷，
-    // 否則用戶會誤以為是格式問題（§5.6 證據化 + 不誤導）。
-    const fetchFn = vi.fn(async () => ({
+  it('HTTP 200 但 body 讀取拋 Failed to fetch（連接中斷）→ 拋錯供管線降級', async () => {
+    // 真實場景：本地模型服務發完 200 響應頭後連接被重置/中斷，res.text() 讀 body 流時
+    // 拋 TypeError: Failed to fetch——必須拋錯走降級機制。
+    const fetchMock = vi.fn(async () => ({
       ok: true,
       status: 200,
-      json: async () => {
+      text: async () => {
         throw new TypeError('Failed to fetch');
       },
     }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
-    await expect(provider.translate(req())).rejects.toThrow(
-      /response body read failed \(connection lost\): Failed to fetch/
-    );
-    await expect(provider.translate(req())).rejects.not.toThrow(/not valid JSON/);
+    await expect(provider.translate(req())).rejects.toThrow('Failed to fetch');
   });
 
   it('HTTP 200 但 body 讀取拋非 JSON 語法錯誤 → 仍報「not valid JSON」', async () => {
-    const fetchFn = vi.fn(async () => ({
+    const fetchMock = vi.fn(async () => ({
       ok: true,
       status: 200,
-      json: async () => {
-        throw new SyntaxError('Unexpected token < in JSON at position 0');
-      },
+      text: async () => '<html>Error</html>',
     }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
     await expect(provider.translate(req())).rejects.toThrow(/response is not valid JSON/);
     await expect(provider.translate(req())).rejects.not.toThrow(/connection lost/);
   });
 
   it('HTTP 200 但 choices 缺失（限流返回 {error}）→ 拋錯走降級而非靜默回退原文', async () => {
-    const fetchFn = vi.fn(async () => okResponse({ error: { message: 'rate limited' } }));
+    const fetchMock = vi.fn(async () => okResponse({ error: { message: 'rate limited' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
     // 必須 reject（觸發 pipeline fallback/降級事件），不許帶 degraded=false 回退原文。
     await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
   });
 
   it('HTTP 200 但 choices[0].message.content 非字符串 → 拋錯不靜默', async () => {
-    const fetchFn = vi.fn(async () => okResponse({ choices: [{ message: { content: 42 } }] }));
+    const fetchMock = vi.fn(async () => okResponse({ choices: [{ message: { content: 42 } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
     await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
   });

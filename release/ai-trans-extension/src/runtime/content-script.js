@@ -85,13 +85,16 @@
     location = "cloud";
     engineId = "pipeline";
     async translate(req) {
+      console.log("[AI_Trans:diag] translation-pipeline: translate() called,", req.segments.length, "segments, targetLang:", req.targetLang ?? this.opts.targetLang);
       const request = {
         ...req,
         targetLang: req.targetLang ?? this.opts.targetLang,
         streaming: this.opts.streaming
       };
       try {
+        console.log("[AI_Trans:diag] translation-pipeline: calling primary engine:", this.opts.primary.engineId);
         const result = await this.opts.primary.translate(request);
+        console.log("[AI_Trans:diag] translation-pipeline: primary engine succeeded, degraded:", result.degraded);
         if (result.degraded) {
           this.emit({
             type: "engine-degraded",
@@ -101,7 +104,9 @@
         }
         return result;
       } catch (primaryErr) {
+        console.log("[AI_Trans:diag] translation-pipeline: primary engine FAILED:", String(primaryErr));
         if (this.opts.fallback) {
+          console.log("[AI_Trans:diag] translation-pipeline: falling back to:", this.opts.fallback.engineId);
           this.emit({
             type: "engine-degraded",
             port: "translation",
@@ -109,6 +114,7 @@
           });
           this.emitError(primaryErr);
           const result = await this.opts.fallback.translate(request);
+          console.log("[AI_Trans:diag] translation-pipeline: fallback engine succeeded");
           return {
             ...result,
             engineId: result.engineId,
@@ -290,16 +296,22 @@
         });
         return;
       }
+      console.log("[AI_Trans:diag] native-strategy: track.fetch() starting");
       const segments = await track.fetch();
+      console.log("[AI_Trans:diag] native-strategy: track.fetch() returned", segments.length, "segments");
       if (this.stopped) return;
       try {
+        console.log("[AI_Trans:diag] native-strategy: translation starting, targetLang:", ctx.config.targetLang);
         const result = await ctx.translation.translate({
           segments,
           targetLang: ctx.config.targetLang
         });
+        console.log("[AI_Trans:diag] native-strategy: translation succeeded,", result.segments.length, "translated segments");
         if (this.stopped) return;
+        console.log("[AI_Trans:diag] native-strategy: emitting segments-ready");
         emit({ type: "segments-ready", segments: result.segments });
       } catch (err) {
+        console.log("[AI_Trans:diag] native-strategy: translation FAILED:", err instanceof Error ? err.message : String(err));
         if (this.stopped) return;
         emit({
           type: "engine-degraded",
@@ -529,6 +541,7 @@
       return void 0;
     }
     async fetchTracks(baseUrl, lang) {
+      console.log("[AI_Trans PlatformAdapter] fetchTracks called, baseUrl:", baseUrl, "lang:", lang);
       let url;
       try {
         url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
@@ -538,10 +551,20 @@
         );
       }
       const finalUrl = this.withJson3Format(url);
+      console.log("[AI_Trans PlatformAdapter] fetchTracks: finalUrl after withJson3Format:", finalUrl);
+      console.log("[AI_Trans PlatformAdapter] fetchTracks: trying tryReuseCapture");
       const reused = this.tryReuseCapture(lang);
-      if (reused) return reused;
+      if (reused) {
+        console.log("[AI_Trans PlatformAdapter] fetchTracks: reused capture success");
+        return reused;
+      }
+      console.log("[AI_Trans PlatformAdapter] fetchTracks: no capture to reuse, trying waitForCaptureReuse");
       const waited = await this.waitForCaptureReuse(lang);
-      if (waited) return waited;
+      if (waited) {
+        console.log("[AI_Trans PlatformAdapter] fetchTracks: waitForCaptureReuse success");
+        return waited;
+      }
+      console.log("[AI_Trans PlatformAdapter] fetchTracks: waitForCaptureReuse timeout, falling back to direct fetch");
       let res;
       try {
         res = await this.fetchFn(finalUrl, { credentials: "include" });
@@ -739,13 +762,10 @@
   var LLMTranslationProvider = class {
     constructor(opts) {
       this.opts = opts;
-      this.fetchFn = opts.fetchFn ?? globalThis.fetch.bind(globalThis);
       this.timeoutMs = opts.timeoutMs ?? 3e4;
     }
     opts;
     location = "cloud";
-    // R1：默認 fetch 必須綁定 globalThis，content-script 中裸 fetch 會拋 Illegal invocation。
-    fetchFn;
     timeoutMs;
     get engineId() {
       return this.opts.engineId;
@@ -764,61 +784,78 @@
           { role: "user", content: lines.join("\n") }
         ]
       };
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      let res;
-      try {
-        res = await this.fetchFn(this.opts.endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${this.opts.apiKey}`
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal
-        });
-      } catch (err) {
-        throw new Error(
-          `LLM translation request failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) {
-        throw new Error(`LLM translation failed: HTTP ${res.status}`);
+      const response = await this.fetchDirectly({
+        endpoint: this.opts.endpoint,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.opts.apiKey}`
+        },
+        body: JSON.stringify(body)
+      });
+      console.log("[AI_Trans:diag] LLM: response status =", response.status, ", ok =", response.ok);
+      if (!response.ok) {
+        throw new Error(`LLM translation failed: HTTP ${response.status}`);
       }
       let data;
       try {
-        data = await res.json();
+        data = JSON.parse(response.body);
+        console.log("[AI_Trans:diag] LLM: JSON parsed, choices count =", data.choices?.length);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/Failed to fetch|NetworkError|network error/i.test(msg)) {
-          throw new Error(
-            `LLM translation response body read failed (connection lost): ${msg}`
-          );
-        }
+        console.error("[AI_Trans:diag] LLM: JSON parse failed, body snippet =", response.body.substring(0, 200));
         throw new Error(
-          `LLM translation response is not valid JSON: ${msg}`
+          `LLM translation response is not valid JSON: ${msg}. Body snippet: ${response.body.substring(0, 200)}`
         );
       }
       const choice = data.choices?.[0];
       if (!choice || typeof choice.message?.content !== "string") {
+        console.error("[AI_Trans:diag] LLM: no valid choices[0].message.content, choice =", choice);
         throw new Error(
           `LLM translation response has no valid choices[0].message.content (possibly rate-limited or schema changed)`
         );
       }
       const content = stripReasoning(choice.message.content);
+      console.log("[AI_Trans:diag] LLM: content after stripReasoning =", content);
       const map = /* @__PURE__ */ new Map();
       for (const line of content.split("\n")) {
         const m = /^(\d+)\t(.+)$/.exec(line.trim());
         if (m) map.set(m[1], m[2]);
       }
+      console.log("[AI_Trans:diag] LLM: parsed map size =", map.size, ", map =", Object.fromEntries(map));
       const translated = req.segments.map((s, i) => ({
         ...s,
         translatedText: map.get(String(i)) ?? s.sourceText,
         targetLang: req.targetLang
       }));
+      console.log("[AI_Trans:diag] LLM: translated segments =", translated.map((s) => ({ id: s.id, translated: s.translatedText })));
       return { segments: translated, engineId: this.opts.engineId, degraded: false };
+    }
+    /**
+     * 直接 fetch 翻譯端點。
+     * content script 在 ISOLATED world 有 host_permissions（manifest.json），
+     * 可以直接 fetch localhost，不受 CORS 限制。
+     */
+    async fetchDirectly(request) {
+      console.log("[AI_Trans:diag] LLM: fetching directly to", request.endpoint);
+      const startTime = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const res = await globalThis.fetch(request.endpoint, {
+          method: "POST",
+          headers: request.headers,
+          body: request.body,
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        const elapsed = Date.now() - startTime;
+        console.log("[AI_Trans:diag] LLM: fetch completed in", elapsed, "ms, status =", res.status);
+        const text = await res.text();
+        return { ok: res.ok, status: res.status, body: text };
+      } catch (err) {
+        clearTimeout(timer);
+        throw err;
+      }
     }
   };
   function stripReasoning(raw) {
@@ -857,6 +894,8 @@
     cues = [];
     currentId = null;
     mount(container, style = {}) {
+      console.log("[AI_Trans:diag] overlay-renderer: mount() called, container:", container.tagName, container.className);
+      console.log("[AI_Trans:diag] overlay-renderer: container computed position:", getComputedStyle(container).position, "overflow:", getComputedStyle(container).overflow);
       this.style = style;
       const root = document.createElement("div");
       root.className = "ai-trans-overlay";
@@ -877,8 +916,10 @@
       }
       container.appendChild(root);
       this.root = root;
+      console.log("[AI_Trans:diag] overlay-renderer: mount() completed, root appended to container");
     }
     render(cues, currentTime) {
+      console.log("[AI_Trans:diag] overlay-renderer: render() called, cues:", cues.length, "currentTime:", currentTime);
       this.cues = cues;
       this.draw(currentTime);
     }
@@ -903,13 +944,19 @@
         (c) => currentTime >= c.start && currentTime < c.end
       );
       if (active) {
+        console.log("[AI_Trans:diag] overlay-renderer: draw() found active cue:", active.id, "start:", active.start, "end:", active.end);
         this.currentId = active.id;
         this.renderActive(active);
       } else {
+        console.log("[AI_Trans:diag] overlay-renderer: draw() no active cue found for currentTime:", currentTime, "cues:", this.cues.length);
+        if (this.cues.length > 0) {
+          console.log("[AI_Trans:diag] overlay-renderer: first cue range:", this.cues[0].start, "-", this.cues[0].end);
+        }
         this.clear();
       }
     }
     renderActive(cue) {
+      console.log("[AI_Trans:diag] overlay-renderer: renderActive() called, root exists:", !!this.root);
       if (!this.root) return;
       const bilingual = this.style["display-mode"] !== "mono";
       const parts = [];
@@ -919,6 +966,24 @@
       parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
       this.root.innerHTML = parts.join("<br/>");
       this.root.dataset.provisional = String(cue.provisional);
+      const rect = this.root.getBoundingClientRect();
+      const computed = getComputedStyle(this.root);
+      console.log("[AI_Trans:diag] overlay-renderer: === RENDER DIAGNOSTICS ===");
+      console.log("[AI_Trans:diag] overlay-renderer: innerHTML:", this.root.innerHTML.substring(0, 150));
+      console.log("[AI_Trans:diag] overlay-renderer: bounding rect:", { top: rect.top, left: rect.left, width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right });
+      console.log("[AI_Trans:diag] overlay-renderer: computed styles:", {
+        display: computed.display,
+        visibility: computed.visibility,
+        opacity: computed.opacity,
+        zIndex: computed.zIndex,
+        position: computed.position,
+        pointerEvents: computed.pointerEvents,
+        color: computed.color,
+        fontSize: computed.fontSize,
+        backgroundColor: computed.backgroundColor
+      });
+      console.log("[AI_Trans:diag] overlay-renderer: parent element:", this.root.parentElement?.tagName, this.root.parentElement?.className?.substring(0, 50));
+      console.log("[AI_Trans:diag] overlay-renderer: === END DIAGNOSTICS ===");
     }
     clear() {
       if (this.root) {
@@ -1105,15 +1170,17 @@
       this.ensurePolling();
     }
     /**
-     * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
-     * 已在途的捕獲（latest 就緒且匹配）立即返回；否則掛起等待 message 事件或輪詢通知。
-     * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
-     * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲——避免換視頻（SPA 導航）後
-     * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
-     */
+      * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
+      * 已在途的捕獲（latest 就緒且匹配）立即返回；否則掛起等待 message 事件或輪詢通知。
+      * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
+      * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲——避免換視頻（SPA 導航）後
+      * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
+      */
     waitForCapture(timeoutMs, expectedVideoId) {
+      console.log("[AI_Trans Bridge] waitForCapture called, timeoutMs:", timeoutMs, "expectedVideoId:", expectedVideoId, "hasLatest:", !!this.latest);
       const current = this.latest;
       if (current && this.matchesVideo(current, expectedVideoId)) {
+        console.log("[AI_Trans Bridge] waitForCapture: latest available, returning immediately");
         return Promise.resolve(current);
       }
       return new Promise((resolve) => {
@@ -1122,6 +1189,7 @@
           if (settled) return;
           settled = true;
           this.waiters.delete(onCapture);
+          console.log("[AI_Trans Bridge] waitForCapture: timeout after", timeoutMs, "ms, returning null");
           resolve(null);
         }, timeoutMs);
         const onCapture = () => {
@@ -1131,6 +1199,7 @@
           settled = true;
           clearTimeout(timer);
           this.waiters.delete(onCapture);
+          console.log("[AI_Trans Bridge] waitForCapture: capture received, videoId:", latest.videoId);
           resolve(latest);
         };
         this.waiters.add(onCapture);
@@ -1395,6 +1464,7 @@
     }
     onEvent(e) {
       if (e.type === "segments-ready" || e.type === "segments-updated") {
+        console.log("[AI_Trans:diag] content-script: onEvent received", e.type, "with", e.segments.length, "segments");
         this.cues = e.segments.map((s) => ({
           id: s.id,
           sourceText: s.sourceText,
@@ -1403,9 +1473,11 @@
           start: s.start,
           end: s.end
         }));
+        console.log("[AI_Trans:diag] content-script: cues updated, count:", this.cues.length, "calling scheduleDraw");
         this.scheduleDraw();
         return;
       }
+      console.log("[AI_Trans:diag] content-script: onEvent received", e.type, e.type === "engine-degraded" ? e.reason : "");
       void recordDiagnostic(e);
     }
     /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */

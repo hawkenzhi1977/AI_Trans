@@ -50,18 +50,24 @@ export class NativeCaptionStrategy implements CaptionStrategy {
       return;
     }
 
+    console.log('[AI_Trans:diag] native-strategy: track.fetch() starting');
     const segments = await track.fetch();
+    console.log('[AI_Trans:diag] native-strategy: track.fetch() returned', segments.length, 'segments');
     if (this.stopped) return;
 
     try {
+      console.log('[AI_Trans:diag] native-strategy: translation starting, targetLang:', ctx.config.targetLang);
       const result = await ctx.translation.translate({
         segments,
         targetLang: ctx.config.targetLang,
       });
+      console.log('[AI_Trans:diag] native-strategy: translation succeeded,', result.segments.length, 'translated segments');
       if (this.stopped) return;
 
+      console.log('[AI_Trans:diag] native-strategy: emitting segments-ready');
       emit({ type: 'segments-ready', segments: result.segments });
     } catch (err) {
+      console.log('[AI_Trans:diag] native-strategy: translation FAILED:', err instanceof Error ? err.message : String(err));
       // 翻譯失敗時顯示原文字幕作為降級（§5.6：不靜默失敗）
       if (this.stopped) return;
       emit({

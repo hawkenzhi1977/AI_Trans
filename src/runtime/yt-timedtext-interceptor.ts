@@ -91,7 +91,10 @@ function emitCapture(
   contentType: string,
   location: Location
 ): void {
-  if (!responseText) return; // 空響應（無登錄態/無字幕）不轉發，也不更新 lastCapture（重播不發空）。
+  if (!responseText) {
+    console.log('[AI_Trans Interceptor] emitCapture: empty response, skipping');
+    return; // 空響應（無登錄態/無字幕）不轉發，也不更新 lastCapture（重播不發空）。
+  }
   captureRequestCount++;
   const capture: TimedTextCapture = {
     url,
@@ -100,6 +103,7 @@ function emitCapture(
     capturedAt: Date.now(),
     videoId: extractVideoId(url),
   };
+  console.log('[AI_Trans Interceptor] emitCapture: success, captureRequestCount:', captureRequestCount, 'videoId:', capture.videoId);
   // M1-46：更新 lastCapture 供重播，並更新調試輔助全局變量。
   lastCapture = capture;
   Reflect.set(globalThis, '__aiTransTimedtextRequests', captureRequestCount);
@@ -229,7 +233,8 @@ function ensureCaptionModuleLoaded(): void {
     player.setOption('captions', 'track', track);
     captionModuleDriven = true;
     console.log('[AI_Trans Interceptor] Caption module driven successfully, selected track:', track);
-    // 短延遲後復位，抑制原生字幕渲染（我們只要 pot 響應，不要播放器把原文字幕畫上去）。
+    // M1-48：增加延遲到 3000ms，確保 timedtext 請求完成後再復位（避免取消請求）。
+    // 原生字幕可能短暫顯示，但捕獲成功後可接受。
     setTimeout(() => {
       try {
         player.setOption!('captions', 'track', {});
@@ -237,7 +242,7 @@ function ensureCaptionModuleLoaded(): void {
       } catch {
         /* 復位失敗無害：原生字幕可能短暫顯示，不影響捕獲。 */
       }
-    }, 600);
+    }, 3000);
   } catch (err) {
     console.log('[AI_Trans Interceptor] setOption error:', err);
     // 選軌失敗：不標記成功，重試定時器會再試。
@@ -305,6 +310,7 @@ function install(): void {
   ): void {
     const urlStr = typeof url === 'string' ? url : url.href;
     if (isTimedText(urlStr)) {
+      console.log('[AI_Trans Interceptor] XHR timedtext request detected:', urlStr);
       (this as unknown as { __aiTransUrl?: string }).__aiTransUrl = urlStr;
     }
     return origOpen.apply(this, [method, url, async ?? true, username, password]);
@@ -315,6 +321,7 @@ function install(): void {
   ): void {
     const urlStr = (this as unknown as { __aiTransUrl?: string }).__aiTransUrl;
     if (urlStr) {
+      console.log('[AI_Trans Interceptor] XHR timedtext request sending:', urlStr);
       // R4：load 監聽器在請求完成後移除自身，不產生累積洩漏。
       const onLoad = (): void => {
         this.removeEventListener('load', onLoad);
@@ -323,6 +330,7 @@ function install(): void {
           const contentType =
             (this as unknown as { getResponseHeader?: (h: string) => string | null })
               .getResponseHeader?.('content-type') ?? 'unknown';
+          console.log('[AI_Trans Interceptor] XHR timedtext response received, length:', responseText.length, 'content-type:', contentType);
           emitCapture(urlStr, responseText, contentType, globalThis.location);
         } catch {
           // §5.7：外部響應解析失敗不允許冒泡破壞播放器——吞掉（捕獲失敗僅意味著本輪不複用）。
@@ -352,12 +360,15 @@ function install(): void {
     }
     if (!isTimedText(urlStr)) return origFetch(input, init);
 
+    console.log('[AI_Trans Interceptor] fetch timedtext request detected:', urlStr);
     const captured = origFetch(input, init);
     // 透傳原響應（不阻塞播放器）；另克隆 body 讀取以捕獲響應文本（§5.4：無持久監聽器）。
     void captured.then((res) => {
+      console.log('[AI_Trans Interceptor] fetch timedtext response received, status:', res.status);
       try {
         const clone = res.clone();
         void clone.text().then((text) => {
+          console.log('[AI_Trans Interceptor] fetch timedtext response body length:', text.length);
           emitCapture(
             urlStr,
             text,

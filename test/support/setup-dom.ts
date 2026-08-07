@@ -28,7 +28,15 @@ const chromeMock = {
   runtime: {
     getURL: vi.fn((path: string) => `chrome-extension://fake/${path}`),
     onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+    onConnect: { addListener: vi.fn(), removeListener: vi.fn() },
     sendMessage: vi.fn(),
+    connect: vi.fn(() => ({
+      name: 'mock-port',
+      postMessage: vi.fn(),
+      onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+      onDisconnect: { addListener: vi.fn(), removeListener: vi.fn() },
+      disconnect: vi.fn(),
+    })),
     lastError: undefined,
   },
   tabs: {

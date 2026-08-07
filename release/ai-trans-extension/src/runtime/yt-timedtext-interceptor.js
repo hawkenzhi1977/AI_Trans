@@ -39,7 +39,10 @@
     }
   }
   function emitCapture(url, responseText, contentType, location) {
-    if (!responseText) return;
+    if (!responseText) {
+      console.log("[AI_Trans Interceptor] emitCapture: empty response, skipping");
+      return;
+    }
     captureRequestCount++;
     const capture = {
       url,
@@ -48,6 +51,7 @@
       capturedAt: Date.now(),
       videoId: extractVideoId(url)
     };
+    console.log("[AI_Trans Interceptor] emitCapture: success, captureRequestCount:", captureRequestCount, "videoId:", capture.videoId);
     lastCapture = capture;
     Reflect.set(globalThis, "__aiTransTimedtextRequests", captureRequestCount);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", capture);
@@ -118,7 +122,7 @@
           console.log("[AI_Trans Interceptor] Caption track reset to suppress native rendering");
         } catch {
         }
-      }, 600);
+      }, 3e3);
     } catch (err) {
       console.log("[AI_Trans Interceptor] setOption error:", err);
     }
@@ -162,6 +166,7 @@
     XMLHttpRequest.prototype.open = function(method, url, async, username, password) {
       const urlStr = typeof url === "string" ? url : url.href;
       if (isTimedText(urlStr)) {
+        console.log("[AI_Trans Interceptor] XHR timedtext request detected:", urlStr);
         this.__aiTransUrl = urlStr;
       }
       return origOpen.apply(this, [method, url, async ?? true, username, password]);
@@ -169,11 +174,13 @@
     XMLHttpRequest.prototype.send = function(...args) {
       const urlStr = this.__aiTransUrl;
       if (urlStr) {
+        console.log("[AI_Trans Interceptor] XHR timedtext request sending:", urlStr);
         const onLoad = () => {
           this.removeEventListener("load", onLoad);
           try {
             const responseText = readXhrResponseText(this);
             const contentType = this.getResponseHeader?.("content-type") ?? "unknown";
+            console.log("[AI_Trans Interceptor] XHR timedtext response received, length:", responseText.length, "content-type:", contentType);
             emitCapture(urlStr, responseText, contentType, globalThis.location);
           } catch {
           }
@@ -191,11 +198,14 @@
         return origFetch(input, init);
       }
       if (!isTimedText(urlStr)) return origFetch(input, init);
+      console.log("[AI_Trans Interceptor] fetch timedtext request detected:", urlStr);
       const captured = origFetch(input, init);
       void captured.then((res) => {
+        console.log("[AI_Trans Interceptor] fetch timedtext response received, status:", res.status);
         try {
           const clone = res.clone();
           void clone.text().then((text) => {
+            console.log("[AI_Trans Interceptor] fetch timedtext response body length:", text.length);
             emitCapture(
               urlStr,
               text,

@@ -481,7 +481,7 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
     await loadInterceptor();
     vi.advanceTimersByTime(1_000);
     setOption.mockClear();
-    vi.advanceTimersByTime(600);
+    vi.advanceTimersByTime(3_100); // M1-48：延遲增加到 3000ms
     expect(setOption).toHaveBeenCalledWith('captions', 'track', {});
   });
 

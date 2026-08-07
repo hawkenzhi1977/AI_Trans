@@ -141,6 +141,7 @@ export class FetchCaptionSource implements CaptionSource {
   }
 
   async fetchTracks(baseUrl: string, lang: string): Promise<SubtitleSegment[]> {
+    console.log('[AI_Trans PlatformAdapter] fetchTracks called, baseUrl:', baseUrl, 'lang:', lang);
     // baseUrl 可能為相對路徑（Mock 站點），統一解析為絕對 URL。
     // §5.2/R2：new URL 可能因 baseUrl 非法而拋錯——拆出語義（URL 構造失敗）而非裸冒泡。
     let url: string;
@@ -157,11 +158,17 @@ export class FetchCaptionSource implements CaptionSource {
     // （{"events":[{tStartMs,dDurationMs,segs:[{utf8}]}]}），與解析器 JSON 分支對齊。
     // Mock 站點的相對 URL（無 host）不加 fmt，避免破壞既有契約。
     const finalUrl = this.withJson3Format(url);
+    console.log('[AI_Trans PlatformAdapter] fetchTracks: finalUrl after withJson3Format:', finalUrl);
 
     // 優先複用 MAIN world 攔截器捕獲的播放器響應（帶 pot，已成功）。
     // §5.6：複用失敗（解析出錯）不靜默——記診斷後仍回退到直接 fetch，兩條路徑都留痕。
+    console.log('[AI_Trans PlatformAdapter] fetchTracks: trying tryReuseCapture');
     const reused = this.tryReuseCapture(lang);
-    if (reused) return reused;
+    if (reused) {
+      console.log('[AI_Trans PlatformAdapter] fetchTracks: reused capture success');
+      return reused;
+    }
+    console.log('[AI_Trans PlatformAdapter] fetchTracks: no capture to reuse, trying waitForCaptureReuse');
 
     // M1-43：無捕獲值時，等待播放器發出 timedtext 請求並被攔截器捕獲。
     // 播放器在「視頻已播放」時才發字幕請求，而 fetchTracks 可能在播放前運行——
@@ -169,7 +176,11 @@ export class FetchCaptionSource implements CaptionSource {
     // 超時才回退直接 fetch（保留原有行為與診斷）。
     // M1-45：等待僅接受屬於當前視頻（expectedVideoId）的捕獲，避免換視頻後複用 stale 捕獲。
     const waited = await this.waitForCaptureReuse(lang);
-    if (waited) return waited;
+    if (waited) {
+      console.log('[AI_Trans PlatformAdapter] fetchTracks: waitForCaptureReuse success');
+      return waited;
+    }
+    console.log('[AI_Trans PlatformAdapter] fetchTracks: waitForCaptureReuse timeout, falling back to direct fetch');
 
     // §5.6：網絡層失敗（DNS/CORS/mixed-content/斷網）與 HTTP 非 2xx、body 解析失敗
     // 要**可區分**——統一記入 lastTrackDiagnostic 並攜帶實際證據（status/content-type/片段），

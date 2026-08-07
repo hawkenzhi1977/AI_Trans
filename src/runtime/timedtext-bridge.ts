@@ -66,42 +66,46 @@ export class TimedTextBridge {
   }
 
   /**
-   * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
-   * 已在途的捕獲（latest 就緒且匹配）立即返回；否則掛起等待 message 事件或輪詢通知。
-   * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
-   * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲——避免換視頻（SPA 導航）後
-   * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
-   */
-  waitForCapture(timeoutMs: number, expectedVideoId?: string): Promise<TimedTextCapture | null> {
-    const current = this.latest;
-    if (current && this.matchesVideo(current, expectedVideoId)) {
-      return Promise.resolve(current);
-    }
-    return new Promise<TimedTextCapture | null>((resolve) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        this.waiters.delete(onCapture);
-        // §5.4/M1-45：超時只解除本次等待，不釋放輪詢器引用（輪詢器由
-        // ensurePolling/stop 統一管理；此處置 null 會讓 stop 無法清理 interval）。
-        resolve(null);
-      }, timeoutMs);
-      const onCapture = (): void => {
-        if (settled) return;
-        const latest = this.latest;
-        if (!latest || !this.matchesVideo(latest, expectedVideoId)) return; // 等待匹配視頻的捕獲
-        settled = true;
-        clearTimeout(timer);
-        this.waiters.delete(onCapture);
-        resolve(latest);
-      };
-      // 註冊等待者（message 事件與輪詢都會通知）。
-      this.waiters.add(onCapture);
-      // 已註冊後再查一次 latest（輪詢間隙捕獲到的情況）。
-      if (this.latest && this.matchesVideo(this.latest, expectedVideoId)) onCapture();
-    });
-  }
+    * 等待最新捕獲值；超時返回 null（由調用方回退直接 fetch）。
+    * 已在途的捕獲（latest 就緒且匹配）立即返回；否則掛起等待 message 事件或輪詢通知。
+    * §5.4：所有 timer/listener 在 stop/dispose 時清理，不殘留。
+    * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲——避免換視頻（SPA 導航）後
+    * 複用上一個視頻的 stale 捕獲（不同視頻的 timedtext 響應不能互用）。
+    */
+   waitForCapture(timeoutMs: number, expectedVideoId?: string): Promise<TimedTextCapture | null> {
+     console.log('[AI_Trans Bridge] waitForCapture called, timeoutMs:', timeoutMs, 'expectedVideoId:', expectedVideoId, 'hasLatest:', !!this.latest);
+     const current = this.latest;
+     if (current && this.matchesVideo(current, expectedVideoId)) {
+       console.log('[AI_Trans Bridge] waitForCapture: latest available, returning immediately');
+       return Promise.resolve(current);
+     }
+     return new Promise<TimedTextCapture | null>((resolve) => {
+       let settled = false;
+       const timer = setTimeout(() => {
+         if (settled) return;
+         settled = true;
+         this.waiters.delete(onCapture);
+         console.log('[AI_Trans Bridge] waitForCapture: timeout after', timeoutMs, 'ms, returning null');
+         // §5.4/M1-45：超時只解除本次等待，不釋放輪詢器引用（輪詢器由
+         // ensurePolling/stop 統一管理；此處置 null 會讓 stop 無法清理 interval）。
+         resolve(null);
+       }, timeoutMs);
+       const onCapture = (): void => {
+         if (settled) return;
+         const latest = this.latest;
+         if (!latest || !this.matchesVideo(latest, expectedVideoId)) return; // 等待匹配視頻的捕獲
+         settled = true;
+         clearTimeout(timer);
+         this.waiters.delete(onCapture);
+         console.log('[AI_Trans Bridge] waitForCapture: capture received, videoId:', latest.videoId);
+         resolve(latest);
+       };
+       // 註冊等待者（message 事件與輪詢都會通知）。
+       this.waiters.add(onCapture);
+       // 已註冊後再查一次 latest（輪詢間隙捕獲到的情況）。
+       if (this.latest && this.matchesVideo(this.latest, expectedVideoId)) onCapture();
+     });
+   }
 
   /** 捕獲是否屬於指定視頻（無 expectedVideoId 或捕獲無 videoId 時視為可接受）。 */
   private matchesVideo(capture: TimedTextCapture, expectedVideoId?: string): boolean {
