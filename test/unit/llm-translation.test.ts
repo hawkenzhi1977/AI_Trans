@@ -7,6 +7,7 @@ import {
   invalidateLlmCache,
   llmCacheSize,
   ensureLlmCacheInvalidationHook,
+  BODY_TIMEOUT_MS,
 } from '../../src/adapters/translation/llm-translation';
 import type { TranslationRequest } from '../../src/domain/models/translation';
 import type { TranslationResult } from '../../src/domain/models/translation';
@@ -182,8 +183,8 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
     expect(result.segments[1].translatedText).toBe('早安');
   });
 
-  it('[M1-52] 超時觸發 AbortSignal 屬瞬態：重試耗盡後塊原文兜底', async () => {
-    // 永不 resolve 的 fetch：依賴超時中斷（含 body 讀取階段，見下獨立用例）。
+  it('[M1-53] headers 階段超時（timeoutMs）觸發 AbortSignal 屬瞬態：重試耗盡後塊原文兜底', async () => {
+    // Phase 1：永不 resolve 的 fetch（響應頭遲遲不到）→ headers 定時器 abort。
     // 超時為瞬態 → 重試耗盡後回退原文。
     const fetchMock = vi.fn(
       (_url: string, init?: RequestInit) =>
@@ -211,9 +212,9 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
     vi.useRealTimers();
   });
 
-  it('[M1-52] 超時覆蓋 body 讀取：響應頭已回但 res.text() 掛死時仍被 abort 中斷', async () => {
-    // 舊 bug：clearTimeout 在收到響應頭後即取消 → body 流掛死時超時永不觸發（連接 lost）。
-    // 修復後 AbortController 覆蓋 fetch+body 全程：res.text() 掛死也會被 abort 拒絕。
+  it('[M1-53] body 階段超時（bodyTimeoutMs）：響應頭已回但 res.text() 掛死時仍被 abort 中斷', async () => {
+    // Phase 2：headers 已到達（fetch resolve），但 res.text() 掛死 → body 定時器 abort。
+    // 兩階段共用 controller；body 超時為瞬態，重試耗盡後塊原文兜底（不永久卡死）。
     const fetchMock = vi.fn(
       (_url: string, init?: RequestInit) =>
         Promise.resolve({
@@ -236,15 +237,55 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
-      timeoutMs: 5,
+      timeoutMs: 30_000, // headers 階段足夠寬（不觸發）
+      bodyTimeoutMs: 5, // body 階段短超時，斷言 body 掛死也會被中斷
     });
-    // body 掛死 → 超時 abort → 瞬態重試耗盡 → 塊原文兜底（不會永久卡死）。
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
     const result = await promise;
     expect(result.segments[0].translatedText).toBe('line-0');
     expect(fetchMock).toHaveBeenCalledTimes(3);
     vi.useRealTimers();
+  });
+
+  it('[M1-53] headers 快返 + body 慢生成（< bodyTimeoutMs）→ 不被 headers 超時誤殺，成功翻譯', async () => {
+    // 回歸本次根因：本地 LLM 11ms 回 headers 但 body 生成需數十秒，
+    // 舊單一 30s 超時會在 body 讀取階段誤殺。兩階段方案下 headers 極短、body 寬鬆 → 成功。
+    const fetchMock = vi.fn(
+      (_url: string) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          // body 讀取延遲 100ms（模擬慢生成），遠小於 bodyTimeoutMs。
+          text: () =>
+            new Promise<string>((resolve) => {
+              setTimeout(() => resolve(JSON.stringify(llmBody)), 100);
+            }),
+        } as unknown as Response)
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.useFakeTimers();
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      timeoutMs: 5, // headers 階段極短：只要 headers 已到就 clearTimeout，不會誤殺 body
+      // bodyTimeoutMs 用默認 300s
+    });
+    const promise = provider.translate(req());
+    await vi.runAllTimersAsync();
+    const result = await promise;
+    // 成功翻譯（未被 headers 超時中斷），單次請求即成功。
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.degraded).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('[M1-53] BODY_TIMEOUT_MS 常數為 5 分鐘（本地 LLM 長輸出窗口）', () => {
+    expect(BODY_TIMEOUT_MS).toBe(300_000);
   });
 
   it('正常請求完成時不會殘留未清理的定時器', async () => {

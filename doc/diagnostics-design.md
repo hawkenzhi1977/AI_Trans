@@ -323,10 +323,10 @@
 
 - **診斷碼**: LLM translation response body read failed (connection lost): <錯誤>
 - **用戶可見消息**: 最近失敗: 錯誤: Error: LLM translation response body read failed (connection lost): <錯誤> (<timestamp>)
-- **觸發條件**: res.json() 拋出 `TypeError: Failed to fetch`（HTTP 響應頭已收到、200 已返回，但 body 流在傳輸中被中止/重置）
-- **根因**: 本地模型服務在發送 200 響應頭後、body 傳輸中途斷連（推理異常/超時關閉連接）；代理/VPN 中斷；服務器主動重置
-- **用戶響應**: 檢查本地模型服務進程是否正常、是否超時；重試；考慮調大 timeoutMs
-- **開發者響應**: 與「響應非 JSON」區分——`Failed to fetch` 是網絡層連接中斷，非格式問題；檢查服務端日誌的推理/斷連原因
+- **觸發條件**: res.text() 拋錯（HTTP 響應頭已收到、200 已返回，但 body 流在傳輸中被中止/重置/超時中止）。**M1-53 兩階段超時後此消息涵蓋兩種場景**：(a) 服務器斷連（`Failed to fetch`/`NetworkError`）；(b) body 生成超時（`The user aborted a request`——headers 已到但 body 超過 `bodyTimeoutMs`（默認 `BODY_TIMEOUT_MS=300_000`，5 分鐘）仍未生成完，本地 LLM 長輸出場景）
+- **根因**: 本地模型服務在發送 200 響應頭後、body 傳輸中途斷連（推理異常/超時關閉連接）；代理/VPN 中斷；服務器主動重置；或單塊翻譯輸出極慢超過 5min body 超時窗口
+- **用戶響應**: 檢查本地模型服務進程是否正常、是否超時；重試。**若 body 超時（`The user aborted a request`）而服務正常**，可考慮縮小 `CHUNK_SIZE` 或調大 `bodyTimeoutMs`（本地長輸出模型）
+- **開發者響應**: 與「響應非 JSON」區分——`Failed to fetch` 是網絡層連接中斷，非格式問題；`The user aborted a request` 是 body 超時中止。兩者均為瞬態（重試可能恢復）。檢查服務端日誌的推理/斷連原因；`LLM: fetch completed in X ms` 麵包屑顯示 headers 到達耗時，X 小（<1s）而後續超時 → body 生成慢
 - **代碼落點**: src/adapters/translation/llm-translation.ts:87-107
 
 ### 4.8 LLM 翻譯響應無有效 choices
@@ -339,6 +339,16 @@
 - **開發者響應**: 檢查響應結構;確認是否需要更新解析邏輯
 - **代碼落點**: src/adapters/translation/llm-translation.ts:100-104
 
+### 4.8.1 LLM 請求超時——兩階段（headers/body，M1-53）
+
+- **診斷碼**: (a) headers 階段：`LLM request timed out (aborted)`；(b) body 階段：`LLM translation response body read failed (connection lost): The user aborted a request`
+- **用戶可見消息**: 最近失敗: 錯誤: Error: LLM request timed out (aborted) (<timestamp>)；或最近失敗: 錯誤: Error: LLM translation response body read failed (connection lost): The user aborted a request (<timestamp>)
+- **觸發條件**: `fetchDirectly()` 兩階段超時之一觸發 abort：(a) **headers 超時**——`fetch()` 等待響應頭超過 `timeoutMs`（默認 30_000），服務無響應/連接 lost；(b) **body 超時**——headers 已到達但 `res.text()` 讀取超過 `bodyTimeoutMs`（默認 `BODY_TIMEOUT_MS=300_000`，5 分鐘），本地 LLM 長輸出未生成完
+- **根因**: **(a)** 端點不可達/CORS/mixed-content/服務器不響應；**(b)** 本地 LLM 單塊（60 段）翻譯輸出耗時 >5min、或 body 傳輸中斷。**M1-53 修復背景**：M1-52 舊實現用單一 30s 定時器覆蓋 `fetch`+`res.text()` 全程，本地服務 11ms 回 headers 但 body 生成需 >30s → 在 body 讀取階段被誤殺，每塊 3 次重試全超時 → 全片回退原文；兩階段解耦後 body 給足 5min
+- **用戶響應**: (a) 檢查端點與服務狀態；(b) 檢查服務推理進度，正常則無需操作（5min 窗口足夠絕大部分輸出）
+- **開發者響應**: 看 `LLM: fetch completed in X ms` 麵包屑——X 小（<1s）而後續超時 → body 生成慢（階段 b）；X 大或無此日誌 → headers 未到達（階段 a）。兩者均為瞬態（`transient=true`），重試 ≤2 次
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`fetchDirectly` / `BODY_TIMEOUT_MS` / `timeoutMs` / `bodyTimeoutMs`）
+
 ### 4.9 LLM 分塊瞬態失敗重試（M1-52）
 
 - **診斷碼**: (console.warn 麵包屑，不落 recordDiagnostic)
@@ -346,8 +356,8 @@
 - **觸發條件**: 單塊翻譯遇瞬態錯誤（`LLMRequestError.transient=true`：網絡中止/超時、HTTP 429/5xx、body 讀取失敗、JSON 解析失敗），`translateChunkWithRetry` 重試 ≤2 次（500ms→1500ms 退避）
 - **根因**: 本地服務瞬時抖動;限流;推理超時;連接短暫中斷
 - **用戶響應**: 無需操作;若整片大量塊回退原文，檢查服務穩定性與 timeoutMs
-- **開發者響應**: 觀察重試麵包屑判斷抖動頻率;瞬態 vs 永久由 `LLMRequestError.transient` 判別（4xx 非 429 為永久，立即拋錯走管線降級，不重試）
-- **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkWithRetry` / `LLMRequestError` / `MAX_RETRIES=2` / `RETRY_DELAYS_MS=[500,1500]`）
+- **開發者響應**: 觀察重試麵包屑判斷抖動頻率;瞬態 vs 永久由 `LLMRequestError.transient` 判別（4xx 非 429 為永久，立即拋錯走管線降級，不重試）。**兩階段超時後**超時即 abort 對應 §4.8.1 的 headers 或 body 階段
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkWithRetry` / `LLMRequestError` / `MAX_RETRIES=2` / `RETRY_DELAYS_MS=[500,1500]` / `BODY_TIMEOUT_MS`）
 
 ### 4.10 LLM 分塊耗盡重試後原文兜底（M1-52）
 

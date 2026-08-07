@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-07（**回填治理缺口**：新增 TC-F26 LLM 直接 fetch 架構（F-04/M1-48，SW 代理移除 + 僅配置管理）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50），TC-F09 字幕樣式從佔位升級為已實裝（F-09/M1-49，三重對比默認樣式 + 背景預設/自定義雙模式 + transparent 向後兼容）。新增 **TC-F24 調試日誌門控（F-12/M1-51，八分類開關 + 錯誤日誌不受門控）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52，CHUNK_SIZE=60 分塊 + translateStream 漸進 emit + LRU 快取 100 條 + 瞬態重試 ≤2 次 + 超時覆蓋 body 讀取）**；先前：TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）；測試合計 113→139→153→164→168→175→182→183→…→unit 87 + integration 116(+1 M1-50 arraybuffer)=117 + contract 11 + E2E 15）
+> 最後更新：2026-08-07（**回填治理缺口**：新增 TC-F26 LLM 直接 fetch 架構（F-04/M1-48，SW 代理移除 + 僅配置管理）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50），TC-F09 字幕樣式從佔位升級為已實裝（F-09/M1-49，三重對比默認樣式 + 背景預設/自定義雙模式 + transparent 向後兼容）。新增 **TC-F24 調試日誌門控（F-12/M1-51，八分類開關 + 錯誤日誌不受門控）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52，CHUNK_SIZE=60 分塊 + translateStream 漸進 emit + LRU 快取 100 條 + 瞬態重試 ≤2 次 + 超時覆蓋 body 讀取；M1-53 擴展為兩階段超時：headers `timeoutMs` 30s + body `BODY_TIMEOUT_MS` 300s，新增 H/H'/J/K 用例）**；先前：TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）；測試合計 113→139→153→164→168→175→182→183→…→unit 89（+2 M1-53 兩階段超時）+ integration 117 + contract 11 + E2E 15）
 
 ---
 
@@ -467,8 +467,8 @@ jobs:
 - 預期：調試日誌按分類可控開關，普通用戶零噪音；開發者按需開啟定位；錯誤/降級信息始終可見（§5.6 不靜默）。
 - 落點：單元 `test/unit/debug-log.test.ts`（+7）；`test/unit/config.test.ts`（DEFAULT_CONFIG 含 `debugLog`）、`test/unit/config-store.test.ts`（merge 保留 debugLog）、`test/integration/options.test.ts`（HTML 模板含調試日誌分區）。
 
-#### TC-F25 字幕翻譯分塊/快取/重試（對應 F-13/M1-52，已實裝）
-- 前置：`LLMTranslationProvider` 五項機制——`CHUNK_SIZE=60` 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取（key=`model|targetLang|djb2Hash(塊源文)`，上限 100）、瞬態失敗重試 ≤2 次（500ms→1500ms 退避）、超時覆蓋 body 讀取。模塊級快取跨測試共享，測試須 `beforeEach/afterEach` 調 `invalidateLlmCache()` 防命中污染。
+#### TC-F25 字幕翻譯分塊/快取/重試（對應 F-13/M1-52，已實裝；M1-53 兩階段超時）
+- 前置：`LLMTranslationProvider` 機制——`CHUNK_SIZE=60` 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取（key=`model|targetLang|djb2Hash(塊源文)`，上限 100）、瞬態失敗重試 ≤2 次（500ms→1500ms 退避）、**兩階段超時**（M1-53：headers `timeoutMs` 默認 30s + body `bodyTimeoutMs` 默認 `BODY_TIMEOUT_MS=300_000`，共用同一 `AbortController`）。模塊級快取跨測試共享，測試須 `beforeEach/afterEach` 調 `invalidateLlmCache()` 防命中污染。
 - 步驟：
   - A（分塊邊界）：130 段 → `chunkSegments` 為 [60,60,10] 三塊；恰 60 段 → 一塊；空輸入 → `[[]]`。
   - B（漸進 emit）：130 段 `translateStream` → emit 序列長度遞增 [60,120,130]（每塊完成 emit 累計全量）。
@@ -477,10 +477,13 @@ jobs:
   - E（LRU 逐出）：110 個不同 key 依序寫入 → 快取大小收斂至 100（最舊被淘汰）。
   - F（瞬態重試）：HTTP 500 / 超時 / body 非 JSON / body 讀取 `Failed to fetch` → fake timers 下 3 請求後回退原文（不拋錯）；HTTP 429 首敗後成功 → 2 請求取成功結果。
   - G（永久失敗 fail-fast）：HTTP 400（非 429）→ 立即拋 `LLMRequestError` 且僅 1 請求；choices 缺失/content 非字符串 → 拋錯走降級。
-  - H（超時覆蓋 body 掛死）：`res.text()` 掛死 → AbortController 超時中斷（fake timers 推進）→ 瞬態重試。
+  - H（**M1-53 headers 超時**）：`fetch()` 永不 resolve（響應頭遲遲不到）→ `timeoutMs` abort → 瞬態重試 → 原文兜底。
+  - H'（**M1-53 body 超時**）：headers 已回但 `res.text()` 掛死 → `bodyTimeoutMs`（測試注入短值）abort → 瞬態重試 → 原文兜底（保留 M1-52「覆蓋 body 掛死」能力）。
   - I（配置變更失效）：`ensureLlmCacheInvalidationHook` 註冊 once-guard；`invalidateLlmCache()` 全量清空（重播零請求→清空後重新請求）。
-- 預期：長視頻首塊秒級可見、後續增量替換；重播/切配置免重複請求；瞬態抖動自動恢復、單塊失敗原文兜底不阻塞；永久失敗立即降級可診斷。
-- 落點：單元 `test/unit/llm-translation.test.ts`（重寫，27 用例）+ `test/unit/native-caption-strategy.test.ts`（+3 流式）。
+  - J（**M1-53 headers 快 + body 慢回歸**）：headers 立即返回 + body 延遲（<bodyTimeoutMs）生成 → **不被 headers 超時誤殺**，單次請求成功翻譯、`degraded=false`。此為本次修復核心回歸（本地 LLM 11ms 回 headers、body 生成 >30s 的場景）。
+  - K（**M1-53 常數**）：`BODY_TIMEOUT_MS = 300_000`（5 分鐘長輸出窗口）。
+- 預期：長視頻首塊秒級可見、後續增量替換；重播/切配置免重複請求；瞬態抖動自動恢復、單塊失敗原文兜底不阻塞；永久失敗立即降級可診斷；**本地 LLM 慢生成不再被 30s headers 超時誤殺**。
+- 落點：單元 `test/unit/llm-translation.test.ts`（29 用例，含 M1-53 兩階段超時 H/H'/J/K）+ `test/unit/native-caption-strategy.test.ts`（+3 流式）。
 
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。

@@ -827,6 +827,7 @@
   var CHUNK_SIZE = 60;
   var MAX_RETRIES = 2;
   var RETRY_DELAYS_MS = [500, 1500];
+  var BODY_TIMEOUT_MS = 3e5;
   var CACHE_MAX_ENTRIES = 100;
   function djb2Hash(text) {
     let hash = 5381;
@@ -881,10 +882,14 @@
     constructor(opts) {
       this.opts = opts;
       this.timeoutMs = opts.timeoutMs ?? 3e4;
+      this.bodyTimeoutMs = opts.bodyTimeoutMs ?? BODY_TIMEOUT_MS;
     }
     opts;
     location = "cloud";
+    /** Headers 階段超時（等待響應頭到達）。 */
     timeoutMs;
+    /** Body 讀取階段超時（headers 到達後等待 body 生成完成）。 */
+    bodyTimeoutMs;
     get engineId() {
       return this.opts.engineId;
     }
@@ -1027,12 +1032,15 @@
      * 可以直接 fetch localhost，不受 CORS 限制。
      * M1-52：AbortController 覆蓋 fetch+body 讀取全程——原實現收到響應頭後即
      * clearTimeout，body 流掛死時超時永遠不觸發（M1-47 用戶反饋的 connection lost 場景）。
+     * M1-53：改為兩階段超時——headers 階段（timeoutMs，默認 30s）抓 connection lost；
+     * fetch resolve 後進入 body 階段（bodyTimeoutMs，默認 300s），本地 LLM 長輸出
+     * （單塊 60 段）不再被 30s 誤殺。兩階段共用同一 AbortController，均為瞬態錯誤。
      */
     async fetchDirectly(request) {
       diagLog("llm", "fetching directly to", request.endpoint);
       const startTime = Date.now();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      const headerTimer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
         const res = await globalThis.fetch(request.endpoint, {
           method: "POST",
@@ -1042,6 +1050,8 @@
         });
         const elapsed = Date.now() - startTime;
         diagLog("llm", "fetch completed in", elapsed, "ms, status =", res.status);
+        clearTimeout(headerTimer);
+        const bodyTimer = setTimeout(() => controller.abort(), this.bodyTimeoutMs);
         let text;
         try {
           text = await res.text();
@@ -1051,6 +1061,8 @@
             res.status,
             true
           );
+        } finally {
+          clearTimeout(bodyTimer);
         }
         return { ok: res.ok, status: res.status, body: text };
       } catch (err) {
@@ -1063,7 +1075,7 @@
           true
         );
       } finally {
-        clearTimeout(timer);
+        clearTimeout(headerTimer);
       }
     }
   };

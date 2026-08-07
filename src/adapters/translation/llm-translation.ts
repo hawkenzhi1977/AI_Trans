@@ -42,6 +42,12 @@ const MAX_RETRIES = 2;
 /** 重試退避間隔（毫秒）：第 1 次重試前 500ms，第 2 次 1500ms。 */
 const RETRY_DELAYS_MS = [500, 1500];
 
+/**
+ * Body 讀取階段超時（毫秒）：headers 已到達但 body 生成慢（本地 LLM 推理長輸出）時
+ * 給出遠大於 headers 階段的窗口（M1-53 兩階段超時）。5 分鐘後仍無 body → abort。
+ */
+export const BODY_TIMEOUT_MS = 300_000;
+
 /** LRU 快取條目上限（~120B/條 ≈ 12KB 上限）。 */
 const CACHE_MAX_ENTRIES = 100;
 
@@ -127,7 +133,10 @@ export function llmCacheSize(): number {
 
 export class LLMTranslationProvider implements TranslationProvider {
   readonly location = 'cloud' as const;
+  /** Headers 階段超時（等待響應頭到達）。 */
   private readonly timeoutMs: number;
+  /** Body 讀取階段超時（headers 到達後等待 body 生成完成）。 */
+  private readonly bodyTimeoutMs: number;
 
   constructor(
     private readonly opts: {
@@ -135,11 +144,14 @@ export class LLMTranslationProvider implements TranslationProvider {
       endpoint: string;
       model: string;
       apiKey: string;
-      /** 請求超時（毫秒）。reasoning 模型可能長時間思考，超時後降級 fallback 避免字幕卡死。 */
+      /** Headers 超時（毫秒）。等待響應頭到達；抓 connection lost / 服務無響應。 */
       timeoutMs?: number;
+      /** Body 超時（毫秒）。headers 到達後等待 body 生成；本地 LLM 長輸出需足夠窗口。 */
+      bodyTimeoutMs?: number;
     }
   ) {
     this.timeoutMs = opts.timeoutMs ?? 30_000;
+    this.bodyTimeoutMs = opts.bodyTimeoutMs ?? BODY_TIMEOUT_MS;
   }
 
   get engineId(): string {
@@ -324,6 +336,9 @@ export class LLMTranslationProvider implements TranslationProvider {
    * 可以直接 fetch localhost，不受 CORS 限制。
    * M1-52：AbortController 覆蓋 fetch+body 讀取全程——原實現收到響應頭後即
    * clearTimeout，body 流掛死時超時永遠不觸發（M1-47 用戶反饋的 connection lost 場景）。
+   * M1-53：改為兩階段超時——headers 階段（timeoutMs，默認 30s）抓 connection lost；
+   * fetch resolve 後進入 body 階段（bodyTimeoutMs，默認 300s），本地 LLM 長輸出
+   * （單塊 60 段）不再被 30s 誤殺。兩階段共用同一 AbortController，均為瞬態錯誤。
    */
   private async fetchDirectly(request: {
     endpoint: string;
@@ -333,7 +348,8 @@ export class LLMTranslationProvider implements TranslationProvider {
     diagLog('llm', 'fetching directly to', request.endpoint);
     const startTime = Date.now();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // Phase 1：headers 超時——等響應頭到達（connection lost 場景在此被抓）。
+    const headerTimer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
       const res = await globalThis.fetch(request.endpoint, {
@@ -344,21 +360,28 @@ export class LLMTranslationProvider implements TranslationProvider {
       });
       const elapsed = Date.now() - startTime;
       diagLog('llm', 'fetch completed in', elapsed, 'ms, status =', res.status);
+
+      // headers 已到達 → 進入 Phase 2：body 超時（給本地 LLM 長輸出足夠窗口）。
+      clearTimeout(headerTimer);
+      const bodyTimer = setTimeout(() => controller.abort(), this.bodyTimeoutMs);
+
       let text: string;
       try {
         text = await res.text();
       } catch (err) {
-        // body 讀取失敗（連接中斷）歸為瞬態錯誤供重試。
+        // body 讀取失敗（連接中斷/body 超時中止）歸為瞬態錯誤供重試。
         throw new LLMRequestError(
           `response body read failed: ${err instanceof Error ? err.message : String(err)}`,
           res.status,
           true
         );
+      } finally {
+        clearTimeout(bodyTimer);
       }
       return { ok: res.ok, status: res.status, body: text };
     } catch (err) {
       if (err instanceof LLMRequestError) throw err;
-      // AbortError：超時中斷（含 fetch 階段與 body 讀取階段）——瞬態（重試可能恢復）。
+      // AbortError：headers 或 body 階段超時中斷——瞬態（重試可能恢復）。
       const isAbort =
         err instanceof DOMException
           ? err.name === 'AbortError'
@@ -372,9 +395,9 @@ export class LLMTranslationProvider implements TranslationProvider {
         true
       );
     } finally {
-      // M1-52：定時器在整個 fetch+body 讀取完成（或拋錯）後的 finally 統一清理，
-      // 不再像舊版在收到響應頭後取消——body 掛死時也能觸發中斷。
-      clearTimeout(timer);
+      // M1-52/53：headers 定時器在整個流程完成（或拋錯）後統一清理，
+      // 兩個階段共用 controller，無重複 abort（abort 後再 abort 是 no-op）。
+      clearTimeout(headerTimer);
     }
   }
 }

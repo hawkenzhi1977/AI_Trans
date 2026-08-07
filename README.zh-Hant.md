@@ -16,7 +16,7 @@ English version: [README.md](./README.md).
 - **覆蓋層字幕渲染**——支持單語或雙語（原文＋譯文），渲染於獨立覆蓋層並對齊播放時間。
 - **播放狀態同步**——字幕隨當前時間、暫停、快進同步（媒體事件 + `requestAnimationFrame` 對齊）。
 - **可配置翻譯引擎**——雲端 LLM（OpenAI 兼容 `/chat/completions`）為主、傳統 MT 兜底；端點、模型、API Key 由用戶配置。API Key 與配置對象分離存儲。
-- **本地 LLM 服務支援**——可搭配本地 OpenAI 兼容服務（mlx / omlx / LM Studio / Ollama）：端點欄位接受「Base URL（如 `http://127.0.0.1:8000/v1`）」或「完整 `/chat/completions` 路徑」（自動規範化）；已授權 `http://127.0.0.1/*` 與 `http://localhost/*` 主機權限；reasoning 模型的 `<think>` 思考塊會自回覆中剝離；長思考請求超時（30s）後降級 MT 兜底；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效。
+- **本地 LLM 服務支援**——可搭配本地 OpenAI 兼容服務（mlx / omlx / LM Studio / Ollama）：端點欄位接受「Base URL（如 `http://127.0.0.1:8000/v1`）」或「完整 `/chat/completions` 路徑」（自動規範化）；已授權 `http://127.0.0.1/*` 與 `http://localhost/*` 主機權限；reasoning 模型的 `<think>` 思考塊會自回覆中剝離；請求採用**兩階段超時**——響應頭 30s + 響應 body 5 分鐘（本地 LLM 長輸出不會被 30s 誤殺）；配置變更經 `chrome.storage.onChanged` 跨上下文熱重啟生效。
 - **目標語言與字幕樣式**——可選目標語言、顯示模式（單語/雙語）、字號、顏色、背景。
 - **Options 與 Popup 配置界面**——完整設定頁 + 快捷彈出頁（狀態顯示 + 重新載入）。
 - **可靠性加固的內容腳本**——宿主方法綁定（避免 "Illegal invocation"）、配置熱重載時無訂閱洩漏、外部 JSON 容錯解析（詳見 `AGENTS.md` §5）。
@@ -123,7 +123,7 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 3. 若伺服器需要驗證，填入 API Key（不需要則任意非空字串）。
 4. 儲存。content script 會熱重啟配置；若 YouTube 分頁已開啟，無需手動重新整理即可生效。
 
-> **reasoning 模型提示**：會輸出長 `<think>` 思考的模型已支援（思考塊會被剝離），但單次翻譯可能耗時 30–40s，易命中 30s 請求超時而降級 MT 兜底。要即時字幕建議改用非推理（instruct）模型。
+> **reasoning 模型提示**：會輸出長 `<think>` 思考的模型已支援（思考塊會被剝離）。採兩階段超時後，body 生成給足 5 分鐘（僅服務不響應/不可達才命中 30s 響應頭超時），但單次翻譯仍可能耗時 30–40s。要即時字幕建議改用非推理（instruct）模型。
 
 > **排查提示 — 字幕不出現時**：先開 Popup 點**「測試連接」**——它會向配置端點發真實請求，直接告訴你失敗在哪一環（端點不可達/模型名不符/響應異常）。也可看**「最近失敗」**行（常駐顯示，如模型 404 `LLM translation failed: HTTP 404`）或 DevTools console 的 `[AI_Trans] translation degraded` 麵包屑。若原因為 `no caption strategies applicable`，則屬**字幕軌抓取失敗**（與翻譯失敗不同），cause 會進一步區分三種子情況——找不到 player-response JSON / JSON 解析失敗 / 視頻確實無字幕軌。若原因為 `timedtext XML: missing transcript root` 或 timedtext 解析錯誤，說明字幕響應格式未被識別——擴充現已優先請求 `fmt=json3` 並回退 srv3 XML 解析；若 timedtext 請求被 YouTube 的 `pot` token 防護攔截，擴充會透明複用播放器自身的字幕響應。常見原因：模型 ID 與伺服器實際名稱不符（omlx 會回 404 Model not found）；端點格式（`http://127.0.0.1:8000/v1` 與 `http://127.0.0.1:8000/v1/chat/completions` 都會自動規範化）。**注意**：Chrome 對 `127.0.0.1`/`localhost` 的明文 HTTP 有 mixed-content 豁免，本地端點用 `http://127.0.0.1:PORT/v1` 即可，無需 HTTPS。**進階診斷字幕捕獲**：開頁面 DevTools console 讀取 `window.__aiTransTimedtextInterceptorInstalled`（MAIN world 攔截器已載入？）、`window.__aiTransTimedtextRequests`（已捕獲字幕響應數——`0` 表示攔截器從未匹配請求）、`window.__aiTransTimedtextLastCapture`（最近捕獲響應，含 `videoId`）。
 
