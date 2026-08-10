@@ -48765,13 +48765,46 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     return String(cause ?? "unknown error");
   }
+  function isUserActionable(message) {
+    const patterns = [
+      // 網絡錯誤
+      "Failed to fetch",
+      "NetworkError",
+      "CORS",
+      "Mixed Content",
+      "net::ERR_",
+      // HTTP 狀態碼
+      "401",
+      "403",
+      "404",
+      "429",
+      "500",
+      "502",
+      "503",
+      "504",
+      // 權限類
+      "tab-capture-not-authorized",
+      "not authorized",
+      "permission",
+      "access denied",
+      // 配置類
+      "model",
+      "endpoint",
+      "API key",
+      "not found",
+      "invalid"
+    ];
+    const lower = message.toLowerCase();
+    return patterns.some((p) => lower.includes(p.toLowerCase()));
+  }
   async function recordDiagnostic(e) {
     const diag = extractDiagnostic(e);
     if (!diag) return;
     const record = {
       kind: diag.kind,
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      message: diag.message
+      message: diag.message,
+      actionable: isUserActionable(diag.message)
     };
     console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
     try {

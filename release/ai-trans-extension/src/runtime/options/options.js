@@ -276,6 +276,15 @@
     $("btn-reset").addEventListener("click", () => {
       fillForm(DEFAULT_CONFIG);
     });
+    const versionEl = $("version");
+    if (versionEl) {
+      try {
+        const manifest = chrome.runtime.getManifest();
+        versionEl.textContent = `v${manifest.version}`;
+      } catch {
+        versionEl.textContent = "v0.0.0";
+      }
+    }
   }
   void init();
 })();

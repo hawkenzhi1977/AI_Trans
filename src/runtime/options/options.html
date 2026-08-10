@@ -80,8 +80,30 @@
   <fieldset>
     <div class="row">
       <div>
-        <label for="target-lang">目標語言（BCP-47）</label>
-        <input id="target-lang" type="text" placeholder="zh-Hant" />
+        <label for="target-lang">目標語言</label>
+        <select id="target-lang">
+          <option value="zh-Hant">中文（繁體）</option>
+          <option value="zh-Hans">中文（简体）</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="es">Español</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="pt">Português</option>
+          <option value="ru">Русский</option>
+          <option value="ar">العربية</option>
+          <option value="hi">हिन्दी</option>
+          <option value="th">ไทย</option>
+          <option value="vi">Tiếng Việt</option>
+          <option value="id">Bahasa Indonesia</option>
+          <option value="ms">Bahasa Melayu</option>
+          <option value="it">Italiano</option>
+          <option value="nl">Nederlands</option>
+          <option value="tr">Türkçe</option>
+          <option value="pl">Polski</option>
+          <option value="uk">Українська</option>
+        </select>
       </div>
       <div>
         <label for="display-mode">顯示模式</label>
@@ -152,6 +174,10 @@
     <button id="btn-reset">恢復默認</button>
     <span id="status"></span>
   </div>
+
+  <footer style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #ddd; text-align: center; color: #888; font-size: 12px;">
+    <span id="version"></span>
+  </footer>
 
   <script src="options.js"></script>
 </body>

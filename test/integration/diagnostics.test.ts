@@ -3,6 +3,7 @@ import {
   DIAGNOSTIC_KEY,
   extractDiagnostic,
   formatDiagnostic,
+  isUserActionable,
   recordDiagnostic,
   readLastDiagnostic,
 } from '../../src/infrastructure/diagnostics';
@@ -106,5 +107,91 @@ describe('diagnostics 診斷持久化', () => {
   it('extractDiagnostic 非 translation/asr 端口的降級不記錄（如 platform 端口）', () => {
     const diag = extractDiagnostic({ type: 'engine-degraded', port: 'platform', reason: 'no adapter' });
     expect(diag).toBeUndefined();
+  });
+});
+
+describe('isUserActionable 白名單匹配（popup 過濾用）', () => {
+  it('網絡錯誤匹配', () => {
+    expect(isUserActionable('TypeError: Failed to fetch')).toBe(true);
+    expect(isUserActionable('NetworkError when attempting to fetch resource')).toBe(true);
+    expect(isUserActionable('CORS policy: No Access-Control-Allow-Origin')).toBe(true);
+    expect(isUserActionable('Mixed Content: blocked upgrade')).toBe(true);
+    expect(isUserActionable('net::ERR_CONNECTION_REFUSED')).toBe(true);
+  });
+
+  it('HTTP 狀態碼匹配', () => {
+    expect(isUserActionable('HTTP 401 Unauthorized')).toBe(true);
+    expect(isUserActionable('HTTP 403 Forbidden')).toBe(true);
+    expect(isUserActionable('HTTP 404 Not Found')).toBe(true);
+    expect(isUserActionable('HTTP 429 Too Many Requests')).toBe(true);
+    expect(isUserActionable('HTTP 500 Internal Server Error')).toBe(true);
+    expect(isUserActionable('HTTP 502 Bad Gateway')).toBe(true);
+    expect(isUserActionable('HTTP 503 Service Unavailable')).toBe(true);
+    expect(isUserActionable('HTTP 504 Gateway Timeout')).toBe(true);
+  });
+
+  it('權限類錯誤匹配', () => {
+    expect(isUserActionable('tab-capture-not-authorized')).toBe(true);
+    expect(isUserActionable('user not authorized')).toBe(true);
+    expect(isUserActionable('permission denied')).toBe(true);
+    expect(isUserActionable('access denied for resource')).toBe(true);
+  });
+
+  it('配置類錯誤匹配', () => {
+    expect(isUserActionable('model gpt-4o-mini not found')).toBe(true);
+    expect(isUserActionable('invalid endpoint URL')).toBe(true);
+    expect(isUserActionable('API key missing or invalid')).toBe(true);
+    expect(isUserActionable('resource not found')).toBe(true);
+    expect(isUserActionable('invalid configuration')).toBe(true);
+  });
+
+  it('內部調測信息不匹配', () => {
+    expect(isUserActionable('JSON parse failed: Unexpected token')).toBe(false);
+    expect(isUserActionable('no caption tracks found')).toBe(false);
+    expect(isUserActionable('player response videoId mismatch')).toBe(false);
+    expect(isUserActionable('stale DOM data detected')).toBe(false);
+    expect(isUserActionable('bridge captured tracks timeout')).toBe(false);
+    expect(isUserActionable('interceptor videoId mismatch')).toBe(false);
+  });
+});
+
+describe('recordDiagnostic actionable 標記', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    vi.restoreAllMocks();
+  });
+
+  it('用戶可操作錯誤設置 actionable: true', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const event: PipelineEvent = {
+      type: 'engine-degraded',
+      port: 'translation',
+      reason: 'TypeError: Failed to fetch',
+    };
+
+    await recordDiagnostic(event);
+
+    const stored = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as Record<string, unknown>;
+    const rec = stored[DIAGNOSTIC_KEY] as { actionable: boolean };
+    expect(rec.actionable).toBe(true);
+  });
+
+  it('內部調測錯誤設置 actionable: false', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const event: PipelineEvent = {
+      type: 'pipeline-error',
+      error: {
+        port: 'platform',
+        code: 'parse-failed',
+        recoverable: false,
+        cause: new Error('JSON parse failed: Unexpected token'),
+      },
+    };
+
+    await recordDiagnostic(event);
+
+    const stored = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as Record<string, unknown>;
+    const rec = stored[DIAGNOSTIC_KEY] as { actionable: boolean };
+    expect(rec.actionable).toBe(false);
   });
 });

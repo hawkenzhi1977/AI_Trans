@@ -13,7 +13,7 @@ const HTML = `
   <select id="asr-tier"><option value="tiny">tiny</option><option value="base">base</option><option value="small">small</option></select>
   <input id="asr-endpoint" />
   <input id="asr-custom-model" />
-  <input id="target-lang" />
+  <select id="target-lang"><option value="zh-Hant">中文（繁體）</option><option value="en">English</option><option value="ja">日本語</option></select>
   <select id="display-mode"><option value="mono">僅譯文</option><option value="bilingual">雙語</option></select>
   <select id="performance-profile"><option value="streaming">streaming</option><option value="balanced">balanced</option><option value="quality">quality</option></select>
   <input id="style-font-size" />
@@ -37,6 +37,7 @@ const HTML = `
   <span id="status"></span>
   <button id="btn-save">保存</button>
   <button id="btn-reset">重置</button>
+  <footer><span id="version"></span></footer>
 `;
 
 const SAVED_CONFIG: EngineConfig = {
@@ -73,7 +74,7 @@ describe('Options — §5.6 配置讀取失敗可見', () => {
     await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
     await loadOptions();
     expect((document.getElementById('translation-type') as HTMLSelectElement).value).toBe('mt');
-    expect((document.getElementById('target-lang') as HTMLInputElement).value).toBe('zh-Hant');
+    expect((document.getElementById('target-lang') as HTMLSelectElement).value).toBe('zh-Hant');
   });
 
   it('配置讀取失敗 → 顯示錯誤狀態且用默認值兜底（不空白）', async () => {

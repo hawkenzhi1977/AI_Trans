@@ -11,6 +11,8 @@ export interface DiagnosticRecord {
   timestamp: string;
   /** 人類可讀原因（如 mixed-content 的 TypeError: Failed to fetch）。 */
   message: string;
+  /** 是否為用戶可操作的錯誤（popup 顯示用；DevTools 仍保留所有記錄）。 */
+  actionable?: boolean;
 }
 
 /** 存儲 key——與 engineConfig 無關的獨立診斷槽位。 */
@@ -42,6 +44,44 @@ function formatCause(cause: unknown): string {
 }
 
 /**
+ * 判斷診斷消息是否為用戶可操作的錯誤（popup 顯示用）。
+ * 白名單匹配：網絡錯誤、權限問題、配置錯誤等需要用戶介入的情況。
+ * DevTools 仍保留所有記錄，此函數僅用於 popup 過濾。
+ */
+export function isUserActionable(message: string): boolean {
+  const patterns = [
+    // 網絡錯誤
+    'Failed to fetch',
+    'NetworkError',
+    'CORS',
+    'Mixed Content',
+    'net::ERR_',
+    // HTTP 狀態碼
+    '401',
+    '403',
+    '404',
+    '429',
+    '500',
+    '502',
+    '503',
+    '504',
+    // 權限類
+    'tab-capture-not-authorized',
+    'not authorized',
+    'permission',
+    'access denied',
+    // 配置類
+    'model',
+    'endpoint',
+    'API key',
+    'not found',
+    'invalid',
+  ];
+  const lower = message.toLowerCase();
+  return patterns.some((p) => lower.includes(p.toLowerCase()));
+}
+
+/**
  * 記錄一次降級/錯誤診斷：寫入 chrome.storage.local 並打 console.warn。
  * §5.7：chrome API 在異常環境（被卸載/權限不足）可能拋錯，必須 try/catch 守護，
  * 診斷記錄失敗不得影響主流程。
@@ -53,6 +93,7 @@ export async function recordDiagnostic(e: PipelineEvent): Promise<void> {
     kind: diag.kind,
     timestamp: new Date().toISOString(),
     message: diag.message,
+    actionable: isUserActionable(diag.message),
   };
   // 麵包屑：優先讓 DevTools console 直接可見（不含敏感信息，純錯誤原因）。
   console.warn(`[AI_Trans] translation degraded: ${diag.message}`);

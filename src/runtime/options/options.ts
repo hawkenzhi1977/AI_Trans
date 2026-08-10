@@ -102,7 +102,7 @@ function readForm(): EngineConfig {
       endpoint: $<HTMLInputElement>('asr-endpoint').value || undefined,
       customModelPath: $<HTMLInputElement>('asr-custom-model').value || undefined,
     },
-    targetLang: $<HTMLInputElement>('target-lang').value || 'zh-Hant',
+    targetLang: $<HTMLSelectElement>('target-lang').value || 'zh-Hant',
     displayMode: $<HTMLSelectElement>('display-mode').value as 'mono' | 'bilingual',
     performanceProfile: profile,
     subtitleStyle: {
@@ -133,7 +133,7 @@ function fillForm(config: EngineConfig): void {
   $<HTMLSelectElement>('asr-tier').value = config.asr.modelTier ?? 'base';
   $<HTMLInputElement>('asr-endpoint').value = config.asr.endpoint ?? '';
   $<HTMLInputElement>('asr-custom-model').value = config.asr.customModelPath ?? '';
-  $<HTMLInputElement>('target-lang').value = config.targetLang;
+  $<HTMLSelectElement>('target-lang').value = config.targetLang;
   $<HTMLSelectElement>('display-mode').value = config.displayMode;
   $<HTMLSelectElement>('performance-profile').value = config.performanceProfile;
   $<HTMLInputElement>('style-font-size').value = config.subtitleStyle?.['font-size'] ?? '24px';
@@ -234,6 +234,17 @@ async function init(): Promise<void> {
   $<HTMLButtonElement>('btn-reset').addEventListener('click', () => {
     fillForm(DEFAULT_CONFIG);
   });
+
+  // 版本號顯示
+  const versionEl = $('version');
+  if (versionEl) {
+    try {
+      const manifest = chrome.runtime.getManifest();
+      versionEl.textContent = `v${manifest.version}`;
+    } catch {
+      versionEl.textContent = 'v0.0.0';
+    }
+  }
 }
 
 void init();

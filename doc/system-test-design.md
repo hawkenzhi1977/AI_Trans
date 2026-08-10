@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-10（**M2-22 第六層治理回填**：新增 TC-M2-16 合成軌驅動播放器（DOM stale + getOption 空陣列時用 URL videoId 構造合成軌道嘗試驅動播放器），解決攔截器在無法獲取軌道時放棄驅動導致播放器從不發 timedtext 請求的問題；先前：M2-22 第五層治理回填 TC-M2-15 waitForCapturedTracks 等待 bridge 軌道到達（立即返回 / 等待到達 / 超時 / videoId 過濾），解決 `fetchTrackList()` 在 bridge 尚未收到軌道信息時提前返回空陣列的時序問題；先前：M2-22 第四層治理回填 TC-M2-14 emitCapture 直接從 URL 提取軌道信息（`extractTrackInfoFromUrl()` + `emitCapture` 發送軌道信息 + 重播定時器發送軌道信息），確保 bridge 在 video-changed 清空後仍能收到；先前：M2-22 第三層治理回填 TC-M2-13 非 watch 頁 SPA 導航字幕切換修復（`startUrlPolling()` 移到 `isWatchPage` 守衛前 + 攔截器/適配器 `currentVid` 為空時 early return 避免 stale DOM 數據）；先前：M2-22 補充治理回填 TC-M2-12 stale DOM 軌列表覆蓋播放器正確請求修復（M2-22 補充，`ensureCaptionModuleLoaded()` 開頭 early return：若 `lastCapture.videoId === currentVideoId` 則跳過驅動，避免 stale DOM 軌覆蓋播放器正確請求）；先前：M2-22 治理回填 TC-M2-10 視頻切換 URL 輪詢偵測（M2-21，pushState patch 被覆蓋兜底 + URL 輪詢 1.5s 檢查 `v` 參數變化）+ TC-M2-11 視頻切換 SPA 導航字幕修復（M2-22，videoId 驗證 + 播放器 API fallback + `ai-trans:video-changed` 事件清空 stale 捕獲 + 攔截器 videoId 驗證）；先前：M2-18 治理回填 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列）；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 101 + integration 142 + contract 11 = 254
+> 最後更新：2026-08-10（**M2-23 UI 增強治理回填**：新增 TC-M2-17 目標語言下拉框 + 診斷過濾 + 版本號顯示（M2-23，`target-lang` 改 `<select>` 含 21 種原生語言名稱 + `isUserActionable()` 白名單匹配 + `DiagnosticRecord.actionable` 標記 + popup 過濾 + 版本號 `<footer>`）；先前：M2-22 第六層治理回填 TC-M2-16 合成軌驅動播放器（DOM stale + getOption 空陣列時用 URL videoId 構造合成軌道嘗試驅動播放器），解決攔截器在無法獲取軌道時放棄驅動導致播放器從不發 timedtext 請求的問題；先前：M2-22 第五層治理回填 TC-M2-15 waitForCapturedTracks 等待 bridge 軌道到達（立即返回 / 等待到達 / 超時 / videoId 過濾），解決 `fetchTrackList()` 在 bridge 尚未收到軌道信息時提前返回空陣列的時序問題；先前：M2-22 第四層治理回填 TC-M2-14 emitCapture 直接從 URL 提取軌道信息（`extractTrackInfoFromUrl()` + `emitCapture` 發送軌道信息 + 重播定時器發送軌道信息），確保 bridge 在 video-changed 清空後仍能收到；先前：M2-22 第三層治理回填 TC-M2-13 非 watch 頁 SPA 導航字幕切換修復（`startUrlPolling()` 移到 `isWatchPage` 守衛前 + 攔截器/適配器 `currentVid` 為空時 early return 避免 stale DOM 數據）；先前：M2-22 補充治理回填 TC-M2-12 stale DOM 軌列表覆蓋播放器正確請求修復（M2-22 補充，`ensureCaptionModuleLoaded()` 開頭 early return：若 `lastCapture.videoId === currentVideoId` 則跳過驅動，避免 stale DOM 軌覆蓋播放器正確請求）；先前：M2-22 治理回填 TC-M2-10 視頻切換 URL 輪詢偵測（M2-21，pushState patch 被覆蓋兜底 + URL 輪詢 1.5s 檢查 `v` 參數變化）+ TC-M2-11 視頻切換 SPA 導航字幕修復（M2-22，videoId 驗證 + 播放器 API fallback + `ai-trans:video-changed` 事件清空 stale 捕獲 + 攔截器 videoId 驗證）；先前：M2-18 治理回填 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列）；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 101 + integration 149 + contract 11 = 261
 
 ---
 
@@ -653,6 +653,16 @@ jobs:
 - 預期：A 中 `setOption` 被調用，參數為合成軌道（含 URL videoId 構造 baseUrl）。
 - 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+1：DOM stale + getOption 空陣列時用合成軌驅動）。
 
+#### TC-M2-17 UI 增強：目標語言下拉框 + 診斷過濾 + 版本號顯示（對應 M2-23）
+- 步驟：
+  - A（目標語言下拉框）：Options HTML 的 `target-lang` 為 `<select>` 而非 `<input type="text">`，包含 21 種語言選項並以原生語言名稱顯示（`中文（繁體）`/`English`/`日本語`/`한국어`/`Español` 等）；`options.ts` 以 `HTMLSelectElement` 讀寫。
+  - B（isUserActionable 白名單匹配）：`isUserActionable(message)` 對用戶可操作錯誤返回 `true`（網絡錯誤 `Failed to fetch`/`NetworkError`/`CORS`/`Mixed Content`/`net::ERR_`、HTTP 狀態碼 `401`-`504`、權限問題 `tab-capture-not-authorized`/`permission`/`access denied`、配置錯誤 `model`/`endpoint`/`API key`/`not found`/`invalid`），對內部調測信息返回 `false`（`JSON parse failed`/`no caption tracks found`/`videoId mismatch`/`stale DOM data`/`bridge captured tracks timeout`/`interceptor videoId mismatch`）。
+  - C（DiagnosticRecord actionable 標記）：`recordDiagnostic()` 自動設置 `actionable` 字段——用戶可操作錯誤設為 `true`，內部調測錯誤設為 `false`。
+  - D（Popup 診斷過濾）：Popup 僅顯示 `actionable !== false` 的記錄（DevTools 仍保留全部記錄，向後兼容舊記錄無 `actionable` 字段時默認顯示）。
+  - E（版本號顯示）：Options 頁底部 `<footer>` 包含 `<span id="version">`，`options.ts` 注入 `chrome.runtime.getManifest().version` 顯示版本號。
+- 預期：A 中語言選擇更友好（原生語言名稱）；B/C/D 中 popup 僅顯示用戶可操作錯誤，內部調測信息不污染用戶界面；E 中用戶可快速確認擴充版本。
+- 落點：集成 `test/integration/diagnostics.test.ts`（+10：isUserActionable 白名單 5 類 11 用例 + actionable 標記 2 類）+ 測試基礎設施更新（`setup-dom.ts` 加 `getManifest` mock、`options.test.ts` HTML 模板加 `#version` + `target-lang` 改 `<select>`）。
+
 #### TC-F08 預緩衝提前處理與降級（對應 F-08）
 - 前置：可預取音頻的 mock 場景。
 - 步驟 A：預取可用 → 走二級 look-ahead。
@@ -776,6 +786,7 @@ jobs:
 | TC-M2-14 | M2-22 第四層 | 集成（已實裝） |
 | TC-M2-15 | M2-22 第五層 | 集成（已實裝） |
 | TC-M2-16 | M2-22 第六層 | 集成（已實裝） |
+| TC-M2-17 | M2-23 UI 增強 | 集成（已實裝） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

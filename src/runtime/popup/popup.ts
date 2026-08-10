@@ -33,11 +33,16 @@ async function init(): Promise<void> {
   $('status-asr').textContent = describeAsr(config);
   $('status-lang').textContent = `目標語言: ${config.targetLang} · ${config.displayMode === 'mono' ? '僅譯文' : '雙語'}`;
 
-  // 最近一次失敗診斷：常駐顯示（無記錄顯示「無」，避免「看不到行」誤會成 bug）。
+  // 最近一次失敗診斷：僅顯示用戶可操作的錯誤（actionable !== false）。
+  // DevTools 仍保留所有記錄，popup 過濾內部調測信息。
+  // 舊記錄無 actionable 字段時默認顯示（向後兼容）。
   let diagText: string | undefined;
   try {
     const diag = await readLastDiagnostic();
-    diagText = formatDiagnostic(diag);
+    // 僅顯示 actionable 的錯誤（undefined 視為 true，兼容舊記錄）
+    if (diag && diag.actionable !== false) {
+      diagText = formatDiagnostic(diag);
+    }
   } catch {
     diagText = undefined; // 診斷讀取失敗不阻塞 popup 其餘功能
   }
