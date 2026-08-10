@@ -48789,6 +48789,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     running = false;
     unsubscribeChunk = null;
     downgradeCheckInterval = null;
+    audioHandle = null;
     /** 注入依賴（由 Orchestrator 調用）。 */
     inject(deps) {
       this.deps = deps;
@@ -48834,8 +48835,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           });
         }
       }, 1e4);
-      const handle = await audioSource.open(ctx.platform);
-      await handle.start();
+      this.audioHandle = await audioSource.open(ctx.platform);
+      await this.audioHandle.start();
       audioSource.onChunk(async (chunk) => {
         if (!this.running) return;
         this.vad.markChunk(chunk);
@@ -48857,6 +48858,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
                 seq: chunk.seq,
                 rtf: asrResult.rtf
               });
+              if (!this.running) return;
               emit({
                 type: "metrics",
                 data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
@@ -48868,10 +48870,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               );
               const translateMs = performance.now() - translateStart;
               this.perf?.add({ stage: "translate", ms: translateMs, seq: chunk.seq });
+              if (!this.running) return;
               emit({
                 type: "metrics",
                 data: { stage: "translate", ms: translateMs, seq: chunk.seq }
               });
+              if (!this.running) return;
               emit({
                 type: asrResult.isPartial ? "segments-updated" : "segments-ready",
                 segments: translatedSegments
@@ -48879,6 +48883,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             });
           } else {
             const asrResult = await asrProvider.transcribe(req);
+            if (!this.running) return;
             const asrMs = performance.now() - asrStartTime;
             this.perf?.add({
               stage: "asr",
@@ -48895,12 +48900,14 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               asrResult.segments,
               translationProvider
             );
+            if (!this.running) return;
             const translateMs = performance.now() - translateStart;
             this.perf?.add({ stage: "translate", ms: translateMs, seq: chunk.seq });
             emit({
               type: "metrics",
               data: { stage: "translate", ms: translateMs, seq: chunk.seq }
             });
+            if (!this.running) return;
             emit({
               type: "segments-ready",
               segments: translatedSegments
@@ -48916,6 +48923,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               cause: err instanceof Error ? err : new Error(String(err))
             }
           });
+          if (!this.running) return;
           emit({
             type: "engine-degraded",
             port: "asr",
@@ -48934,6 +48942,20 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       if (this.downgradeCheckInterval !== null) {
         clearInterval(this.downgradeCheckInterval);
         this.downgradeCheckInterval = null;
+      }
+      if (this.audioHandle) {
+        void this.audioHandle.stop().catch((err) => {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "audio",
+              code: "audio-handle-stop-failed",
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err))
+            }
+          });
+        });
+        this.audioHandle = null;
       }
     }
     /** 翻譯字幕段（批量）。 */
@@ -50822,6 +50844,10 @@ Output example:
     getLatest() {
       return this.latest;
     }
+    /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
+    clearLatest() {
+      this.latest = null;
+    }
     /** 停止監聽與輪詢，但保留 latest 緩存（restart 熱重載時不丟已捕獲響應）。 */
     stop() {
       globalThis.removeEventListener("message", this.onMessageBound);
@@ -51098,6 +51124,7 @@ Output example:
       const videoId = extractVideoId(window.location.href);
       if (videoId === this.lastVideoId) return;
       this.lastVideoId = videoId;
+      this.bridge.clearLatest();
       this.urlChangeTimer = setTimeout(() => {
         this.urlChangeTimer = null;
         void this.restart().catch((err) => {

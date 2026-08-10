@@ -302,6 +302,8 @@ class SubtitleController {
     const videoId = extractVideoId(window.location.href);
     if (videoId === this.lastVideoId) return; // 同一視頻（如僅參數調整），不重啟。
     this.lastVideoId = videoId;
+    // 視頻切換時清空 timedtext 緩存，避免複用舊視頻字幕。
+    this.bridge.clearLatest();
     this.urlChangeTimer = setTimeout(() => {
       this.urlChangeTimer = null;
       // §5.5/R6：SPA 換視頻後重啟失敗必須落診斷，不許靜默。

@@ -7,7 +7,7 @@ import type { CaptionStrategy, StrategyContext } from '../../domain/ports/captio
 import type { AudioSourceProvider } from '../../domain/ports/audio-source';
 import type { ASRProvider } from '../../domain/ports/asr-provider';
 import type { TranslationProvider } from '../../domain/ports/translation-provider';
-import type { AudioChunk } from '../../domain/models/audio';
+import type { AudioChunk, AudioSourceHandle } from '../../domain/models/audio';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
 import { EnergyVAD } from '../../infrastructure/vad';
 import { PerfMetrics } from '../../infrastructure/perf/metrics';
@@ -36,6 +36,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   private running = false;
   private unsubscribeChunk: (() => void) | null = null;
   private downgradeCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private audioHandle: AudioSourceHandle | null = null;
 
   /** 注入依賴（由 Orchestrator 調用）。 */
   inject(deps: RealtimeASRDeps): void {
@@ -95,9 +96,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
       }
     }, 10000);
 
-    // 啟動音頻源。
-    const handle = await audioSource.open(ctx.platform);
-    await handle.start();
+    // 啟動音頻源（保存 handle 供 stop() 關閉，§5.4 洩漏零容忍）。
+    this.audioHandle = await audioSource.open(ctx.platform);
+    await this.audioHandle.start();
 
     // 監聽音頻塊。
     audioSource.onChunk(async (chunk: AudioChunk) => {
@@ -128,6 +129,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
               seq: chunk.seq,
               rtf: asrResult.rtf,
             });
+            if (!this.running) return;
             emit({
               type: 'metrics',
               data: { stage: 'asr', ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf },
@@ -141,12 +143,14 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             );
             const translateMs = performance.now() - translateStart;
             this.perf?.add({ stage: 'translate', ms: translateMs, seq: chunk.seq });
+            if (!this.running) return;
             emit({
               type: 'metrics',
               data: { stage: 'translate', ms: translateMs, seq: chunk.seq },
             });
 
             // 推送事件。
+            if (!this.running) return;
             emit({
               type: asrResult.isPartial ? 'segments-updated' : 'segments-ready',
               segments: translatedSegments,
@@ -155,6 +159,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
         } else {
           // 非流式推理。
           const asrResult = await asrProvider.transcribe(req);
+          if (!this.running) return;
           const asrMs = performance.now() - asrStartTime;
           this.perf?.add({
             stage: 'asr',
@@ -172,6 +177,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             asrResult.segments,
             translationProvider
           );
+          if (!this.running) return;
           const translateMs = performance.now() - translateStart;
           this.perf?.add({ stage: 'translate', ms: translateMs, seq: chunk.seq });
           emit({
@@ -179,6 +185,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             data: { stage: 'translate', ms: translateMs, seq: chunk.seq },
           });
 
+          if (!this.running) return;
           emit({
             type: 'segments-ready',
             segments: translatedSegments,
@@ -195,6 +202,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             cause: err instanceof Error ? err : new Error(String(err)),
           },
         });
+        if (!this.running) return;
         emit({
           type: 'engine-degraded',
           port: 'asr',
@@ -219,6 +227,22 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     if (this.downgradeCheckInterval !== null) {
       clearInterval(this.downgradeCheckInterval);
       this.downgradeCheckInterval = null;
+    }
+    // §5.4：關閉音頻源（tabCapture + Offscreen Document），避免視頻切換時資源洩漏。
+    // handle.stop() 是 async，但 CaptionStrategy.stop() 介面是同步——fire-and-forget + catch。
+    if (this.audioHandle) {
+      void this.audioHandle.stop().catch((err) => {
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'audio',
+            code: 'audio-handle-stop-failed',
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err)),
+          },
+        });
+      });
+      this.audioHandle = null;
     }
   }
 

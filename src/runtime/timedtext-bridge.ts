@@ -122,6 +122,11 @@ export class TimedTextBridge {
     return this.latest;
   }
 
+  /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
+  clearLatest(): void {
+    this.latest = null;
+  }
+
   /** 停止監聽與輪詢，但保留 latest 緩存（restart 熱重載時不丟已捕獲響應）。 */
   stop(): void {
     globalThis.removeEventListener('message', this.onMessageBound);

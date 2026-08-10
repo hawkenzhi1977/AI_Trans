@@ -22,6 +22,8 @@ let currentPort: chrome.runtime.Port | null = null;
 
 /** 啟動 tabCapture 音頻捕獲。 */
 async function startCapture(streamId: string, port: chrome.runtime.Port): Promise<void> {
+  // §5.4：啟動前先清理舊 capture（ASR → ASR 視頻切換時可能有多個 MediaStream 同時活躍）。
+  await stopCapture();
   try {
     // 使用 getMediaStreamId 獲取的 streamId 請求媒體流。
     const constraints = {

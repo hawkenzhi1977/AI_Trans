@@ -652,6 +652,16 @@ DiagnosticRecord 結構:
 - **開發者響應**: 檢查 Offscreen Document 生命週期管理（`createDocument` / `deleteDocument`）；確認 port 在 `stop()` 正確斷開
 - **代碼落點**: src/adapters/audio/tab-capture-source.ts（port `onDisconnect` 處理）
 
+### 11.3a 音頻 handle 關閉失敗（M2-19）
+
+- **診斷碼**: audio-handle-stop-failed
+- **用戶可見消息**: 最近失敗: 錯誤: Error: audio handle stop failed: <錯誤> (<timestamp>)
+- **觸發條件**: `RealtimeASRStrategy.stop()` 調用 `audioHandle.stop()` 時拋錯（fire-and-forget + catch）
+- **根因**: Offscreen Document 已被提前關閉；port 斷開導致 `postMessage` 失敗；`chrome.offscreen.closeDocument` 失敗
+- **用戶響應**: 刷新頁面重試（通常不影響功能，僅資源洩漏）
+- **開發者響應**: 檢查 `TabCaptureAudioSource.stop()` 的 port/offscreen 清理邏輯；確認 `RealtimeASRStrategy.stop()` 正確調用 handle.stop
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`stop()` fire-and-forget catch）
+
 ### 11.4 ASR 引擎失敗
 
 - **診斷碼**: asr-engine-failed

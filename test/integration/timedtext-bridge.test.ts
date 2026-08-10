@@ -102,6 +102,19 @@ describe('TimedTextBridge — 消息接收與存儲', () => {
     expect(bridge.getLatest()?.url).toBe('u');
   });
 
+  it('clearLatest 清空 latest 緩存（視頻切換時避免複用舊字幕）', () => {
+    bridge.start();
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(bridge.getLatest()).toEqual(payload);
+    bridge.clearLatest();
+    expect(bridge.getLatest()).toBeNull();
+    // clearLatest 後仍可接收新消息
+    const newPayload = { url: 'u2', responseText: 'r2', contentType: 'c', capturedAt: 2 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: newPayload } }));
+    expect(bridge.getLatest()).toEqual(newPayload);
+  });
+
   it('waitForCapture：已有捕獲值立即返回（不等待）', async () => {
     bridge.start();
     const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
