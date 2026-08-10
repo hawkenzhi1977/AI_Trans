@@ -124,6 +124,8 @@ export class TimedTextBridge {
 
   /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
   clearLatest(): void {
+    const previousVideoId = this.latest?.videoId ?? '(none)';
+    diagLog('bridge', 'clearLatest() called, previous videoId:', previousVideoId);
     this.latest = null;
   }
 

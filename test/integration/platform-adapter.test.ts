@@ -170,6 +170,81 @@ describe('FetchCaptionSource — R1 fetch 綁定 / R2 URL 絕對化 / R7 JSON �
     await src.fetchTrackList();
     expect(src.getLastTrackDiagnostic()).toBeUndefined();
   });
+
+  it('[M2-22] videoId 不匹配（SPA 導航後 ytInitialPlayerResponse stale）→ 嘗試播放器 API fallback', async () => {
+    // 當前頁面 URL 為視頻 B（v=bbb），但 ytInitialPlayerResponse 包含視頻 A（v=aaa）的數據。
+    window.history.replaceState({}, '', '/watch?v=bbb');
+    const stalePlayerResponse = JSON.stringify({
+      videoDetails: { videoId: 'aaa' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [{ baseUrl: '/timedtext?v=aaa&lang=en', languageCode: 'en', kind: 'asr' }],
+        },
+      },
+    });
+    setPlayerResponse(stalePlayerResponse);
+    // Mock 播放器元素 API 返回當前視頻的字幕軌。
+    const mockPlayer = document.createElement('div');
+    mockPlayer.id = 'movie_player';
+    (mockPlayer as unknown as { getOption: (m: string, k: string) => unknown }).getOption = (m: string, k: string) => {
+      if (m === 'captions' && k === 'tracklist') {
+        return [{ baseUrl: '/timedtext?v=bbb&lang=en', languageCode: 'en', kind: 'standard' }];
+      }
+      return null;
+    };
+    document.body.appendChild(mockPlayer);
+    const src = new FetchCaptionSource(document);
+    const list = await src.fetchTrackList();
+    // 應該返回播放器 API 的當前視頻字幕軌，而非 stale 數據。
+    expect(list).toHaveLength(1);
+    expect(list[0].baseUrl).toContain('v=bbb');
+    expect(src.getLastTrackDiagnostic()).toContain('videoId mismatch');
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('[M2-22] videoId 不匹配且播放器 API 無軌 → 返回空並記錄診斷', async () => {
+    window.history.replaceState({}, '', '/watch?v=bbb');
+    const stalePlayerResponse = JSON.stringify({
+      videoDetails: { videoId: 'aaa' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [{ baseUrl: '/timedtext?v=aaa&lang=en', languageCode: 'en' }],
+        },
+      },
+    });
+    setPlayerResponse(stalePlayerResponse);
+    // 無播放器元素。
+    document.body.innerHTML = '';
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.type = 'application/json';
+    script.textContent = stalePlayerResponse;
+    document.body.appendChild(script);
+    const src = new FetchCaptionSource(document);
+    const list = await src.fetchTrackList();
+    expect(list).toEqual([]);
+    expect(src.getLastTrackDiagnostic()).toContain('videoId mismatch');
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('[M2-22] videoId 匹配 → 正常返回字幕軌（不觸發 fallback）', async () => {
+    window.history.replaceState({}, '', '/watch?v=aaa');
+    const matchingPlayerResponse = JSON.stringify({
+      videoDetails: { videoId: 'aaa' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [{ baseUrl: '/timedtext?v=aaa&lang=en', languageCode: 'en', kind: 'standard' }],
+        },
+      },
+    });
+    setPlayerResponse(matchingPlayerResponse);
+    const src = new FetchCaptionSource(document);
+    const list = await src.fetchTrackList();
+    expect(list).toHaveLength(1);
+    expect(list[0].baseUrl).toContain('v=aaa');
+    expect(src.getLastTrackDiagnostic()).toBeUndefined();
+    window.history.replaceState({}, '', '/');
+  });
 });
 
 describe('FetchCaptionSource — §5.6 拉取失敗診斷證據化', () => {
@@ -373,8 +448,9 @@ describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
     const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
     expect(segs).toHaveLength(2);
     expect(segs[0].sourceText).toBe('captured');
-    // M1-45：等待會帶上當前視頻 ID（jsdom location 無 v → 空串，與測試兼容）。
-    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000, '');
+    // M2-22：傳入 expectedVideoId（從當前 URL 提取），確保只接受當前視頻的捕獲。
+    // jsdom 默認 location 為 http://localhost/，無 v 參數，故 expectedVideoId 為 undefined。
+    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000, undefined);
     expect(fetchFn).not.toHaveBeenCalled(); // 複用捕獲，未直接 fetch
   });
 
@@ -409,29 +485,27 @@ describe('FetchCaptionSource — MAIN world 捕獲響應複用', () => {
     expect(fetchFn).toHaveBeenCalledOnce();
   });
 
-  it('[M1-45] 捕獲屬於其他視頻（SPA 換視頻後 stale）→ 跳過複用，等待新視頻捕獲', async () => {
+  it('[M2-22] 視頻切換時 stale 捕獲被拒絕（videoId 不匹配）', async () => {
+    // M2-22：恢復 videoId 驗證——攔截器的 lastCapture 在 MAIN world，
+    // bridge.clearLatest() 只清空 isolated world 的緩存，MAIN world 的 lastCapture
+    // 仍可能保留舊視頻的捕獲。必須驗證捕獲的 videoId 與當前視頻匹配。
     const fetchFn = vi.fn(async () => ({
       ok: true,
       status: 200,
       text: async () => JSON.stringify({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'fetched' }] }] }),
     }) as Response);
-    // 當前頁面 URL 為視頻 B（v=bbb），捕獲是視頻 A（v=aaa）的 → stale。
+    // 當前頁面 URL 為視頻 B（v=bbb），捕獲來自視頻 A（v=aaa）。
     window.history.replaceState({}, '', '/watch?v=bbb');
     const capturedA = { url: 'https://www.youtube.com/api/timedtext?v=aaa', responseText: validJson, contentType: 'application/json', videoId: 'aaa' };
     const provider = {
-      getLatest: vi.fn(() => capturedA), // latest 是舊視頻 A 的捕獲
-      waitForCapture: vi.fn(async () => null), // 等待新視頻 B 捕獲（此測試中超時）
+      getLatest: vi.fn(() => capturedA), // latest 是舊視頻 A 的 stale 捕獲
     };
     const src = new FetchCaptionSource(document, fetchFn as unknown as typeof fetch, provider);
     const segs = await src.fetchTracks('/timedtext?lang=en', 'en');
-    // stale 捕獲不被複用 → 回退（等待超時後）直接 fetch
+    // M2-22 新行為：stale 捕獲被拒絕，回退到直接 fetch
+    expect(segs).toHaveLength(1);
     expect(segs[0].sourceText).toBe('fetched');
-    expect(fetchFn).toHaveBeenCalledOnce();
-    // §5.6：stale 跳過與超時原因鏈完整（超時診斷帶上 stale 上文）
-    expect(src.getLastTrackDiagnostic()).toContain('capture is for another video');
-    expect(src.getLastTrackDiagnostic()).toContain('wait timeout');
-    // 等待必須以當前視頻 B 的 videoId 為期望值
-    expect(provider.waitForCapture).toHaveBeenCalledWith(15_000, 'bbb');
+    expect(fetchFn).toHaveBeenCalledOnce(); // 回退直接 fetch
     window.history.replaceState({}, '', '/');
   });
 

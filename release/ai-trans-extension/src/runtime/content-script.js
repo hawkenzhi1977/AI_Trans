@@ -49375,32 +49375,31 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     /** 等待播放器捕獲響應的超時（毫秒）：視頻播放後播放器才發 timedtext 請求（M1-43）。 */
     waitForCaptureTimeoutMs;
     lastTrackDiagnostic;
+    /** 從當前文檔 URL 提取視頻 ID（`v` 參數）；非 watch 頁或解析失敗返回空串。 */
+    currentVideoId() {
+      const href = this.doc.location?.href;
+      if (!href) return "";
+      try {
+        return new URL(href).searchParams.get("v") ?? "";
+      } catch {
+        return "";
+      }
+    }
     constructor(doc = globalThis.document, fetchFn = globalThis.fetch, captureProvider, waitForCaptureTimeoutMs = 15e3) {
       this.doc = doc;
       this.fetchFn = fetchFn === globalThis.fetch ? fetchFn.bind(globalThis) : fetchFn;
       this.captureProvider = captureProvider;
       this.waitForCaptureTimeoutMs = waitForCaptureTimeoutMs;
     }
-    /**
-     * 當前頁面 URL 中的視頻 ID（從 `/watch?v=` 提取；SPA 換視頻後 location.href 會更新）。
-     * 用於跨視頻捕獲失效校驗：capture.videoId 與之不一致即視為 stale。
-     */
-    currentVideoId() {
-      try {
-        const href = this.doc.location?.href;
-        if (!href) return "";
-        return new URL(href).searchParams.get("v") ?? "";
-      } catch {
-        return "";
-      }
-    }
     getLastTrackDiagnostic() {
       return this.lastTrackDiagnostic;
     }
     async fetchTrackList() {
+      diagLog("capture", "fetchTrackList: starting, current URL:", this.doc.location?.href);
       const json = this.findPlayerResponseJson();
       if (!json) {
         this.lastTrackDiagnostic = "player response JSON not found (ytInitialPlayerResponse missing/empty)";
+        diagLog("capture", "fetchTrackList: player response JSON not found");
         return [];
       }
       let data;
@@ -49408,13 +49407,28 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         data = JSON.parse(json);
       } catch (err) {
         this.lastTrackDiagnostic = `player response JSON parse failed: ${err instanceof Error ? err.message : String(err)}`;
+        diagLog("capture", "fetchTrackList: JSON parse failed:", this.lastTrackDiagnostic);
+        return [];
+      }
+      const currentVid = this.currentVideoId();
+      const playerVid = data.videoDetails?.videoId ?? "";
+      if (currentVid && playerVid && currentVid !== playerVid) {
+        this.lastTrackDiagnostic = `player response videoId mismatch: current=${currentVid}, player=${playerVid} (ytInitialPlayerResponse stale after SPA navigation)`;
+        diagLog("capture", "fetchTrackList:", this.lastTrackDiagnostic);
+        const fallbackTracks = this.getCaptionTracksFromPlayer();
+        if (fallbackTracks.length > 0) {
+          diagLog("capture", "fetchTrackList: fallback from player element succeeded, tracks:", fallbackTracks.length);
+          return fallbackTracks;
+        }
         return [];
       }
       const tracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
       if (tracks.length === 0) {
         this.lastTrackDiagnostic = "player response has no captionTracks (video may have no captions)";
+        diagLog("capture", "fetchTrackList: no captionTracks found");
       } else {
         this.lastTrackDiagnostic = void 0;
+        diagLog("capture", "fetchTrackList: found", tracks.length, "tracks, first track baseUrl:", String(tracks[0].baseUrl ?? "").substring(0, 100));
       }
       return tracks.map((t) => ({
         lang: String(t.languageCode ?? "und"),
@@ -49425,19 +49439,57 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     /** 從頁面內嵌腳本提取 ytInitialPlayerResponse JSON 文本；找不到返回 undefined。 */
     findPlayerResponseJson() {
       const named = this.doc.querySelector("script#ytInitialPlayerResponse")?.textContent;
-      if (named && named.trim()) return named.trim();
+      if (named && named.trim()) {
+        diagLog("capture", "findPlayerResponseJson: found script#ytInitialPlayerResponse, length:", named.length);
+        return named.trim();
+      }
       const scripts = this.doc.querySelectorAll("script:not([src])");
       for (const el2 of Array.from(scripts)) {
         const text = el2.textContent ?? "";
         const m = /ytInitialPlayerResponse\s*=\s*(\{[\s\S]*?\})\s*;/.exec(text);
-        if (m) return m[1];
+        if (m) {
+          diagLog("capture", "findPlayerResponseJson: found ytInitialPlayerResponse assignment, length:", m[1].length);
+          return m[1];
+        }
         const trimmed = text.trim();
-        if (trimmed.startsWith("{") && trimmed.includes("captionTracks")) return trimmed;
+        if (trimmed.startsWith("{") && trimmed.includes("captionTracks")) {
+          diagLog("capture", "findPlayerResponseJson: found inline JSON with captions, length:", trimmed.length);
+          return trimmed;
+        }
       }
+      diagLog("capture", "findPlayerResponseJson: ytInitialPlayerResponse not found in any script");
       return void 0;
     }
+    /**
+     * M2-22：當 `ytInitialPlayerResponse` stale（SPA 導航後未更新）時，
+     * 從播放器元素 API `getOption('captions', 'tracklist')` 獲取當前視頻的字幕軌。
+     * 播放器 API 在 SPA 導航後會更新為新視頻的數據，是可靠的 fallback。
+     */
+    getCaptionTracksFromPlayer() {
+      const player = this.doc.getElementById("movie_player");
+      if (!player || typeof player.getOption !== "function") {
+        diagLog("capture", "getCaptionTracksFromPlayer: player API not available");
+        return [];
+      }
+      try {
+        const raw = player.getOption("captions", "tracklist");
+        if (!Array.isArray(raw) || raw.length === 0) {
+          diagLog("capture", "getCaptionTracksFromPlayer: no tracks from player API");
+          return [];
+        }
+        diagLog("capture", "getCaptionTracksFromPlayer: got", raw.length, "tracks from player API");
+        return raw.map((t) => ({
+          lang: String(t.languageCode ?? "und"),
+          baseUrl: String(t.baseUrl ?? ""),
+          isAutoGenerated: Boolean(t.kind === "asr")
+        }));
+      } catch (err) {
+        diagLog("capture", "getCaptionTracksFromPlayer: error:", err instanceof Error ? err.message : String(err));
+        return [];
+      }
+    }
     async fetchTracks(baseUrl, lang) {
-      diagLog("capture", "fetchTracks called, baseUrl:", baseUrl, "lang:", lang);
+      diagLog("capture", "fetchTracks called, baseUrl:", baseUrl.substring(0, 100), "lang:", lang);
       let url;
       try {
         url = new URL(baseUrl, globalThis.location?.href ?? baseUrl).href;
@@ -49447,17 +49499,17 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         );
       }
       const finalUrl = this.withJson3Format(url);
-      diagLog("capture", "fetchTracks: finalUrl after withJson3Format:", finalUrl);
+      diagLog("capture", "fetchTracks: finalUrl after withJson3Format:", finalUrl.substring(0, 100));
       diagLog("capture", "fetchTracks: trying tryReuseCapture");
       const reused = this.tryReuseCapture(lang);
       if (reused) {
-        diagLog("capture", "fetchTracks: reused capture success");
+        diagLog("capture", "fetchTracks: reused capture success, segments:", reused.length);
         return reused;
       }
       diagLog("capture", "fetchTracks: no capture to reuse, trying waitForCaptureReuse");
       const waited = await this.waitForCaptureReuse(lang);
       if (waited) {
-        diagLog("capture", "fetchTracks: waitForCaptureReuse success");
+        diagLog("capture", "fetchTracks: waitForCaptureReuse success, segments:", waited.length);
         return waited;
       }
       diagLog("capture", "fetchTracks: waitForCaptureReuse timeout, falling back to direct fetch");
@@ -49467,11 +49519,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       } catch (err) {
         const msg = `timedtext fetch failed: ${err instanceof Error ? err.message : String(err)} (url: ${finalUrl})`;
         this.lastTrackDiagnostic = msg;
+        diagLog("capture", "fetchTracks: direct fetch failed:", msg);
         throw new Error(msg);
       }
       if (!res.ok) {
         const msg = `timedtext fetch HTTP ${res.status} (url: ${finalUrl})`;
         this.lastTrackDiagnostic = msg;
+        diagLog("capture", "fetchTracks: direct fetch HTTP error:", msg);
         throw new Error(msg);
       }
       let raw;
@@ -49480,13 +49534,17 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       } catch (err) {
         const msg = `timedtext body read failed: ${err instanceof Error ? err.message : String(err)}`;
         this.lastTrackDiagnostic = msg;
+        diagLog("capture", "fetchTracks: body read failed:", msg);
         throw new Error(msg);
       }
       try {
-        return parseTimedText(raw, lang);
+        const segments = parseTimedText(raw, lang);
+        diagLog("capture", "fetchTracks: direct fetch success, segments:", segments.length);
+        return segments;
       } catch (err) {
         const msg = `${err instanceof Error ? err.message : String(err)} (content-type: ${res.headers.get("content-type") ?? "unknown"})`;
         this.lastTrackDiagnostic = msg;
+        diagLog("capture", "fetchTracks: parse failed:", msg);
         throw new Error(msg);
       }
     }
@@ -49506,69 +49564,90 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       }
     }
     /**
-     * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
-     * - 有捕獲值、響應非空且屬於當前視頻 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
-     * - 無捕獲值 / 捕獲屬於其他視頻（stale）→ 返回 undefined（走等待或直接 fetch）。
-     */
+      * 嘗試複用 MAIN world 攔截器捕獲的播放器 timedtext 響應。
+      * - 有捕獲值、響應非空 → 解析；解析失敗記診斷並回退（返回 undefined 讓 fetch 兜底）。
+      * - 無捕獲值 → 返回 undefined（走等待或直接 fetch）。
+      * 
+      * M2-22：恢復 videoId 驗證——攔截器的 `lastCapture` 在 MAIN world，
+      * `bridge.clearLatest()` 只清空 isolated world 的緩存，MAIN world 的 `lastCapture`
+      * 仍可能保留舊視頻的捕獲（重播機制會持續發送）。必須驗證捕獲的 videoId 與當前視頻匹配。
+      */
     tryReuseCapture(lang) {
-      if (!this.captureProvider) return void 0;
-      const capture = this.captureProvider.getLatest();
-      if (!capture || !capture.responseText) return void 0;
-      if (!this.captureMatchesCurrentVideo(capture)) {
-        this.lastTrackDiagnostic = `timedtext capture is for another video (capture videoId: ${capture.videoId ?? "(unknown)"}, current: ${this.currentVideoId()}) \u2014 skip reuse`;
+      if (!this.captureProvider) {
+        diagLog("capture", "tryReuseCapture: no captureProvider");
         return void 0;
       }
+      const capture = this.captureProvider.getLatest();
+      if (!capture || !capture.responseText) {
+        diagLog("capture", "tryReuseCapture: no capture or empty responseText");
+        return void 0;
+      }
+      const currentVid = this.currentVideoId();
+      if (currentVid && capture.videoId && currentVid !== capture.videoId) {
+        diagLog("capture", "tryReuseCapture: videoId mismatch, current:", currentVid, "capture:", capture.videoId, "- skipping stale capture");
+        return void 0;
+      }
+      diagLog("capture", "tryReuseCapture: found capture, url:", capture.url.substring(0, 80), "videoId:", capture.videoId);
       const { url, responseText, contentType } = capture;
       try {
         const segments = parseTimedText(responseText, lang);
         if (segments.length > 0) {
           this.lastTrackDiagnostic = `reused player timedtext capture (url: ${url})`;
+          diagLog("capture", "tryReuseCapture: parse success, segments:", segments.length);
           return segments;
         }
         this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${contentType}, url: ${url})`;
+        diagLog("capture", "tryReuseCapture: parse empty, content-type:", contentType);
         return void 0;
       } catch (err) {
         this.lastTrackDiagnostic = `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)} (content-type: ${contentType}, url: ${url})`;
+        diagLog("capture", "tryReuseCapture: parse failed:", this.lastTrackDiagnostic);
         return void 0;
       }
     }
-    /** 捕獲是否屬於當前視頻（無視頻 ID 上下文時保守接受；明確不同才拒絕）。 */
-    captureMatchesCurrentVideo(capture) {
-      const current = this.currentVideoId();
-      if (!current) return true;
-      if (!capture.videoId) return true;
-      return capture.videoId === current;
-    }
     /**
-     * 等待播放器捕獲響應後複用（M1-43）。
-     * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
-     */
+      * 等待播放器捕獲響應後複用（M1-43）。
+      * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
+      * 
+      * M2-22：傳入 expectedVideoId 確保只接受當前視頻的捕獲，避免 SPA 導航後複用 stale 捕獲。
+      */
     async waitForCaptureReuse(lang) {
-      if (!this.captureProvider?.waitForCapture) return void 0;
+      if (!this.captureProvider?.waitForCapture) {
+        diagLog("capture", "waitForCaptureReuse: no waitForCapture provider");
+        return void 0;
+      }
+      const expectedVideoId = this.currentVideoId();
+      diagLog("capture", "waitForCaptureReuse: waiting for capture, timeout:", this.waitForCaptureTimeoutMs, "expectedVideoId:", expectedVideoId);
       let capture;
       try {
         capture = await this.captureProvider.waitForCapture(
           this.waitForCaptureTimeoutMs,
-          this.currentVideoId()
+          expectedVideoId || void 0
         );
       } catch {
         this.lastTrackDiagnostic = `timedtext capture wait failed`;
+        diagLog("capture", "waitForCaptureReuse: wait failed");
         return void 0;
       }
       if (!capture || !capture.responseText) {
-        this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) \u2014 fall back to direct fetch` + (this.lastTrackDiagnostic?.includes("capture is for another video") ? ` (prior: ${this.lastTrackDiagnostic})` : "");
+        this.lastTrackDiagnostic = `timedtext capture wait timeout (${this.waitForCaptureTimeoutMs} ms) \u2014 fall back to direct fetch`;
+        diagLog("capture", "waitForCaptureReuse: timeout, no capture received");
         return void 0;
       }
+      diagLog("capture", "waitForCaptureReuse: capture received, url:", capture.url.substring(0, 80), "videoId:", capture.videoId);
       try {
         const segments = parseTimedText(capture.responseText, lang);
         if (segments.length > 0) {
           this.lastTrackDiagnostic = `reused player timedtext capture after wait (url: ${capture.url})`;
+          diagLog("capture", "waitForCaptureReuse: parse success, segments:", segments.length);
           return segments;
         }
         this.lastTrackDiagnostic = `timedtext capture parse empty (content-type: ${capture.contentType}, url: ${capture.url})`;
+        diagLog("capture", "waitForCaptureReuse: parse empty");
         return void 0;
       } catch (err) {
         this.lastTrackDiagnostic = `timedtext capture parse failed: ${err instanceof Error ? err.message : String(err)} (content-type: ${capture.contentType}, url: ${capture.url})`;
+        diagLog("capture", "waitForCaptureReuse: parse failed:", this.lastTrackDiagnostic);
         return void 0;
       }
     }
@@ -50846,6 +50925,8 @@ Output example:
     }
     /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
     clearLatest() {
+      const previousVideoId = this.latest?.videoId ?? "(none)";
+      diagLog("bridge", "clearLatest() called, previous videoId:", previousVideoId);
       this.latest = null;
     }
     /** 停止監聽與輪詢，但保留 latest 緩存（restart 熱重載時不丟已捕獲響應）。 */
@@ -50916,7 +50997,7 @@ Output example:
   }
   var MOUNT_WAIT_TIMEOUT_MS = 15e3;
   var store = new ChromeStorageConfigStore();
-  var SubtitleController = class {
+  var SubtitleController = class _SubtitleController {
     constructor(config, url) {
       this.config = config;
       this.url = url;
@@ -50993,6 +51074,11 @@ Output example:
     patchedHistory;
     lastVideoId;
     urlChangeTimer = null;
+    // M2-21：URL 輪詢偵測（兜底機制）：YouTube 可能覆蓋我們的 pushState patch，
+    // 導致 onUrlChanged() 不被觸發。定期檢查 location.href 變化作為兜底。
+    urlPollTimer = null;
+    /** URL 輪詢間隔（毫秒）：1.5 秒檢查一次，平衡響應速度與性能。 */
+    static URL_POLL_INTERVAL_MS = 1500;
     /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
     async start() {
       const authState = await chrome.storage.local.get("tabCaptureAuthorized");
@@ -51040,6 +51126,7 @@ Output example:
         });
       }
       await this.orchestrator.start(currentUrl);
+      this.startUrlPolling();
     }
     /** 取得當前頁面 URL（M1-47：每次 start/restart 都讀最新 location）。 */
     currentUrl() {
@@ -51079,12 +51166,16 @@ Output example:
     }
     /** 配置變更後熱重啟：停止舊管線 → 讀新配置 → 重新啟動。 */
     async restart() {
+      diagLog("content", "restart() called");
       this.stop();
+      diagLog("content", "restart() stop() completed");
       this.config = await store.get();
       await this.start();
+      diagLog("content", "restart() start() completed");
     }
     stop() {
       cancelAnimationFrame(this.rafId);
+      this.stopUrlPolling();
       this.pendingMountObserver?.disconnect();
       this.pendingMountObserver = null;
       if (this.mountWaitTimer !== null) {
@@ -51118,16 +51209,53 @@ Output example:
         history.replaceState = this.origReplaceState;
       }
     }
+    /**
+     * M2-21：啟動 URL 輪詢偵測（兜底機制）。
+     * 
+     * 背景：YouTube 的 SPA 導航機制可能覆蓋我們的 `history.pushState/replaceState` patch，
+     * 導致 `onUrlChanged()` 不被觸發。定期檢查 `location.href` 的 `v` 參數變化作為兜底。
+     * 
+     * 設計：
+     * - 每 1.5 秒檢查一次 `location.href` 的 `v` 參數
+     * - 偵測到變化時調用 `onUrlChanged()`（已有 debounce 機制，不衝突）
+     * - 與 pushState patch 共存，不重複觸發（`onUrlChanged()` 的 debounce 確保）
+     */
+    startUrlPolling() {
+      if (this.urlPollTimer !== null) return;
+      diagLog("content", "startUrlPolling: starting URL polling with interval", _SubtitleController.URL_POLL_INTERVAL_MS, "ms");
+      this.urlPollTimer = setInterval(() => {
+        const currentVideoId = extractVideoId(window.location.href);
+        if (currentVideoId !== this.lastVideoId) {
+          diagLog("content", "urlPollTimer: videoId changed from", this.lastVideoId, "to", currentVideoId);
+          this.onUrlChanged();
+        }
+      }, _SubtitleController.URL_POLL_INTERVAL_MS);
+    }
+    /** M2-21：停止 URL 輪詢偵測（§5.4：註冊必配解除）。 */
+    stopUrlPolling() {
+      if (this.urlPollTimer !== null) {
+        clearInterval(this.urlPollTimer);
+        this.urlPollTimer = null;
+        diagLog("content", "stopUrlPolling: URL polling stopped");
+      }
+    }
     /** 偵測 URL 的 v 參數變化（SPA 換視頻）→ 熱重啟字幕管線（M1-45）。 */
     onUrlChanged() {
       if (this.urlChangeTimer !== null) return;
       const videoId = extractVideoId(window.location.href);
+      diagLog("content", "onUrlChanged triggered:", "oldVideoId:", this.lastVideoId, "newVideoId:", videoId, "url:", window.location.href);
       if (videoId === this.lastVideoId) return;
       this.lastVideoId = videoId;
       this.bridge.clearLatest();
+      document.dispatchEvent(new CustomEvent("ai-trans:video-changed"));
+      diagLog("content", "Dispatched ai-trans:video-changed event to MAIN world interceptor");
       this.urlChangeTimer = setTimeout(() => {
         this.urlChangeTimer = null;
-        void this.restart().catch((err) => {
+        diagLog("content", "restart() starting after URL change");
+        void this.restart().then(() => {
+          diagLog("content", "restart() completed successfully");
+        }).catch((err) => {
+          diagLog("content", "restart() failed:", err instanceof Error ? err.message : String(err));
           recordDiagnostic({
             type: "pipeline-error",
             error: {

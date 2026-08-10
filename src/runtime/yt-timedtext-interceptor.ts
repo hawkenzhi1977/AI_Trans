@@ -23,6 +23,8 @@ export const TIMEDTEXT_REQUEST_EVENT = 'ai-trans:timedtext-request';
 export const SET_TARGET_LANG_EVENT = 'ai-trans:set-target-lang';
 /** 消息通道常量（M1-51）：content-script 中繼調試日誌開關（isolated world → MAIN world）。 */
 export const SET_DEBUG_FLAGS_EVENT = 'ai-trans:set-debug-flags';
+/** 消息通道常量（M2-22）：content-script 通知視頻切換（SPA 導航），清空 stale 捕獲並重新驅動字幕模組。 */
+export const VIDEO_CHANGED_EVENT = 'ai-trans:video-changed';
 
 /** 發送給 content-script 的捕獲結果。 */
 export interface TimedTextCapture {
@@ -186,13 +188,17 @@ function pickTargetTrack(tracklist: YtCaptionTrack[]): YtCaptionTrack {
 let captionModuleDriven = false;
 
 /**
- * 從 DOM 中的 ytInitialPlayerResponse 解析字幕軌列表（M2-18 修復）。
+ * 從 DOM 中的 ytInitialPlayerResponse 解析字幕軌列表（M2-18 修復 + M2-22 videoId 驗證）。
  * 
  * 背景：YouTube 播放器 API `getOption('captions', 'tracklist')` 在某些情況下
  * 持續返回空陣列（即使視頻有字幕），導致字幕驅動失敗。本函式直接從頁面內嵌的
  * `ytInitialPlayerResponse` JSON 提取字幕軌信息，繞過播放器 API。
  * 
- * @returns 字幕軌列表；解析失敗或無字幕時返回 undefined。
+ * M2-22：YouTube SPA 導航後 `ytInitialPlayerResponse` 不會更新，仍包含舊視頻的字幕數據。
+ * 新增 videoId 驗證：比對 player response 的 videoId 與當前 URL 的 v 參數，
+ * 不匹配時返回 undefined，讓調用方 fallback 到播放器 API（`getOption('captions', 'tracklist')`）。
+ * 
+ * @returns 字幕軌列表；解析失敗、無字幕、或 videoId 不匹配時返回 undefined。
  */
 function getCaptionTracksFromPlayerResponse(): YtCaptionTrack[] | undefined {
   // 掃描所有內聯腳本，尋找 ytInitialPlayerResponse 賦值。
@@ -220,7 +226,16 @@ function getCaptionTracksFromPlayerResponse(): YtCaptionTrack[] | undefined {
     try {
       const data = JSON.parse(jsonStr);
       const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      if (Array.isArray(tracks)) return tracks as YtCaptionTrack[];
+      if (!Array.isArray(tracks)) continue;
+      // M2-22：驗證 videoId——SPA 導航後 ytInitialPlayerResponse 不會更新，
+      // 比對 player response 的 videoId 與當前 URL 的 v 參數，不匹配時視為 stale。
+      const currentVid = extractVideoId(globalThis.location?.href ?? '');
+      const playerVid = data?.videoDetails?.videoId ?? '';
+      if (currentVid && playerVid && currentVid !== playerVid) {
+        diagLog('interceptor', 'getCaptionTracksFromPlayerResponse: videoId mismatch, current:', currentVid, 'player:', playerVid, '- stale data');
+        return undefined;
+      }
+      return tracks as YtCaptionTrack[];
     } catch {
       // JSON 解析失敗，繼續嘗試下一個腳本。
     }
@@ -374,6 +389,18 @@ function install(): void {
     diagLog('interceptor', 'debug flags updated:', detail?.flags);
   };
   document.addEventListener(SET_DEBUG_FLAGS_EVENT, onSetDebugFlags);
+  // M2-22：接收視頻切換通知（SPA 導航），清空 stale 捕獲並重新驅動字幕模組。
+  // 背景：YouTube SPA 導航後 `ytInitialPlayerResponse` 不會更新，攔截器的 `lastCapture`
+  // 仍保留舊視頻的 timedtext 響應，重播機制會持續發送給 bridge，導致字幕管線複用舊字幕。
+  const onVideoChanged = (): void => {
+    diagLog('interceptor', 'video-changed event received, clearing lastCapture and resetting captionModuleDriven');
+    lastCapture = null;
+    // 同步清空調試輔助全局變量（與 emitCapture 中的設置對應）。
+    Reflect.set(globalThis, '__aiTransTimedtextLastCapture', null);
+    captionModuleDriven = false;
+    resetAndRedriveCaptionModule();
+  };
+  document.addEventListener(VIDEO_CHANGED_EVENT, onVideoChanged);
   // 即使未收到語言消息也啟動一次驅動（用第一/人工軌），避免消息時序問題導致完全不驅動。
   startCaptionModuleDriver();
   // 調試輔助（M1-27 真實環境驗證）：暴露計數器與最近捕獲對象到 window。

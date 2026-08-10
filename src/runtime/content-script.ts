@@ -57,6 +57,11 @@ class SubtitleController {
   private readonly patchedHistory: boolean;
   private lastVideoId: string;
   private urlChangeTimer: ReturnType<typeof setTimeout> | null = null;
+  // M2-21：URL 輪詢偵測（兜底機制）：YouTube 可能覆蓋我們的 pushState patch，
+  // 導致 onUrlChanged() 不被觸發。定期檢查 location.href 變化作為兜底。
+  private urlPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** URL 輪詢間隔（毫秒）：1.5 秒檢查一次，平衡響應速度與性能。 */
+  private static readonly URL_POLL_INTERVAL_MS = 1500;
 
   constructor(private config: EngineConfig, url: string) {
     this.url = url;
@@ -200,6 +205,8 @@ class SubtitleController {
     }
 
     await this.orchestrator.start(currentUrl);
+    // M2-21：啟動 URL 輪詢偵測（兜底機制），確保即使 pushState patch 被覆蓋也能偵測到視頻切換。
+    this.startUrlPolling();
   }
 
   /** 取得當前頁面 URL（M1-47：每次 start/restart 都讀最新 location）。 */
@@ -244,13 +251,18 @@ class SubtitleController {
 
   /** 配置變更後熱重啟：停止舊管線 → 讀新配置 → 重新啟動。 */
   async restart(): Promise<void> {
+    diagLog('content', 'restart() called');
     this.stop();
+    diagLog('content', 'restart() stop() completed');
     this.config = await store.get();
     await this.start();
+    diagLog('content', 'restart() start() completed');
   }
 
   stop(): void {
     cancelAnimationFrame(this.rafId);
+    // M2-21：停止 URL 輪詢偵測（§5.4：註冊必配解除）。
+    this.stopUrlPolling();
     // R4：中斷等待型 MutationObserver 與其超時，避免 restart 期間洩漏/懸掛。
     this.pendingMountObserver?.disconnect();
     this.pendingMountObserver = null;
@@ -295,19 +307,61 @@ class SubtitleController {
     }
   }
 
+  /**
+   * M2-21：啟動 URL 輪詢偵測（兜底機制）。
+   * 
+   * 背景：YouTube 的 SPA 導航機制可能覆蓋我們的 `history.pushState/replaceState` patch，
+   * 導致 `onUrlChanged()` 不被觸發。定期檢查 `location.href` 的 `v` 參數變化作為兜底。
+   * 
+   * 設計：
+   * - 每 1.5 秒檢查一次 `location.href` 的 `v` 參數
+   * - 偵測到變化時調用 `onUrlChanged()`（已有 debounce 機制，不衝突）
+   * - 與 pushState patch 共存，不重複觸發（`onUrlChanged()` 的 debounce 確保）
+   */
+  private startUrlPolling(): void {
+    if (this.urlPollTimer !== null) return; // 已啟動，不重複
+    diagLog('content', 'startUrlPolling: starting URL polling with interval', SubtitleController.URL_POLL_INTERVAL_MS, 'ms');
+    this.urlPollTimer = setInterval(() => {
+      const currentVideoId = extractVideoId(window.location.href);
+      if (currentVideoId !== this.lastVideoId) {
+        diagLog('content', 'urlPollTimer: videoId changed from', this.lastVideoId, 'to', currentVideoId);
+        this.onUrlChanged();
+      }
+    }, SubtitleController.URL_POLL_INTERVAL_MS);
+  }
+
+  /** M2-21：停止 URL 輪詢偵測（§5.4：註冊必配解除）。 */
+  private stopUrlPolling(): void {
+    if (this.urlPollTimer !== null) {
+      clearInterval(this.urlPollTimer);
+      this.urlPollTimer = null;
+      diagLog('content', 'stopUrlPolling: URL polling stopped');
+    }
+  }
+
   /** 偵測 URL 的 v 參數變化（SPA 換視頻）→ 熱重啟字幕管線（M1-45）。 */
   private onUrlChanged(): void {
     // debounce：同一導航可能 popstate 與 pushState 各觸發一次，避免重複 restart。
     if (this.urlChangeTimer !== null) return;
     const videoId = extractVideoId(window.location.href);
+    diagLog('content', 'onUrlChanged triggered:', 'oldVideoId:', this.lastVideoId, 'newVideoId:', videoId, 'url:', window.location.href);
     if (videoId === this.lastVideoId) return; // 同一視頻（如僅參數調整），不重啟。
     this.lastVideoId = videoId;
     // 視頻切換時清空 timedtext 緩存，避免複用舊視頻字幕。
     this.bridge.clearLatest();
+    // M2-22：通知 MAIN world 攔截器視頻已切換——清空 stale 捕獲並重新驅動字幕模組。
+    // 背景：攔截器的 `lastCapture` 在 MAIN world，`bridge.clearLatest()` 只清空 isolated world
+    // 的緩存。攔截器的重播機制會持續發送 stale 捕獲，導致字幕管線複用舊視頻字幕。
+    document.dispatchEvent(new CustomEvent('ai-trans:video-changed'));
+    diagLog('content', 'Dispatched ai-trans:video-changed event to MAIN world interceptor');
     this.urlChangeTimer = setTimeout(() => {
       this.urlChangeTimer = null;
+      diagLog('content', 'restart() starting after URL change');
       // §5.5/R6：SPA 換視頻後重啟失敗必須落診斷，不許靜默。
-      void this.restart().catch((err) => {
+      void this.restart().then(() => {
+        diagLog('content', 'restart() completed successfully');
+      }).catch((err) => {
+        diagLog('content', 'restart() failed:', err instanceof Error ? err.message : String(err));
         recordDiagnostic({
           type: 'pipeline-error',
           error: {

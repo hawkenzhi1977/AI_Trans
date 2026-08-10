@@ -27,6 +27,7 @@
   var TIMEDTEXT_REQUEST_EVENT = "ai-trans:timedtext-request";
   var SET_TARGET_LANG_EVENT = "ai-trans:set-target-lang";
   var SET_DEBUG_FLAGS_EVENT = "ai-trans:set-debug-flags";
+  var VIDEO_CHANGED_EVENT = "ai-trans:video-changed";
   var INSTALL_FLAG = "__aiTransTimedtextInterceptorInstalled";
   function isTimedText(url) {
     try {
@@ -126,7 +127,14 @@
       try {
         const data = JSON.parse(jsonStr);
         const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (Array.isArray(tracks)) return tracks;
+        if (!Array.isArray(tracks)) continue;
+        const currentVid = extractVideoId(globalThis.location?.href ?? "");
+        const playerVid = data?.videoDetails?.videoId ?? "";
+        if (currentVid && playerVid && currentVid !== playerVid) {
+          diagLog("interceptor", "getCaptionTracksFromPlayerResponse: videoId mismatch, current:", currentVid, "player:", playerVid, "- stale data");
+          return void 0;
+        }
+        return tracks;
       } catch {
       }
     }
@@ -226,6 +234,14 @@
       diagLog("interceptor", "debug flags updated:", detail?.flags);
     };
     document.addEventListener(SET_DEBUG_FLAGS_EVENT, onSetDebugFlags);
+    const onVideoChanged = () => {
+      diagLog("interceptor", "video-changed event received, clearing lastCapture and resetting captionModuleDriven");
+      lastCapture = null;
+      Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);
+      captionModuleDriven = false;
+      resetAndRedriveCaptionModule();
+    };
+    document.addEventListener(VIDEO_CHANGED_EVENT, onVideoChanged);
     startCaptionModuleDriver();
     Reflect.set(globalThis, "__aiTransTimedtextRequests", 0);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);

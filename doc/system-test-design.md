@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-10（**M2-18 治理回填**：新增 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列））；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 93 + integration 124 + contract 11 = 228
+> 最後更新：2026-08-10（**M2-22 治理回填**：新增 TC-M2-10 視頻切換 URL 輪詢偵測（M2-21，pushState patch 被覆蓋兜底 + URL 輪詢 1.5s 檢查 `v` 參數變化）+ TC-M2-11 視頻切換 SPA 導航字幕修復（M2-22，videoId 驗證 + 播放器 API fallback + `ai-trans:video-changed` 事件清空 stale 捕獲 + 攔截器 videoId 驗證））；先前：M2-18 治理回填 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列）；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 101 + integration 130 + contract 11 = 242
 
 ---
 
@@ -405,15 +405,15 @@ jobs:
 - 預期：網絡層連接中斷與格式層解析失敗可區分，popup「最近失敗」能告訴用戶正確原因。
 - 落點：單元 `test/unit/llm-translation.test.ts`（+2）。
 
-#### TC-F21 SPA 換視頻後字幕重新出現（對應 F-01/M1-45，已實裝）
+#### TC-F21 SPA 換視頻後字幕重新出現（對應 F-01/M1-45，已實裝；M2-20 更新）
 - 前置：E2E 測試構建（`TEST_PROFILE=1`）含 M1-45 manifest 新 content_scripts 條目（`world:"MAIN"`+`run_at:"document_start"` 注入攔截器）；mock 頁 `with-native-captions.html` 的 `app.js` 以 `v` 參數為當前視頻身份——`currentVideoId()` 讀 URL，`requestCaptions()` 請求 `/timedtext?lang=en&v=<當前 v>`，並以 200ms setInterval 偵測 URL `v` 變化後重置 `captionsRequested` 重發請求；`serve-mock.mjs` timedtext 響應 `videoId` 動態反映請求 `v` 參數。
 - 步驟：
   - A（首次播放）：`page.goto('/with-native-captions.html?lang=en&v=abc123')` → 覆蓋層 `.ai-trans-overlay` 非空（字幕顯示）。
   - B（SPA 換視頻）：`page.evaluate(() => history.pushState({}, '', '/with-native-captions.html?lang=en&v=xyz789'))` 觸發 URL `v` 變化（不走頁面重載）→ content-script 偵測到 URL 變化（popstate/patch history）→ debounce 後熱重啟字幕管線。
   - C（新視頻字幕出現）：等待覆蓋層重新非空，且內容對應新視頻（mock 字幕為 v 依賴文本，斷言含 `xyz789` 特有標記）。
-  - D（無舊字幕殘留）：新視頻字幕出現前不顯示舊視頻字幕（跨視頻捕獲失效校驗：stale 捕獲被跳過）。
-- 預期：SPA 導航換視頻後字幕自動重新出現；跨視頻捕獲不誤用。
-- 落點：E2E `test/e2e/extension.spec.ts`（+1）；配套 `test/fixtures/mock-youtube/app.js`（v 動態 + 換視頻重發）、`with-native-captions.html`（ytInitialPlayerResponse 動態注入，baseUrl 按當前 v）、`scripts/serve-mock.mjs`（videoId 動態）；集成 `test/integration/timedtext-bridge.test.ts`（+2：waitForCapture 期望 videoId 過濾 + 超時後 stop 仍 clearInterval）、`test/integration/platform-adapter.test.ts`（+2：stale 跳過+診斷原因鏈、同視頻正常複用）、`test/integration/yt-timedtext-interceptor.test.ts`（+2：videoId 提取、URL 無 v 為空串）。
+  - D（無舊字幕殘留）：新視頻字幕出現前不顯示舊視頻字幕（`bridge.clearLatest()` 確保新捕獲來自新視頻）。
+- 預期：SPA 導航換視頻後字幕自動重新出現；`bridge.clearLatest()` 確保新捕獲來自新視頻。
+- 落點：E2E `test/e2e/extension.spec.ts`（+1）；配套 `test/fixtures/mock-youtube/app.js`（v 動態 + 換視頻重發）、`with-native-captions.html`（ytInitialPlayerResponse 動態注入，baseUrl 按當前 v）、`scripts/serve-mock.mjs`（videoId 動態）；集成 `test/integration/timedtext-bridge.test.ts`（+2：waitForCapture 超時後 stop 仍 clearInterval）、`test/integration/platform-adapter.test.ts`（+2：M2-20 更新——捕獲被接受不再檢查 videoId、同視頻正常複用）、`test/integration/yt-timedtext-interceptor.test.ts`（+2：videoId 提取、URL 無 v 為空串）。
 
 #### TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（對應 F-01/M1-46，已實裝）
 - 前置：M1-45 把攔截器以 `document_start`（MAIN world）注入後，引入新競態——攔截器捕獲響應並 `postMessage`，但 `TimedTextBridge` 的 `message` 監聽器在 content-script（`document_idle`）才註冊；帶緩存二次加載時播放器 timedtext 請求在 document_idle 前發出，捕獲消息發在監聽器就位前永久丟失 → `waitForCapture(15s)` 超時 → pot 空響應失敗。修復：攔截器維護模塊級 `lastCapture`，`install()` 啟 1.5s 定時器周期重播，晚註冊的監聽器最遲 1.5s 內收到。
@@ -597,6 +597,24 @@ jobs:
 - 預期：A 中 content-script bundle 可獨立解析 `@huggingface/transformers`（Chrome content script 無 node_modules）；B 中播放器 API 返回空時仍從 DOM 獲取字幕軌。
 - 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（M2-18 用例：getOption 返回空陣列時 DOM 解析兜底成功，斷言 `setOption('captions', 'track', { languageCode: 'zh-Hant' })` + `__aiTransCaptionTracks === 2`）。
 
+#### TC-M2-10 視頻切換 URL 輪詢偵測（對應 M2-21）
+- 步驟：
+  - A（pushState patch 被覆蓋兜底）：YouTube SPA 導航可能覆蓋 `history.pushState/replaceState` patch，導致 `onUrlChanged()` 不被觸發。新增 URL 輪詢偵測機制（`urlPollTimer`），每 1.5 秒檢查 `location.href` 的 `v` 參數變化。
+  - B（debounce 不衝突）：`onUrlChanged()` 已有 debounce 機制，URL 輪詢與 pushState patch 共存，不重複觸發。
+  - C（§5.4 註冊必配解除）：`startUrlPolling()`/`stopUrlPolling()` 在 `start()`/`stop()` 中正確管理，`stop()` 清除 `urlPollTimer`。
+- 預期：A 中 URL 輪詢成功偵測視頻切換；B 中 debounce 確保不重複觸發；C 中 `stop()` 正確解除輪詢。
+- 落點：手動驗證真實 YouTube SPA 導航場景（URL 輪詢偵測視頻切換 → 觸發 `onUrlChanged()` → 重新翻譯）。
+
+#### TC-M2-11 視頻切換 SPA 導航字幕修復（對應 M2-22）
+- 步驟：
+  - A（videoId 驗證）：`fetchTrackList()` 解析 JSON 後比對 `videoDetails.videoId` 與當前 URL 的 `v` 參數，不匹配時記錄診斷並嘗試播放器 API fallback。
+  - B（播放器 API fallback）：新增 `getCaptionTracksFromPlayer()` 從 `#movie_player` 元素的 `getOption('captions', 'tracklist')` 獲取當前視頻字幕軌（SPA 導航後播放器 API 會更新為新視頻數據）。
+  - C（攔截器 video-changed 事件）：content-script `onUrlChanged()` dispatch `ai-trans:video-changed` CustomEvent，MAIN world 攔截器收到後清空 `lastCapture` + 同步清空 `__aiTransTimedtextLastCapture` + 重置 `captionModuleDriven` + 調用 `resetAndRedriveCaptionModule()` 重新驅動字幕模組。
+  - D（捕獲 videoId 校驗）：`tryReuseCapture()` 和 `waitForCaptureReuse()` 恢復 videoId 驗證（從當前 URL 提取 `expectedVideoId`），stale 捕獲被拒絕並回退直接 fetch。
+  - E（攔截器 videoId 驗證）：`getCaptionTracksFromPlayerResponse()` 同步驗證 videoId（比對 DOM 數據的 `videoDetails.videoId` 與當前 URL），stale DOM 數據被拒絕、fallback 到播放器 API。
+- 預期：A 中 videoId 不匹配時記錄診斷並嘗試 fallback；B 中播放器 API 返回當前視頻字幕軌；C 中攔截器收到 `ai-trans:video-changed` 事件後清空 stale 捕獲並重新驅動字幕模組；D 中 stale 捕獲被拒絕；E 中 stale DOM 字幕軌被拒絕。
+- 落點：集成 `test/integration/platform-adapter.test.ts`（+3：videoId 不匹配時 fallback 播放器 API 返回當前視頻軌 / videoId 不匹配且無播放器 API 返回空並記錄診斷 / videoId 匹配時正常返回不觸發 fallback）+ `test/integration/yt-timedtext-interceptor.test.ts`（+2：`ai-trans:video-changed` 事件清空 `lastCapture` 並重新驅動字幕模組 / videoId 不匹配時 DOM 字幕軌被拒絕 fallback 播放器 API）。
+
 #### TC-F08 預緩衝提前處理與降級（對應 F-08）
 - 前置：可預取音頻的 mock 場景。
 - 步驟 A：預取可用 → 走二級 look-ahead。
@@ -713,6 +731,8 @@ jobs:
 | TC-M2-07 | M2-11 | 單元/集成 |
 | TC-M2-08 | M2-12 | 單元 |
 | TC-M2-09 | M2-17/M2-18 | 集成（已實裝） |
+| TC-M2-10 | M2-21 | 集成（已實裝） |
+| TC-M2-11 | M2-22 | 集成（已實裝） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

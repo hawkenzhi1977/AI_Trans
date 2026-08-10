@@ -650,4 +650,66 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
     expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'zh-Hant' });
     expect(Reflect.get(globalThis, '__aiTransCaptionTracks')).toBe(2);
   });
+
+  it('[M2-22] video-changed 事件清空 lastCapture 並重新驅動字幕模組', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000); // 首輪驅動成功
+    setOption.mockClear();
+
+    // 模擬捕獲一個 timedtext 響應（lastCapture 被設置）。
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=oldVideo&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    const lastCaptureBefore = Reflect.get(globalThis, '__aiTransTimedtextLastCapture');
+    expect(lastCaptureBefore).not.toBe(null);
+
+    // 發送 video-changed 事件（模擬 SPA 導航）。
+    document.dispatchEvent(new CustomEvent('ai-trans:video-changed'));
+
+    // lastCapture 應被清空。
+    const lastCaptureAfter = Reflect.get(globalThis, '__aiTransTimedtextLastCapture');
+    expect(lastCaptureAfter).toBe(null);
+
+    // captionModuleDriven 應被重置，重新驅動字幕模組。
+    vi.advanceTimersByTime(1_000);
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+  });
+
+  it('[M2-22] videoId 不匹配時 DOM 字幕軌被拒絕，fallback 到播放器 API', async () => {
+    // 當前頁面 URL 為新視頻（v=newVideo），但 DOM 中的 ytInitialPlayerResponse 是舊視頻（v=oldVideo）。
+    window.history.replaceState({}, '', '/watch?v=newVideo');
+
+    // 播放器 API 返回當前視頻的字幕軌。
+    const { setOption } = mountMockPlayer([{ languageCode: 'ja', kind: undefined }]);
+
+    // DOM 中注入舊視頻的 ytInitialPlayerResponse。
+    const stalePlayerResponseData = {
+      videoDetails: { videoId: 'oldVideo' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [{ languageCode: 'en', kind: 'asr' }],
+        },
+      },
+    };
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.textContent = `var ytInitialPlayerResponse = ${JSON.stringify(stalePlayerResponseData)};`;
+    document.body.appendChild(script);
+
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+
+    // 應從播放器 API 獲取軌（ja），而非 DOM 的 stale 軌（en）。
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'ja', kind: undefined });
+
+    window.history.replaceState({}, '', '/');
+  });
 });
