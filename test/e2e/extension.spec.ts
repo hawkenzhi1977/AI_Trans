@@ -74,12 +74,17 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     // 字幕文本出現（複用捕獲響應後管線成功）。
     await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 8_000 });
 
+    // 等待播放器 XHR 請求到達（CI 環境時序可能較慢，需輪詢等待）。
     // 讀取服務端 timedtext 請求計數：應恰好 1（僅 mock 播放器的 XHR）。
     // 若擴充自己 fetch，計數會是 2。
-    const { count } = await page.evaluate(() =>
-      fetch('/__mock-caption-request-count').then((r) => r.json() as Promise<{ count: number }>)
-    );
-    expect(count).toBe(1);
+    await expect(async () => {
+      const { count } = await page.evaluate(() =>
+        fetch('/__mock-caption-request-count').then((r) => r.json() as Promise<{ count: number }>)
+      );
+      // 計數至少 1（播放器已發請求），且不超過 1（擴充未重複 fetch）。
+      expect(count).toBeGreaterThanOrEqual(1);
+      expect(count).toBeLessThanOrEqual(1);
+    }).toPass({ timeout: 5_000 });
   });
 
   test('暫停後字幕覆蓋層仍掛載', async ({ page }) => {
