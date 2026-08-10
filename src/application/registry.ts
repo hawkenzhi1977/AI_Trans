@@ -1,4 +1,5 @@
 import type { ASRProvider } from '../domain/ports/asr-provider';
+import type { AudioSourceProvider } from '../domain/ports/audio-source';
 import type { CaptionStrategy } from '../domain/ports/caption-strategy';
 import type { PlatformAdapter } from '../domain/ports/platform-adapter';
 import type { SubtitleRenderer } from '../domain/ports/subtitle-renderer';
@@ -12,6 +13,8 @@ export interface Registry {
   platforms: PlatformAdapter[];
   /** 有序，代表降級優先級。 */
   strategies: CaptionStrategy[];
+  /** M2：音頻源註冊表（tabCapture → TabCaptureAudioSource）。 */
+  audioSources: Map<string, AudioSourceProvider>;
   asr: Map<string, ASRProvider>;
   translation: Map<string, TranslationProvider>;
   renderer: SubtitleRenderer;

@@ -25,13 +25,16 @@ English version: [README.md](./README.md).
 - **低延遲分塊翻譯**——長視頻按塊翻譯（`CHUNK_SIZE=60` 段）並漸進流式交付：首塊數秒內出現、後續塊增量更新覆蓋層，而非等待整片翻譯數分鐘。塊結果以 LRU 快取（上限 100 條，key = 模型 + 語言 + 內容哈希），重播、切換語言、重載分頁均免重複請求；引擎配置變更時快取自動失效。瞬態失敗（網絡中止、超時、HTTP 429/5xx、body 讀取或 JSON 錯誤）以退避重試 ≤2 次，重試耗盡的塊**回退顯示原文**而不阻塞其餘塊；永久錯誤（如 HTTP 400、響應結構異常）則 fail-fast，觸發管線降級並留下可追蹤診斷。
 - **調試日誌門控**——console 日誌分為八個分類（overlay / llm / capture / pipeline / strategy / content / bridge / interceptor），**預設全部關閉**；排查問題時在「設定 → 調試日誌」按需開啟個別分類。輸出行帶 `[AI_Trans:diag][分類]` 前綴便於過濾。錯誤與降級信息**不受門控**——始終顯示，即使關閉調試日誌，「最近失敗」行與 `console.warn` 麵包屑仍可靠可見。
 
+### 已實現（里程碑 M2）
+
+- **無字幕視頻實時 ASR**（`F-06`、`F-07`）——對無原生字幕的視頻，通過 `chrome.tabCapture` 擷取標籤頁音頻，做流式 ASR + 翻譯。**Offscreen Document 架構**——ASR 運行在獨立的 offscreen document（manifest 聲明）中，避免 service worker 掛起問題；通過 `chrome.runtime.connect` port（長連接，非一次性消息）與 content script 通信。**標籤頁音頻捕獲**——`TabCaptureAudioSource` 適配器捕獲標籤頁音頻流；用戶通過 Popup 的「啟用 ASR」按鈕授權，觸發 `chrome.tabCapture.getMediaStream`，含完整的生命週期管理（start/stop 事件）。**能量閾值 VAD**——`EnergyVAD`（RMS 閾值計算，無外部依賴）通過檢測語音活動 vs 靜音，將連續音頻切分為語音段，支持分塊 ASR 處理。**本地 Whisper ASR**——`LocalWhisperASR` 適配器使用 `@huggingface/transformers`（transformers.js v3，WASM/WebGPU）在本地運行 Whisper 模型；模型檔按需下載並緩存至 IndexedDB（非 `chrome.storage.local`，因其有 5MB 限制——Whisper tiny 約 150MB）。**雲端 ASR**——`CloudASR` 適配器同時支持 OpenAI Whisper API（multipart POST 至 `/v1/audio/transcriptions`）和 Deepgram（WebSocket 流式）；端點 URL 自動識別（含 `deepgram` → WebSocket，否則 → OpenAI 兼容）。**流式 ASR 接口**——`ASRPipeline.transcribeStream()` 增量產出分段結果；`RealtimeASRStrategy` 編排完整流程：音頻捕獲 → VAD 分段 → ASR 轉錄 → 翻譯 → 覆蓋層渲染。**臨時字幕修正**——中間 ASR 結果以「臨時」字幕顯示（區分樣式），最終結果到達後自動修正，提供即時反饋。**性能監控**——`PerfMetrics` 以滑動窗口（100 樣本）追蹤 ASR 延遲，計算 P50/P95 統計，當實時因子超過 1.0 持續 30s 時觸發自動降檔（如從本地 Whisper 降級至雲端 ASR，或從高質量模型降級至輕量模型）。**模型檔位配置**——Options UI 支持選擇模型檔位（本地 Whisper 的 tiny/base/small/medium；雲端端點 + 模型 ID）；支持自定義本地 ASR 模型（如 vibevoice）通過端點配置。**完整診斷**——ASR 管線失敗（tabCapture 授權拒絕、捕獲失敗、Offscreen 通信錯誤、ASR 引擎失敗、性能降檔、VAD 靜音切分、模型下載錯誤、端點識別）均發出可追蹤的診斷事件，在 Popup 的「最近失敗」行可見。
+
 ### 待實現（後續里程碑）
 
-- **M2 — 實時 ASR**（`F-06`、`F-07`）：對無字幕視頻擷取標籤頁音頻，做流式 ASR + 翻譯。本地 Whisper（WASM/WebGPU）與雲端 ASR，均可配置。
 - **M3 — 預緩衝提前處理**（`F-08`）：對「無字幕但可預取音頻」的視頻，提前對已緩衝音頻做 ASR（較高風險 / 屬優化）。
 - **更多平台**（YouTube 之外）。
 
-> 目前僅 M1（原生字幕路徑）達到可用狀態。三級字幕策略（原生 → 預緩衝 ASR → 實時 ASR）已完整設計，見 `doc/`。
+> M1（原生字幕路徑）與 M2（實時 ASR）均已達到可用狀態。三級字幕策略（原生 → 預緩衝 ASR → 實時 ASR）已完成三分之二，見 `doc/`。
 
 ---
 
@@ -40,7 +43,7 @@ English version: [README.md](./README.md).
 預構建的發布件位於 [`release/`](./release/)：
 
 - `release/ai-trans-extension/` — 未打包擴充目錄（推薦）。
-- `release/ai-trans-extension-v0.1.0.zip` — 壓縮包。
+- `release/ai-trans-extension-v0.2.0.zip` — 壓縮包。
 
 在 **Windows、macOS、Linux 上加載方式完全相同**，任何 Chromium 內核瀏覽器（Chrome / Edge / Brave）通用：
 

@@ -42,10 +42,13 @@ class SubtitleController {
   // R4：所有需解除的訂閱句柄，restart/stop 前必須全部清理，避免線性累積。
   private unsubscribePlayback: (() => void) | null = null;
   private unsubscribeConfig: (() => void) | null = null;
+  private unsubscribeAsrAuth: (() => void) | null = null;
   private pendingMountObserver: MutationObserver | null = null;
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
   // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
   private debugFlagRelayTimer: ReturnType<typeof setInterval> | null = null;
+  // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
+  private tabCaptureAuthorized = false;
   // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
   // 偵測 URL 的 v 參數變化後熱重啟字幕管線。dispose 時必須解除/恢復（R4）。
   private readonly onUrlChangedBound: () => void;
@@ -93,10 +96,40 @@ class SubtitleController {
     };
     chrome.storage.onChanged.addListener(onStorageChanged);
     this.unsubscribeConfig = () => chrome.storage.onChanged.removeListener(onStorageChanged);
+
+    // M2-14：監聽 tabCapture 授權狀態變更（Popup「啟用 ASR」按鈕寫入）。
+    // 授權成功後熱重啟字幕管線（enableAsr 切換為 true）。
+    const onAsrAuthChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string
+    ): void => {
+      if (areaName !== 'local' || !('tabCaptureAuthorized' in changes)) return;
+      const newValue = changes.tabCaptureAuthorized.newValue as boolean;
+      if (newValue === this.tabCaptureAuthorized) return; // 無變化。
+      this.tabCaptureAuthorized = newValue;
+      // §5.5/R6：授權變更後重啟失敗必須落診斷。
+      void this.restart().catch((err) => {
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'platform',
+            code: 'asr-auth-restart-failed',
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err)),
+          },
+        });
+      });
+    };
+    chrome.storage.onChanged.addListener(onAsrAuthChanged);
+    this.unsubscribeAsrAuth = () => chrome.storage.onChanged.removeListener(onAsrAuthChanged);
   }
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
   async start(): Promise<void> {
+    // M2-14：讀取 tabCapture 授權狀態（初始值，後續由 storage.onChanged 監聽更新）。
+    const authState = await chrome.storage.local.get('tabCaptureAuthorized');
+    this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
+
     // M1-51：套用調試日誌分類開關（content-script 側），並中繼給 MAIN world 攔截器
     // （interceptor 無法訪問 chrome.storage，靠 CustomEvent 同步旗標）。
     this.applyDebugFlags();
@@ -139,8 +172,9 @@ class SubtitleController {
       platformWatchRe,
       captionCaptureProvider: this.bridge,
     });
+    // M2-14：enableAsr 由 tabCapture 授權狀態驅動（Popup「啟用 ASR」按鈕觸發授權）。
     this.orchestrator = new Orchestrator(
-      { registry, getConfig: () => store.get(), enableAsr: false },
+      { registry, getConfig: () => store.get(), enableAsr: this.tabCaptureAuthorized },
       (e) => this.onEvent(e)
     );
 
@@ -249,6 +283,9 @@ class SubtitleController {
     this.bridge.dispose();
     this.unsubscribeConfig?.();
     this.unsubscribeConfig = null;
+    // R4：解除 tabCapture 授權監聽（§5.4）。
+    this.unsubscribeAsrAuth?.();
+    this.unsubscribeAsrAuth = null;
     // R4：解除 SPA 導航監聽並恢復被 patch 的 history API（防止疊加/洩漏）。
     globalThis.removeEventListener('popstate', this.onUrlChangedBound);
     if (this.patchedHistory) {

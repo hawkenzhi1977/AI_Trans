@@ -72,6 +72,39 @@
 
   // src/infrastructure/diagnostics.ts
   var DIAGNOSTIC_KEY = "lastDiagnostic";
+  function extractDiagnostic(e) {
+    switch (e.type) {
+      case "engine-degraded":
+        if (e.port === "translation" || e.port === "asr") {
+          return { kind: "degraded", message: e.reason };
+        }
+        return void 0;
+      case "pipeline-error":
+        return { kind: "error", message: formatCause(e.error.cause) };
+      default:
+        return void 0;
+    }
+  }
+  function formatCause(cause) {
+    if (cause instanceof Error) {
+      return `${cause.name}: ${cause.message}`;
+    }
+    return String(cause ?? "unknown error");
+  }
+  async function recordDiagnostic(e) {
+    const diag = extractDiagnostic(e);
+    if (!diag) return;
+    const record = {
+      kind: diag.kind,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      message: diag.message
+    };
+    console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
+    try {
+      await chrome.storage.local.set({ [DIAGNOSTIC_KEY]: record });
+    } catch {
+    }
+  }
   async function readLastDiagnostic() {
     try {
       const stored = await chrome.storage.local.get(DIAGNOSTIC_KEY);
@@ -197,6 +230,20 @@
       diagEl.textContent = "\u6700\u8FD1\u5931\u6557: \u7121";
     }
     bindActions(config);
+    await updateAsrButton();
+  }
+  async function updateAsrButton() {
+    const btn = $("btn-asr");
+    const authorized = await chrome.storage.local.get("tabCaptureAuthorized");
+    if (authorized.tabCaptureAuthorized) {
+      btn.textContent = "ASR \u5DF2\u555F\u7528";
+      btn.disabled = true;
+      btn.style.opacity = "0.6";
+    } else {
+      btn.textContent = "\u555F\u7528 ASR";
+      btn.disabled = false;
+      btn.style.opacity = "1";
+    }
   }
   function bindActions(config) {
     $("btn-options").addEventListener("click", () => {
@@ -237,6 +284,33 @@
         connEl.textContent = `\u91CD\u65B0\u8F09\u5165: ${err instanceof Error ? err.message : String(err)}`;
         connEl.classList.remove("ok");
         connEl.classList.add("warn");
+      }
+    });
+    $("btn-asr").addEventListener("click", async () => {
+      const connEl = $("status-connection");
+      connEl.textContent = "ASR \u6388\u6B0A: \u8ACB\u6C42\u4E2D\u2026";
+      connEl.classList.remove("warn", "ok");
+      try {
+        const streamId = await chrome.tabCapture.getMediaStreamId({});
+        await chrome.storage.local.set({
+          tabCaptureAuthorized: true,
+          tabCaptureStreamId: streamId
+        });
+        connEl.textContent = "ASR \u6388\u6B0A: \u6210\u529F";
+        connEl.classList.add("ok");
+        await updateAsrButton();
+      } catch (err) {
+        connEl.textContent = `ASR \u6388\u6B0A: \u5931\u6557 \u2014 ${err instanceof Error ? err.message : String(err)}`;
+        connEl.classList.add("warn");
+        void recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "audio",
+            code: "tab-capture-not-authorized",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
       }
     });
   }

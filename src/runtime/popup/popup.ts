@@ -3,7 +3,7 @@
 // 並提供「測試連接」按鈕直接驗證端點與模型名（見 connection-test.ts）——
 // 讓「字幕沒出現」時用戶能一鍵確認是端點/模型/CORS 哪一環的問題。
 import { ChromeStorageConfigStore } from '../../infrastructure/chrome-config-store';
-import { readLastDiagnostic, formatDiagnostic } from '../../infrastructure/diagnostics';
+import { readLastDiagnostic, formatDiagnostic, recordDiagnostic } from '../../infrastructure/diagnostics';
 import { testConnection } from './connection-test';
 import type { EngineConfig } from '../../domain/models/config';
 import { DEFAULT_CONFIG } from '../../domain/models/config';
@@ -50,6 +50,22 @@ async function init(): Promise<void> {
   }
 
   bindActions(config);
+  await updateAsrButton();
+}
+
+/** 更新 ASR 按鈕狀態（已授權顯示「ASR 已啟用」，未授權顯示「啟用 ASR」）。 */
+async function updateAsrButton(): Promise<void> {
+  const btn = $('btn-asr') as HTMLButtonElement;
+  const authorized = await chrome.storage.local.get('tabCaptureAuthorized');
+  if (authorized.tabCaptureAuthorized) {
+    btn.textContent = 'ASR 已啟用';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+  } else {
+    btn.textContent = '啟用 ASR';
+    btn.disabled = false;
+    btn.style.opacity = '1';
+  }
 }
 
 /** 綁定 popup 按鈕事件（config 讀取失敗時以默認值佔位，不影響手動操作）。 */
@@ -97,6 +113,43 @@ function bindActions(config: EngineConfig): void {
       connEl.textContent = `重新載入: ${err instanceof Error ? err.message : String(err)}`;
       connEl.classList.remove('ok');
       connEl.classList.add('warn');
+    }
+  });
+
+  // M2-14：tabCapture 授權按鈕——用戶點擊後觸發 tabCapture.getMediaStreamId（需用戶手勢）。
+  // 授權成功後寫入 chrome.storage.local['tabCaptureAuthorized'] = true，
+  // content-script 監聽 storage.onChanged 後啟用 ASR 策略。
+  $('btn-asr').addEventListener('click', async () => {
+    const connEl = $('status-connection');
+    connEl.textContent = 'ASR 授權: 請求中…';
+    connEl.classList.remove('warn', 'ok');
+    try {
+      // 觸發 tabCapture 授權對話框（需用戶手勢觸發，popup 按鈕符合條件）。
+      // getMediaStreamId 會彈出授權對話框，用戶點擊「允許」後返回 streamId。
+      // @ts-expect-error Chrome extension API: getMediaStreamId signature varies by version.
+      const streamId = await chrome.tabCapture.getMediaStreamId({});
+      // 授權成功 → 記錄 streamId（實際捕獲由 Offscreen Document 使用）。
+      await chrome.storage.local.set({
+        tabCaptureAuthorized: true,
+        tabCaptureStreamId: streamId,
+      });
+      connEl.textContent = 'ASR 授權: 成功';
+      connEl.classList.add('ok');
+      await updateAsrButton();
+    } catch (err) {
+      // 授權失敗（用戶點擊「拒絕」或權限不足）。
+      connEl.textContent = `ASR 授權: 失敗 — ${err instanceof Error ? err.message : String(err)}`;
+      connEl.classList.add('warn');
+      // §5.6：授權失敗必須落診斷。
+      void recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'audio',
+          code: 'tab-capture-not-authorized',
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err)),
+        },
+      });
     }
   });
 }

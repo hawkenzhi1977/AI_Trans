@@ -10,6 +10,7 @@ cpSync('manifest.json', 'dist/manifest.json', { force: true });
 for (const html of [
   'src/runtime/options/options.html',
   'src/runtime/popup/popup.html',
+  'src/runtime/offscreen.html', // M2-09：Offscreen Document 入口。
 ]) {
   const dest = `dist/${html}`;
   mkdirSync(dest.slice(0, dest.lastIndexOf('/')), { recursive: true });

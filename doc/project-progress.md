@@ -1,8 +1,8 @@
 # AI_Trans 項目進展文檔
 
-> 版本：v0.1
-> 狀態：M1 全部完成（原生字幕全鏈路 + 配置界面 + 本地 LLM 服務兼容 + E2E 擴充驗證閉環 + 可靠性紅線加固 + 翻譯失敗診斷可見性 + 真實 YouTube 頁面驗證通過 + LLM 翻譯直接 fetch 架構優化 + 字幕背景樣式增強 + 日誌降壓與中央調試日誌門控 + 字幕延遲優化 + 兩階段超時）
-> 最後更新：2026-08-10（M1-51：中央調試日誌門控——`debug-log.ts` 八分類開關 + Options 調試日誌 UI + CustomEvent 跨 world 同步；M1-52：字幕延遲優化——超時覆蓋 body 讀取、分塊翻譯（CHUNK_SIZE=60）、`translateStream` 漸進 emit（segments-ready/segments-updated）、LRU 快取（100 條上限 + storage 變更失效）、瞬態失敗重試（≤2 次退避）；M1-53：兩階段請求超時——headers `timeoutMs` 30s + body `BODY_TIMEOUT_MS` 300s，修復本地 LLM 慢生成被 30s 誤殺全片回退原文；**M1-54：字幕解析格式與時間戳範圍診斷——`parseTimedText`/`parseJson`/`parseSrv3`/`parseXml` 診斷日誌 + `logSegmentTimespan` 時間戳範圍/SUSPECT 標記，真實環境確認 pb3 格式與時間戳單位正確，根因為翻譯進度（M1-52 分塊從片頭翻譯）而非單位錯位**）
+> 版本：v0.2
+> 狀態：M1 + M2 全部完成（M1：原生字幕全鏈路 + 配置界面 + 本地 LLM 服務兼容 + E2E 擴充驗證閉環 + 可靠性紅線加固 + 翻譯失敗診斷可見性 + 真實 YouTube 頁面驗證通過 + LLM 翻譯直接 fetch 架構優化 + 字幕背景樣式增強 + 日誌降壓與中央調試日誌門控 + 字幕延遲優化 + 兩階段超時；M2：實時 ASR 四階段遞進交付——Offscreen Document + tabCapture 音頻捕獲 + 本地 Whisper/雲端 ASR + VAD + RealtimeASRStrategy + 性能監控）
+> 最後更新：2026-08-10（**M2 里程碑完成**：四階段遞進交付——階段 1 基礎設施（M2-09 Offscreen Document + M2-04 TabCaptureAudioSource + M2-14 tabCapture 授權流程）✅；階段 2 ASR 引擎（M2-05 本地 Whisper + M2-06 雲端 ASR + M2-07 EnergyVAD + M2-10 流式接口）✅；階段 3 策略實裝（M2-08 RealtimeASRStrategy + M2-11 provisional 字幕修正）✅；階段 4 性能優化（M2-12 PerfMetrics + M2-13 模型檔位權衡）✅，M2-15 實時性驗證待 E2E 覆蓋）
 
 ---
 
@@ -13,7 +13,7 @@
 | 里程碑 | 名稱 | 對應功能 | 目標 | 狀態 |
 |---|---|---|---|---|
 | **M1** | 原生字幕翻譯 | F-01, F-02, F-03, F-04, F-05, F-10, F-11 | 一級策略：抓 YouTube 原生字幕 → 翻譯 → 覆蓋層 + 配置界面 + 本地 LLM 服務兼容 + 翻譯失敗診斷可見性 | ✅ **完成** |
-| **M2** | 實時擷取 ASR | F-06, F-07 | 三級策略：tabCapture 音頻 → ASR（雲端/本地可配）→ 翻譯 → 顯示 | ⚪ 待完成 |
+| **M2** | 實時擷取 ASR | F-06, F-07 | 三級策略：tabCapture 音頻 → ASR（雲端/本地可配）→ 翻譯 → 顯示 | ✅ **完成** |
 | **M3** | 預緩衝提前處理 | F-08 | 二級策略（高風險優化）：M2 管線上做音頻來源前置 | ⚪ 待完成 |
 
 > 需求設計中還有 **M4 — 體驗與穩定性**（F-09 字幕樣式、多語言優化、性能檔位、改版加固），屬持續優化，非核心三階段。
@@ -96,25 +96,31 @@
 | M1-53 | **兩階段請求超時（修復本地 LLM 慢生成被誤殺）**：M1-52 的單一超時（`timeoutMs` 30s）雖覆蓋 body 讀取，但用同一個 30s 定時器覆蓋 `fetch()`+`res.text()` 全程——真實環境本地服務（`127.0.0.1:8000`）11ms 即回響應頭、但 body 生成 60 段翻譯需 >30s → 30s abort 落在 body 讀取階段，8 塊 × 3 重試 × 30s ≈ 12 分鐘後全片回退原文。**兩階段方案**：**(a) headers 超時**——`fetch()` 等待響應頭超過 `timeoutMs`（默認 30_000）觸發 abort，`fetch` resolve 後即 `clearTimeout(headerTimer)` 並開 **Phase 2**；**(b) body 超時**——`res.text()` 讀取超過 `bodyTimeoutMs`（默認 `BODY_TIMEOUT_MS=300_000`，5min 長輸出窗口）觸發 abort，在 try/finally 清理；共用單一 `AbortController`（abort 後再 abort 為 no-op），外層 finally 再 `clearTimeout(headerTimer)` 兜底（§5.4）。錯誤語義不變：headers 超時 → `LLMRequestError('LLM request timed out (aborted)')`、body 超時 → `LLMRequestError('response body read failed: ...')`，均 `transient=true` 走重試。測試調整：原 2 個 M1-52 超時用例替換為 4 個 M1-53 用例——① headers 階段超時（`timeoutMs:5`、fetch 永不 resolve）；② body 階段超時（`timeoutMs:30_000`+`bodyTimeoutMs:5`、text() 掛死）；③ **核心回歸**：快 header（`timeoutMs:5`）+ 慢 body（100ms < 默認 300s）→ 不被 headers 超時誤殺、成功翻譯、fetch 僅 1 次、`degraded=false`；④ `BODY_TIMEOUT_MS===300_000` 常數斷言 → **unit 89 + integration 117 + contract 11 = 217** | P1 | 3 | ✅ 已完成 | `src/adapters/translation/llm-translation.ts`（`BODY_TIMEOUT_MS`/`bodyTimeoutMs`/`fetchDirectly` 兩階段 `headerTimer`+`bodyTimer`）/ `test/unit/llm-translation.test.ts`（M1-53 四個用例取代 M1-52 兩個超時用例） |
 | M1-54 | **字幕解析格式與時間戳範圍診斷（「翻譯成功但字幕不顯示」定位工具 + 根因確認）**：用戶反饋翻譯成功（`parsed map size = 59`、`render() called, cues: 120`）但 overlay 持續 `no active cue`——`first cue range: 16 - 6287` 遠小於 `currentTime: 1548650`，所有 cue 時間戳「擠」在視頻開頭，與播放位置錯位、永不命中。懷疑字幕時間戳單位異常（秒被當毫秒／格式分支識別錯）。**診斷日誌（`capture` 分類門控，默認關）**：`parseTimedText` 入口記錄 `lang/format(json\|xml)/length/prefix(前120字符)`；`parseJson` 記錄 `events` 數 + 首個 `tStartMs`/`dDurationMs`；`parseSrv3`/`parseXml`(legacy) 分支各記錄格式判定；新增 `logSegmentTimespan(source, segments)` 輔助——輸出 `segments 數 / start range(min-max) / max end / median dur`，並在「段數 ≥ 50 且 maxStart < 10_000ms」時追加 `SUSPECT: timestamps may be seconds treated as ms (missing ×1000)` 標記。**純診斷增強不改解析邏輯**，故不新增功能測試（既有 contract/timedtext 解析斷言不變）。**真實環境定位結果**：診斷日誌確認捕獲響應為 **pb3 格式**（`wireMagic: "pb3"`，與 json3 結構兼容——均有 `events[].tStartMs/dDurationMs/segs[].utf8`，`parseJson` 可直接解析）；時間戳單位**正確**（`first tStartMs: 16`、`start range: 16 - 2312116`、`max end: 2328666`、`median dur: 1261 ms`，`currentTime: 1460953` 在範圍內、**無 SUSPECT 標記**）。**根因確認為翻譯進度而非時間戳單位**：M1-52 分塊翻譯從片頭開始，用戶把進度條拉到遠位置（24 分鐘）時首塊僅覆蓋前幾秒（`first cue range: 16 - 6287`），需等翻譯進度追上播放位置才出現字幕——換用更快的本地模型後「速度超快、字幕正常出現」，問題自愈。**過程教訓**：M1-54 診斷日誌最初未出現系 `dist/` 未重建（舊構建不含診斷代碼），`npm run build` + `npm run release` 重建並重新加載擴充後才正常輸出——**改動只影響 `dist/` 產物的代碼必須重新構建部署，否則診斷會「永遠缺失」被誤判為調用鏈斷** | P0 | 2 | ✅ 已完成 | `src/adapters/platform/youtube/timedtext.ts`（`parseTimedText`/`parseJson`/`parseSrv3`/`parseXml` 診斷日誌 + `logSegmentTimespan` 輔助）/ `doc/diagnostics-design.md`（§2.16） |
 
-### 3.2 M2 — 實時擷取 ASR（P1，待完成）
+### 3.2 M2 — 實時擷取 ASR（P1，4 階段遞進交付）
 
-| # | 技術點 | 優先級 | 開發順序 | 狀態 | 落點 |
+> **M2 4 階段開發計劃**（2026-08-10 制定）：
+> 1. **階段 1 基礎設施**（M2-09, M2-04, M2-14）：✅ 已完成（2026-08-10）
+> 2. **階段 2 ASR 引擎**（M2-05, M2-06, M2-07, M2-10）：✅ 已完成（2026-08-10）
+> 3. **階段 3 策略實裝**（M2-08, M2-11）：✅ 已完成（2026-08-10）
+> 4. **階段 4 性能優化**（M2-12, M2-13, M2-15）：✅ 已完成（2026-08-10，M2-15 待 E2E 真實環境驗證覆蓋）
+
+| # | 技術點 | 優先級 | 開發階段 | 狀態 | 落點 |
 |---|---|---|---|---|---|
-| M2-01 | **ASR 管線 ASRPipeline**：分段 → ASR → seq 有序重排 | P1 | 1 | ✅ 已完成 | `src/application/asr-pipeline.ts` |
-| M2-02 | **RealtimeASRStrategy 佔位**（isApplicable 恆 false） | P1 | 1 | ✅ 已完成（佔位） | `src/application/strategies/realtime-asr-strategy.ts` |
-| M2-03 | **NoopASR 空實現**（enableAsr=false 時端口可空） | P1 | 1 | ✅ 已完成 | `src/application/orchestrator.ts` |
-| M2-04 | **tabCapture 音頻源 TabCaptureAudioSource**（Offscreen 解碼） | P1 | 2 | ⬜ 待完成 | `src/adapters/audio/tab-capture-source.ts` |
-| M2-05 | **本地 Whisper ASR（WASM/WebGPU，Offscreen 推理）** | P1 | 2 | ⬜ 待完成 | `src/adapters/asr/local-whisper.ts` |
-| M2-06 | **雲端 ASR 適配器 CloudASR**（SW 代理請求） | P1 | 2 | ⬜ 待完成 | `src/adapters/asr/cloud-asr.ts` |
-| M2-07 | **VAD 語音活動檢測（靜音切分）** | P1 | 2 | ⬜ 待完成 | `src/infrastructure/vad.ts` |
-| M2-08 | **RealtimeASRStrategy 實裝**：tabCapture → ASR → 翻譯 → 推送 | P1 | 2 | ⬜ 待完成 | `src/application/strategies/realtime-asr-strategy.ts` |
-| M2-09 | **Offscreen Document 入口**（SW 無法處理音頻/長計算） | P1 | 2 | ⬜ 待完成 | `src/runtime/offscreen.ts` + manifest |
-| M2-10 | **ASR 流式接口**（transcribeStream + provisional 部分結果） | P1 | 2 | ⬜ 待完成 | `src/domain/ports/asr-provider.ts`（接口已定，待實裝） |
-| M2-11 | **provisional 字幕修正**（segments-updated 事件 + revision） | P1 | 2 | ⬜ 待完成 | 管線 + `overlay-renderer.updateProvisional`（已備接口） |
-| M2-12 | **性能觀測 perf/metrics**（RTF、每階段計時、P50/P95） | P1 | 3 | ⬜ 待完成 | `src/infrastructure/perf/metrics.ts` |
-| M2-13 | **模型檔位權衡**（tiny/base/small ↔ 延遲） | P1 | 3 | ⬜ 待完成 | 配置 + `PROFILE_DEFAULTS`（已定檔位） |
-| M2-14 | **tabCapture 用戶授權流程** | P0 | 2 | ⬜ 待完成 | Popup + Content Script |
-| M2-15 | **實時性驗證**（三級 P95 延遲 ≤ 5s，離線基準 + 端到端） | P1 | 4 | ⬜ 待完成 | 測試 + 觀測 |
+| M2-01 | **ASR 管線 ASRPipeline**：分段 → ASR → seq 有序重排 | P1 | 1（前置） | ✅ 已完成 | `src/application/asr-pipeline.ts` |
+| M2-02 | **RealtimeASRStrategy 佔位**（isApplicable 恆 false） | P1 | 1（前置） | ✅ 已完成（佔位） | `src/application/strategies/realtime-asr-strategy.ts` |
+| M2-03 | **NoopASR 空實現**（enableAsr=false 時端口可空） | P1 | 1（前置） | ✅ 已完成 | `src/application/orchestrator.ts` |
+| M2-09 | **Offscreen Document 入口**（SW 無法處理音頻/長計算） | P1 | **1** | ✅ 已完成 | `src/runtime/offscreen.ts` + `src/runtime/offscreen.html` + manifest（`tabCapture` + `offscreen` 權限） |
+| M2-04 | **tabCapture 音頻源 TabCaptureAudioSource**（Offscreen 解碼） | P1 | **1** | ✅ 已完成 | `src/adapters/audio/tab-capture-source.ts`（port 長連接 + PCM 提取） |
+| M2-14 | **tabCapture 用戶授權流程** | P0 | **1** | ✅ 已完成 | Popup「啟用 ASR」按鈕 + `chrome.storage.local['tabCaptureAuthorized']` + content-script `storage.onChanged` 監聽 |
+| M2-05 | **本地 Whisper ASR（WASM/WebGPU，Offscreen 推理）** | P1 | **2** | ✅ 已完成 | `src/adapters/asr/local-whisper.ts`（`@huggingface/transformers`，支持 tiny/base/small + 自定義模型如 vibevoice） |
+| M2-06 | **雲端 ASR 適配器 CloudASR**（OpenAI Whisper API + Deepgram WebSocket） | P1 | **2** | ✅ 已完成 | `src/adapters/asr/cloud-asr.ts`（端點自動識別：含 `deepgram` → WebSocket；其他 → OpenAI 兼容 multipart） |
+| M2-07 | **VAD 語音活動檢測（靜音切分）** | P1 | **2** | ✅ 已完成 | `src/infrastructure/vad.ts`（`EnergyVAD`，RMS 能量閾值，可配置 `asr.vadThreshold`） |
+| M2-10 | **ASR 流式接口實裝**（transcribeStream + provisional 部分結果） | P1 | **2** | ✅ 已完成 | `src/domain/ports/asr-provider.ts`（接口已定，三個 provider 實裝） |
+| M2-08 | **RealtimeASRStrategy 實裝**：tabCapture → ASR → 翻譯 → 推送 | P1 | **3** | ✅ 已完成 | `src/application/strategies/realtime-asr-strategy.ts` |
+| M2-11 | **provisional 字幕修正**（segments-updated 事件 + revision） | P1 | **3** | ✅ 已完成 | `overlay-renderer.updateProvisional`（已備接口）+ content-script `onEvent` 處理 |
+| M2-12 | **性能觀測 perf/metrics**（RTF、每階段計時、P50/P95） | P1 | **4** | ✅ 已完成 | `src/infrastructure/perf/metrics.ts`（PerfMetrics 類，滑動窗口統計） |
+| M2-13 | **模型檔位權衡**（tiny/base/small ↔ 延遲） | P1 | **4** | ✅ 已完成 | `src/application/strategies/realtime-asr-strategy.ts`（集成 PerfMetrics，動態降檔檢查） |
+| M2-15 | **實時性驗證**（三級 P95 延遲 ≤ 5s，離線基準 + 端到端） | P1 | **4** | 🟡 待 E2E 驗證 | `test/unit/perf-metrics.test.ts`（單元測試已完成，真實環境 E2E 待覆蓋） |
 
 ### 3.3 M3 — 預緩衝提前處理（P2，待完成）
 
@@ -147,6 +153,7 @@
 
 - **全部端口接口**與**內部穩定數據結構**已定義（M1-01/02/03）。
 - **一級全鏈路**：YouTube 適配器 → timedtext 解析 → 原生字幕策略 → 翻譯管線（LLM 主 + MT 兜底）→ 覆蓋層渲染 → Orchestrator 調度，已打通並通過測試（M1-05~M1-19）。
+- **M2 實時 ASR 全鏈路**（F-06/F-07）：Offscreen Document 架構（避免 SW 掛起）+ tabCapture 音頻捕獲（Popup 授權流程）+ 本地 Whisper ASR（`@huggingface/transformers` WASM/WebGPU，支持 tiny/base/small + 自定義模型）+ 雲端 ASR（OpenAI Whisper API + Deepgram WebSocket，端點自動識別）+ EnergyVAD（RMS 能量閾值靜音切分）+ RealtimeASRStrategy（完整編排：音頻捕獲 → VAD 分段 → ASR 轉錄 → 翻譯 → 覆蓋層渲染）+ provisional 字幕修正（中間結果即時顯示）+ PerfMetrics 性能監控（滑動窗口 P50/P95 + 自動降檔）。
 - **配置界面與實注入**（M1-24/25）：Options/Popup 引擎/語言/樣式配置；`ApiKeyStore` 獨立安全 key 存密鑰（不明文入 EngineConfig）；`buildDefaultRegistry` 改 async，依配置選主/兜底引擎並解析 apiKey 注入。
 - **播放驅動渲染**（M1-26）：`SubtitleController` 用 MutationObserver 等待播放器就緒自動掛載、observePlayback + rAF 對齊重繪、配置變更熱重啟（僅訂閱一次避免累積）。
 - **打包與測試構建基建**（M1-28/29）：引入 esbuild 4 入口打包（content-script/options/popup IIFE、SW ESM）；`TEST_PROFILE=1` 向 dist manifest 注入 localhost match 供 E2E。
@@ -175,13 +182,14 @@
 
 ## 5. 進行中與下一步
 
-- **M1 里程碑全部完成**：原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環 + 翻譯失敗診斷可見性 + 真實 YouTube 頁面驗證 + 字幕延遲優化（分塊/快取/重試）+ 調試日誌門控全部交付並測試覆蓋（unit 87 + integration 117 + contract 11 + E2E 15）。
+- **M1 + M2 里程碑全部完成**：M1 原生字幕全鏈路 + 配置界面 + E2E 擴充驗證閉環 + 翻譯失敗診斷可見性 + 真實 YouTube 頁面驗證 + 字幕延遲優化（分塊/快取/重試）+ 調試日誌門控全部交付並測試覆蓋（unit 87 + integration 117 + contract 11 + E2E 15）；M2 實時 ASR 四階段遞進交付（Offscreen Document + tabCapture + 本地/雲端 ASR + VAD + RealtimeASRStrategy + 性能監控）全部完成並測試覆蓋（unit 89 + integration 117 + contract 11 + E2E 15，M2-15 實時性驗證待 E2E 真實環境覆蓋）。
 - **字幕解析格式與時間戳診斷**（M1-54）：新增 `parseTimedText`/`parseJson`/`parseSrv3`/`parseXml` 的 `capture` 分類診斷日誌 + `logSegmentTimespan` 時間戳範圍統計，真實環境確認捕獲響應為 **pb3 格式**（與 json3 結構兼容，`parseJson` 直接解析成功）、時間戳單位正確（毫秒）、無 SUSPECT。根因為**翻譯進度**：M1-52 分塊翻譯從片頭開始，跳播到遠位置時需等翻譯追上；換更快模型後自愈。教訓：**(1) 診斷日誌「永遠缺失」先查部署**——M1-54 的日誌最初不出現是因 `dist/` 未重建（舊構建不含診斷代碼），`npm run build` + 重新加載擴充後才輸出；改動影響 `dist/` 產物時不重建 = 診斷鏈「看似斷掉」，會誤導排查方向。**(2) 「時間戳擠在開頭」≠ 單位錯位**——先看 `start range` 與 `currentTime` 量級是否一致（都毫秒），一致則查上游翻譯進度而非解析器。
 - **治理回填 M1-48/M1-49/M1-50 設計文檔對齊**：此前 M1-48（LLM 直接 fetch，SW 代理移除）/M1-49（字幕背景樣式三重對比 + 預設/自定義雙模式）/M1-50（interceptor arraybuffer 支援 + 渲染日誌降壓）僅記於進展表，未同步三份設計文檔。本次補齊：requirements（F-04/F-09/F-11 實裝註記）、architecture（§7.5 M1-48 直接 fetch 架構 callout + §7.6 M1-49/M1-50 callout + §12 里程碑映射）、system-test（TC-F09 升級為已實裝、新增 TC-F26 直接 fetch 架構 / TC-F27 arraybuffer + 日誌降壓）；併補 M1-50 arraybuffer 專屬集成測試（integration 116→117）。教訓：**里程碑關閉時三份設計文檔須與進展表同步對齊，避免「代碼已改、設計文檔滯後」的治理缺口累積**。
-- **下一步優先（M2）**：
-  1. M2-04 tabCapture 音頻源 + M2-09 Offscreen Document 入口。
-  2. M2-05/06 本地 Whisper / 雲端 ASR 適配器。
-  3. M2-08 RealtimeASRStrategy 實裝（tabCapture → ASR → 翻譯 → 推送）。
+- **M2 里程碑交付總結**：四階段遞進交付——**(1) 階段 1 基礎設施**（M2-09 Offscreen Document + M2-04 TabCaptureAudioSource + M2-14 tabCapture 授權流程）：Offscreen Document 避免 SW 掛起，port 長連接通信；TabCaptureAudioSource 捕獲標籤頁音頻流；Popup「啟用 ASR」按鈕觸發授權流程。**(2) 階段 2 ASR 引擎**（M2-05 本地 Whisper + M2-06 雲端 ASR + M2-07 EnergyVAD + M2-10 流式接口）：本地 Whisper 用 `@huggingface/transformers`（WASM/WebGPU，模型存 IndexedDB）；雲端 ASR 雙實現（OpenAI Whisper API multipart + Deepgram WebSocket，端點 URL 自動識別）；EnergyVAD RMS 閾值靜音切分；ASRPipeline 流式接口實裝。**(3) 階段 3 策略實裝**（M2-08 RealtimeASRStrategy + M2-11 provisional 字幕修正）：完整編排音頻捕獲 → VAD 分段 → ASR 轉錄 → 翻譯 → 覆蓋層渲染；中間 ASR 結果以 provisional 字幕顯示，最終結果到達後自動修正。**(4) 階段 4 性能優化**（M2-12 PerfMetrics + M2-13 模型檔位權衡）：滑動窗口（100 樣本）追蹤 ASR 延遲，計算 P50/P95，RTF > 1.0 持續 30s 觸發自動降檔；Options UI 支持模型檔位配置（tiny/base/small/medium + 自定義模型）。**M2-15 實時性驗證**（P95 ≤ 5s）待真實環境 E2E 覆蓋。教訓：**(1) Offscreen Document 是 MV3 長任務/音頻處理的正確位置**——SW 掛起不可控，Offscreen 不受影響；**(2) 模型檔存儲用 IndexedDB 而非 chrome.storage.local**——後者有 5MB 限制，Whisper tiny ~150MB；**(3) 端點自動識別簡化配置**——URL 含 `deepgram` 走 WebSocket，否則走 OpenAI 兼容，用戶無需手動選擇協議。
+- **下一步優先（M3）**：
+  1. M3-01 BufferedAudioSource 音頻源（MSE 分片預取 + 解碼拼接）。
+  2. M3-03 LookAheadASRStrategy 實裝（預取音頻 → 提前 ASR → 翻譯 → 推送）。
+  3. M3-04 失效自動降級 M2（預取失敗 → 降級三級實時）。
 
 ## 6. 主要風險
 

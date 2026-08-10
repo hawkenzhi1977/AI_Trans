@@ -459,6 +459,12 @@ export interface AudioSourceProvider {
 
 **插拔說明**：二級 `BufferedAudioSource` 若因 YouTube 改版失效 → 上層策略鏈捕獲異常 → 降級到三級 `TabCaptureAudioSource`。二者輸出同為 `AudioChunk`，下游 ASR 管線完全不變。
 
+> **TabCaptureAudioSource 實裝設計（M2-04）**：`src/adapters/audio/tab-capture-source.ts` 實現 `AudioSourceProvider`（`kind: 'tab-capture'`）。`open()` 通過 content-script → port 向 Offscreen Document 發 `{ type: 'start', tabId }` → Offscreen 調 `chrome.tabCapture.getMediaStream({ tabId, audio: true, video: false })` → 建 `AudioContext` → `MediaStreamAudioSourceNode` → `ScriptProcessorNode`（或 `AudioWorklet`）按 200ms 窗口分塊 → 推送 `AudioChunk`（`seq` 單調遞增、`pcm: Float32Array`、`isSpeech` 由 VAD 標記）。`stop()` 關閉 MediaStream + AudioContext + 向 Offscreen 發 `{ type: 'stop' }`。§5.4：所有訂閱/定時器在 `stop()` 解除；§5.1：`chrome.runtime.connect` 等宿主方法 `.bind(globalThis)`。
+
+> **Offscreen Document 通信協議（M2-09）**：content-script ↔ Offscreen 用 `chrome.runtime.connect` port 長連接（避免 SW 掛起問題，M1-48 教訓）。消息類型：`{ type: 'start', tabId }` → Offscreen 啟動 tabCapture；`{ type: 'audio-chunk', chunk: AudioChunk }` ← Offscreen 推送音頻塊；`{ type: 'stop' }` → Offscreen 停止捕獲；`{ type: 'error', message }` ← Offscreen 報告錯誤。Offscreen 生命週期由 content-script 管理（`chrome.offscreen.createDocument` / `chrome.offscreen.deleteDocument`），MV3 同時只允許一個 Offscreen 文檔（§13 開放問題 #2）。
+
+> **VAD 能量閾值（M2-07）**：`src/infrastructure/vad.ts` 實裝 `EnergyVAD` 類——計算 `AudioChunk.pcm` 的 RMS 能量，低於閾值（`EngineConfig.asr.vadThreshold`，默認 0.01）標記 `isSpeech = false`（靜音，跳過 ASR 節省算力）。靜音連續超過 2s 觸發分段邊界（切分 AudioChunk 送 ASR）。
+
 ### 7.4 ASRProvider
 
 ```typescript
@@ -473,6 +479,12 @@ export interface ASRProvider {
 ```
 
 **插拔說明**：新增 ASR 供應商 → 實現接口 + 註冊。本地/雲端只是 `location` 不同，管線一視同仁。
+
+> **LocalWhisperASR 實裝設計（M2-05）**：`src/adapters/asr/local-whisper.ts` 實現 `ASRProvider`（`engineId: 'local-whisper'`，`location: 'local'`）。依賴 `@huggingface/transformers`（transformers.js v3，純 JS WASM/WebGPU）。**運行在 Offscreen Document 內**（避免阻塞 content-script 渲染線程）。`warmup()` 加載模型（tiny/base/small），首次從 HuggingFace Hub 下載到 IndexedDB（`chrome.storage.local` 有 5MB 限制，Whisper tiny ~150MB 必須用 IndexedDB）；`transcribe()` PCM → Whisper pipeline → `ASRResult`；`transcribeStream()` 分段推理 → emit provisional `ASRResult(isPartial=true)` → emit final `ASRResult(isPartial=false)`。**自定義模型支持**：`EngineConfig.asr.modelPath` 允許指定本地模型目錄（如 vibevoice），從 IndexedDB 或 `file://` 加載。
+
+> **CloudASR 實裝設計（M2-06）**：`src/adapters/asr/cloud-asr.ts` 實現 `ASRProvider`（`engineId: 'cloud-asr'`，`location: 'cloud'`）。雙實現依 `config.asr.endpoint` 自動識別：**(1) OpenAI Whisper API**——`POST <endpoint>/v1/audio/transcriptions`（multipart/form-data，`file` 字段為 WAV blob，`model: 'whisper-1'`），非流式 → `transcribe()` 等同 `transcribeStream()` 只 emit 一次 final；**(2) Deepgram**——WebSocket `wss://api.deepgram.com/v1/listen`（`encoding: 'linear16'`，`sample_rate: 16000`，`interim_results: true`），原生流式 → `transcribeStream()` emit provisional → emit final。端點含 `deepgram` → WebSocket；其他 → OpenAI 兼容。§5.1：fetch 綁定 `globalThis.fetch.bind(globalThis)`；§5.4：WebSocket 連接在 `stop()` 關閉。
+
+> **ASR 流式接口實裝（M2-10）**：`ASRProvider.transcribeStream` 接口已定義（`src/domain/ports/asr-provider.ts`），M2 實裝三個 provider：LocalWhisperASR（分段推理 → emit provisional → emit final）、CloudASR-Deepgram（WebSocket 原生流式 → emit provisional → emit final）、CloudASR-OpenAI（非流式 → emit 一次 final）。`ASRPipeline.transcribeStream` 已支持流式（`src/application/asr-pipeline.ts:37-60`）。
 
 ### 7.5 TranslationProvider
 
@@ -783,7 +795,7 @@ export interface PerfSample {
 | 里程碑 | 落地的適配器/模塊 | 先定義後實現的接口 |
 |---|---|---|
 | M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容）；LLM 直接 fetch + SW 精簡（M1-48）；字幕背景樣式增強（F-09/M1-49）；日誌降壓 + interceptor arraybuffer 支援（M1-50）；`debug-log.ts` 調試日誌門控（F-12/M1-51）；LLM 分塊翻譯 + `translateStream` 漸進交付 + LRU 快取 + 瞬態失敗重試（F-13/M1-52） | 全部端口先定義 |
-| M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD、`perf/metrics` | ASR 流式接口啟用 |
+| M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD（`EnergyVAD`）、`perf/metrics`、Offscreen Document（`src/runtime/offscreen.ts`）、tabCapture 授權流程 | ASR 流式接口啟用；Offscreen port 長連接通信；transformers.js 本地推理；Deepgram/OpenAI 雲端雙實現；provisional 字幕修正 |
 | M3 預緩衝 | `BufferedAudioSource`、`LookAheadASRStrategy` | 復用 M2 管線，僅換音頻源 |
 | M4 優化 | 動態引擎選擇、性能檔位、樣式與多語言加固 | — |
 

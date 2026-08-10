@@ -11,10 +11,12 @@ export interface TranslationConfig {
 
 /** ASR 引擎配置。 */
 export interface ASRConfig {
-  type: 'local-whisper' | 'cloud';
+  type: 'local-whisper' | 'cloud' | 'none';
   modelTier?: 'tiny' | 'base' | 'small';
   endpoint?: string;
   apiKeyRef?: string;
+  /** VAD 能量閾值（0-1），低於此值視為靜音。默認 0.01。 */
+  vadThreshold?: number;
 }
 
 /**

@@ -610,7 +610,92 @@ DiagnosticRecord 結構:
 
 ---
 
-## 11. 診斷設計原則
+## 11. ASR 管線診斷（M2）
+
+### 11.1 tabCapture 授權失敗
+
+- **診斷碼**: tab-capture-not-authorized
+- **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture not authorized — user denied or not triggered (<timestamp>)
+- **觸發條件**: `chrome.tabCapture.getMediaStream` 被用戶拒絕或未經用戶手勢觸發
+- **根因**: 用戶點擊「拒絕」授權對話框；Popup 按鈕未以用戶手勢觸發
+- **用戶響應**: 點擊 Popup「啟用 ASR」按鈕重新授權；確認瀏覽器未全局禁用 tabCapture
+- **開發者響應**: 確認 `chrome.tabCapture.getMediaStream` 在用戶手勢（click）事件處理器中調用；檢查 manifest `tabCapture` 權限
+- **代碼落點**: src/adapters/audio/tab-capture-source.ts（`open()` catch 分支）
+
+### 11.2 tabCapture 捕獲失敗
+
+- **診斷碼**: tab-capture-failed
+- **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture failed: <錯誤詳情> (<timestamp>)
+- **觸發條件**: `chrome.tabCapture.getMediaStream` 拋錯（非用戶拒絕，如權限不足、標籤頁已關閉）
+- **根因**: 標籤頁已被關閉；MV3 權限模型限制；Offscreen Document 創建失敗
+- **用戶響應**: 確認標籤頁仍打開；刷新頁面重試
+- **開發者響應**: 檢查 Offscreen Document 是否成功創建（`chrome.offscreen.createDocument`）；確認 port 連接狀態
+- **代碼落點**: src/runtime/offscreen.ts（tabCapture 錯誤處理）；src/adapters/audio/tab-capture-source.ts（port 錯誤事件）
+
+### 11.3 Offscreen Document 通信失敗
+
+- **診斷碼**: offscreen-communication-failed
+- **用戶可見消息**: 最近失敗: 錯誤: Error: offscreen communication failed: <錯誤> (<timestamp>)
+- **觸發條件**: port `onDisconnect` 觸發且 `lastError` 非空；或 port `postMessage` 拋錯
+- **根因**: Offscreen Document 崩潰；port 被 SW 回收；MV3 同時只允許一個 Offscreen（重複創建衝突）
+- **用戶響應**: 刷新頁面重試
+- **開發者響應**: 檢查 Offscreen Document 生命週期管理（`createDocument` / `deleteDocument`）；確認 port 在 `stop()` 正確斷開
+- **代碼落點**: src/adapters/audio/tab-capture-source.ts（port `onDisconnect` 處理）
+
+### 11.4 ASR 引擎失敗
+
+- **診斷碼**: asr-engine-failed
+- **用戶可見消息**: 最近失敗: 降級: asr engine <engineId> failed: <錯誤> (<timestamp>)
+- **觸發條件**: `ASRProvider.transcribe` / `transcribeStream` 拋錯
+- **根因**: 本地 Whisper 模型加載失敗（記憶體不足、模型損壞）；雲端 ASR API 錯誤（4xx/5xx、WebSocket 斷開）
+- **用戶響應**: 切換 ASR 引擎（本地 ↔ 雲端）；檢查雲端 API Key；降低模型檔位（small → base → tiny）
+- **開發者響應**: 檢查 `ASRProvider` 實現；確認 `warmup()` 是否成功；查看 `engine-degraded` 事件詳情
+- **代碼落點**: src/application/asr-pipeline.ts（catch 分支發 `engine-degraded`）
+
+### 11.5 ASR 性能降檔
+
+- **診斷碼**: asr-performance-degraded
+- **用戶可見消息**: 最近失敗: 降級: asr performance degraded — RTF <rtf> > 1.0, switching to <tier> (<timestamp>)
+- **觸發條件**: `PerfMetrics` 偵測 RTF > 1.0 持續 30s → 自動降檔（small → base → tiny）
+- **根因**: 本地 Whisper 推理速度跟不上實時音頻（低端設備、大型模型）
+- **用戶響應**: 切換到雲端 ASR；或接受降檔後的較低準確率
+- **開發者響應**: 檢查 `PerfMetrics.summary()` 的 RTF 分佈；確認 `warmup()` 是否充分預熱
+- **代碼落點**: src/infrastructure/perf/metrics.ts（動態降檔邏輯）
+
+### 11.6 VAD 靜音切分
+
+- **診斷碼**: (非錯誤，觀測日誌)
+- **用戶可見消息**: 無（`diagLog('pipeline', ...)` 門控輸出）
+- **觸發條件**: `EnergyVAD.process(pcm)` RMS < 閾值 → `isSpeech = false`
+- **根因**: 音頻片段為靜音或背景噪音
+- **用戶響應**: 無需操作（VAD 正常過濾靜音，節省 ASR 算力）
+- **開發者響應**: 開啟「pipeline」調試日誌分類可觀察 VAD 切分頻率；調整 `asr.vadThreshold` 可改變靈敏度
+- **代碼落點**: src/infrastructure/vad.ts（`EnergyVAD.process`）
+
+### 11.7 本地 Whisper 模型下載
+
+- **診斷碼**: (非錯誤，狀態通知)
+- **用戶可見消息**: Options 頁「模型管理」區顯示下載進度
+- **觸發條件**: `LocalWhisperASR.warmup()` 首次加載模型 → 從 HuggingFace Hub 下載到 IndexedDB
+- **根因**: 模型未預先安裝
+- **用戶響應**: 等待下載完成（tiny ~150MB、base ~300MB、small ~1GB）
+- **開發者響應**: 檢查 IndexedDB 存儲空間；確認 `@huggingface/transformers` 版本
+- **代碼落點**: src/adapters/asr/local-whisper.ts（`warmup()` 下載邏輯）；src/runtime/options/options.ts（進度條 UI）
+
+### 11.8 雲端 ASR 端點識別
+
+- **診斷碼**: (非錯誤，路由日誌)
+- **用戶可見消息**: 無（`diagLog('pipeline', ...)` 門控輸出）
+- **觸發條件**: `CloudASR` 依 `config.asr.endpoint` 自動識別：含 `deepgram` → WebSocket；其他 → OpenAI 兼容
+- **根因**: 用戶填寫不同雲端服務商端點
+- **用戶響應**: 無需操作（自動識別正確路由）
+- **開發者響應**: 開啟「pipeline」調試日誌分類可觀察路由決策；確認端點格式
+- **代碼落點**: src/adapters/asr/cloud-asr.ts（端點識別邏輯）
+
+
+---
+
+## 12. 診斷設計原則
 
 1. **不靜默失敗**: 每個關鍵節點的失敗都必須留下可被用戶/開發者查詢的痕跡
 2. **區分三態**: 找不到數據源 vs 數據源無字幕 vs 解析失敗,必須可區分
@@ -621,11 +706,11 @@ DiagnosticRecord 結構:
 
 ---
 
-## 12. 調試日誌門控（M1-51，F-12）
+## 13. 調試日誌門控（M1-51，F-12）
 
 普通用戶的 console 不應被開發性日誌淹沒,但真實環境（content-script / MAIN world 攔截器）定位問題又依賴詳細日誌。M1-51 以中央門控分離「調試日誌」與「診斷/錯誤日誌」。
 
-### 12.1 分類與開關
+### 13.1 分類與開關
 
 - **八分類**: `overlay` / `llm` / `capture` / `pipeline` / `strategy` / `content` / `bridge` / `interceptor`,各一個布爾開關。
 - **預設全關**: `DEBUG_LOG_OFF`——普通用戶零噪音。
@@ -633,7 +718,7 @@ DiagnosticRecord 結構:
 - **持久化與同步**: 開關存 `EngineConfig.debugLog`（`chrome.storage.local`）;Options 頁「調試日誌」分區勾選;content-script 讀取後 `setDebugFlags()` 寫入模組內存,並 `dispatchEvent(new CustomEvent('ai-trans:set-debug-flags'))` 同步給無法訪問 `chrome.storage` 的 MAIN world 攔截器。
 - **代碼落點**: src/infrastructure/debug-log.ts（`DebugLogCategory` / `diagLog` / `setDebugFlags` / `getDebugFlags`）、src/domain/models/config.ts（`DebugLogConfig` / `DEBUG_LOG_OFF` / `EngineConfig.debugLog`）、src/runtime/content-script.ts（讀配置 + CustomEvent 中繼）、src/runtime/yt-timedtext-interceptor.ts（監聽 `ai-trans:set-debug-flags`）、src/runtime/options/options.ts（`readDebugLog` / `fillDebugLog`）。
 
-### 12.2 與診斷/錯誤日誌的邊界（§5.6 紅線）
+### 13.2 與診斷/錯誤日誌的邊界（§5.6 紅線）
 
 - **錯誤/降級不受門控**: 所有失敗路徑的 `console.warn` + `recordDiagnostic`（本文件 §1–§11 全部診斷條目）**不經過 `diagLog`**,調試開關全關時仍照常輸出——「字幕沒出來」的原因永遠可見。
 - **`diagLog` 僅承載正常流轉的觀測日誌**（掛載/渲染/捕獲複用/塊流轉等），關閉不損失任何失敗痕跡。

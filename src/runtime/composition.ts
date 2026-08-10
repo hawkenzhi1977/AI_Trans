@@ -9,9 +9,14 @@ import { YouTubePlatformAdapter, FetchCaptionSource } from '../adapters';
 import { LLMTranslationProvider, ensureLlmCacheInvalidationHook } from '../adapters/translation/llm-translation';
 import { MTTranslationProvider } from '../adapters/translation/mt-translation';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
+import { TabCaptureAudioSource } from '../adapters/audio/tab-capture-source';
+import { CloudASR } from '../adapters/asr/cloud-asr';
+import { LocalWhisperASR } from '../adapters/asr/local-whisper';
 import type { CaptionCaptureProvider } from '../adapters/platform/youtube/platform-adapter';
 import type { EngineConfig, TranslationConfig } from '../domain/models/config';
 import type { TranslationProvider } from '../domain/ports/translation-provider';
+import type { AudioSourceProvider } from '../domain/ports/audio-source';
+import type { ASRProvider } from '../domain/ports/asr-provider';
 import type { ApiKeyStore } from '../domain/ports/config-store';
 
 export interface BuildRegistryOptions {
@@ -47,6 +52,13 @@ export async function buildDefaultRegistry(
   // 非擴充環境（無 chrome.storage）內部 try/catch 守護為無操作。
   ensureLlmCacheInvalidationHook();
 
+  // M2-04：註冊音頻源（tabCapture）。
+  const audioSources = new Map<string, AudioSourceProvider>();
+  audioSources.set('tab-capture', new TabCaptureAudioSource());
+
+  // M2-05/06：註冊 ASR providers（本地 Whisper + 雲端 ASR）。
+  const asr = await buildASRProviders(config, opts.apiKeyStore);
+
   return {
     platforms: [youtube],
     strategies: [
@@ -54,10 +66,36 @@ export async function buildDefaultRegistry(
       new LookAheadASRStrategy(),
       new RealtimeASRStrategy(),
     ],
-    asr: new Map(), // M2 起註冊 ASRProvider
+    audioSources,
+    asr,
     translation,
     renderer: new OverlayRenderer(),
   };
+}
+
+/** 依配置構建 ASR providers。 */
+async function buildASRProviders(
+  config: EngineConfig,
+  apiKeyStore: ApiKeyStore
+): Promise<Map<string, ASRProvider>> {
+  const providers = new Map<string, ASRProvider>();
+
+  if (config.asr.type === 'local-whisper') {
+    const whisper = new LocalWhisperASR({
+      modelTier: config.asr.modelTier ?? 'base',
+    });
+    providers.set(whisper.engineId, whisper);
+  } else if (config.asr.type === 'cloud' && config.asr.endpoint) {
+    const apiKey = (await apiKeyStore.getApiKey('asr')) ?? '';
+    const cloud = new CloudASR({
+      endpoint: config.asr.endpoint,
+      apiKey,
+      model: config.asr.modelTier,
+    });
+    providers.set(cloud.engineId, cloud);
+  }
+
+  return providers;
 }
 
 /** 依配置構建可用的翻譯引擎集合；密鑰從安全存儲解析。 */

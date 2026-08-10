@@ -497,14 +497,96 @@ jobs:
 - 預期：`ok`/`error` 分支覆蓋以上六類；fetch 永遠以 `globalThis.fetch.bind(globalThis)`（§5.1），超時 AbortController + finally 清 timer（§5.4）。
 - 落點：集成 `test/integration/connection-test.test.ts`（5）+ `test/integration/popup.test.ts`（1：點擊按鈕標綠）。
 
-#### TC-F06 實時擷取 ASR（對應 F-06）
+#### TC-F06 實時擷取 ASR（對應 F-06，M2 實裝）
 - 前置：打開 `no-captions.html`，注入音頻 fixture 與 `StubASR`。
-- 步驟：啟用擴充 → 授權音頻擷取（測試中自動放行）。
-- 預期：provisional 字幕先顯示（`revision` 遞增），隨後被最終結果修正；`origin=realtime-asr`。
+- 步驟：
+  - A（tabCapture 授權）：Popup 點擊「啟用 ASR」→ tabCapture 授權對話框（測試中自動放行）→ `chrome.storage.local['tabCaptureAuthorized']` 寫入 `true` → content-script `storage.onChanged` 監聽 → `enableAsr = true`。
+  - B（Offscreen 通信）：content-script → port → Offscreen 發 `{ type: 'start', tabId }` → Offscreen 啟動 tabCapture → AudioContext 解碼 → 推送 `AudioChunk`（`seq` 遞增、`pcm: Float32Array`）。
+  - C（VAD 過濾）：`EnergyVAD` 計算 RMS 能量 → 靜音 chunk `isSpeech=false` → 跳過 ASR。
+  - D（ASR 流式）：`ASRPipeline.transcribeStream` → `StubASR.transcribeStream` → emit provisional `ASRResult(isPartial=true)` → emit final `ASRResult(isPartial=false)`。
+  - E（provisional 字幕）：provisional emit → `segments-updated` → `OverlayRenderer.updateProvisional` 原地更新 → final emit → `segments-ready` → 定稿修正。
+- 預期：provisional 字幕先顯示（`revision` 遞增），隨後被最終結果修正；`origin=realtime-asr`；tabCapture 授權狀態持久化。
+- 落點：單元 `test/unit/tab-capture-source.test.ts`（TabCaptureAudioSource mock MediaStream → AudioChunk）、`test/unit/energy-vad.test.ts`（RMS 能量計算 + 靜音切分）、`test/unit/offscreen-protocol.test.ts`（Offscreen 消息協議）；集成 `test/integration/realtime-asr-strategy.test.ts`（RealtimeASRStrategy mock AudioSource + ASR → emit 事件序列）；E2E `test/e2e/extension.spec.ts`（TC-F06 無字幕頁面 → provisional → 定稿）。
 
-#### TC-F07 ASR 引擎配置（對應 F-07）
-- 步驟：切換本地 Whisper ↔ 雲端 ASR（均為 stub）。
-- 預期：`Registry` 選中對應 `ASRProvider`；識別路徑切換正確。
+#### TC-F07 ASR 引擎配置（對應 F-07，M2 實裝）
+- 步驟：
+  - A（引擎切換）：Options 切換本地 Whisper ↔ 雲端 ASR → `Registry.asr` Map 選中對應 `ASRProvider`（`local-whisper` / `cloud-asr`）。
+  - B（模型檔位）：切換 `asr.modelTier`（tiny/base/small）→ `LocalWhisperASR.warmup()` 加載對應模型。
+  - C（自定義模型）：填寫 `asr.modelPath`（如 vibevoice 本地路徑）→ 從 IndexedDB 加載自定義模型。
+  - D（雲端端點識別）：`asr.endpoint` 含 `deepgram` → WebSocket 流式；其他 → OpenAI 兼容 multipart。
+  - E（模型下載）：Options「模型管理」區 → 點擊「下載 tiny」→ Offscreen 下載到 IndexedDB → 進度條更新。
+- 預期：`Registry` 選中對應 `ASRProvider`；識別路徑切換正確；自定義模型可加載；雲端端點自動識別。
+- 落點：單元 `test/unit/local-whisper.test.ts`（LocalWhisperASR mock pipeline → ASRResult）、`test/unit/cloud-asr.test.ts`（CloudASR mock fetch/WebSocket → ASRResult）；集成 `test/integration/composition.test.ts`（ASR provider 註冊 + 選擇）。
+
+#### TC-M2-01 Offscreen Document 生命週期（對應 M2-09）
+- 步驟：
+  - A（創建）：`RealtimeASRStrategy.run()` 觸發 → `chrome.offscreen.createDocument({ url: 'offscreen.html', reasons: ['USER_MEDIA'], justification: 'ASR audio processing' })`。
+  - B（port 長連接）：content-script `chrome.runtime.connect({ name: 'offscreen-asr' })` → Offscreen `chrome.runtime.onConnect` 接收 → 雙向消息傳遞。
+  - C（銷毀）：`RealtimeASRStrategy.stop()` → `chrome.offscreen.deleteDocument()`。
+  - D（SW 掛起免疫）：port 消息不經 SW 代理（直接 content-script ↔ Offscreen），SW 掛起不影響音頻流。
+- 預期：Offscreen 正確創建/銷毀；port 消息雙向通達；MV3 同時只允許一個 Offscreen（重複創建報錯被 catch）。
+- 落點：單元 `test/unit/offscreen-lifecycle.test.ts`（創建/銷毀/冪等）；集成 `test/integration/offscreen-protocol.test.ts`（port 消息協議）。
+
+#### TC-M2-02 TabCapture 授權流程（對應 M2-14）
+- 步驟：
+  - A（授權成功）：Popup 點擊「啟用 ASR」→ `chrome.tabCapture.getMediaStream({ audio: true })` → 用戶點擊允許 → `chrome.storage.local['tabCaptureAuthorized'] = true` → content-script `storage.onChanged` → `enableAsr = true`。
+  - B（授權拒絕）：用戶點擊拒絕 → popup 顯示「ASR 授權失敗」→ `tabCaptureAuthorized` 保持 `false` → content-script `enableAsr = false` → 策略鏈跳過 RealtimeASRStrategy。
+  - C（授權持久化）：刷新頁面 → `chrome.storage.local` 讀取 `tabCaptureAuthorized = true` → 自動啟用 ASR（不再彈授權對話框）。
+- 預期：授權狀態正確持久化；content-script 響應授權變更；拒絕授權時降級到原生字幕。
+- 落點：集成 `test/integration/tab-capture-auth.test.ts`（授權成功/拒絕/持久化）。
+
+#### TC-M2-03 VAD 能量閾值（對應 M2-07）
+- 步驟：
+  - A（語音檢測）：`EnergyVAD.process(pcm)` → RMS 能量 > 閾值 → `isSpeech = true`。
+  - B（靜音檢測）：RMS < 閾值 → `isSpeech = false`。
+  - C（分段邊界）：靜音連續 > 2s → 觸發分段邊界（切分 AudioChunk 送 ASR）。
+  - D（閾值配置）：`EngineConfig.asr.vadThreshold` 可調（默認 0.01）。
+- 預期：靜音/語音正確區分；分段邊界觸發正常；閾值可配置。
+- 落點：單元 `test/unit/energy-vad.test.ts`（RMS 計算 + 靜音切分 + 閾值配置）。
+
+#### TC-M2-04 LocalWhisperASR 本地推理（對應 M2-05）
+- 步驟：
+  - A（warmup）：`LocalWhisperASR.warmup({ modelTier: 'tiny' })` → 加載 tiny 模型（首次從 HuggingFace Hub 下載到 IndexedDB）。
+  - B（transcribe）：`transcribe({ chunk, hintLang: 'en' })` → PCM → Whisper pipeline → `ASRResult(segments, isPartial: false)`。
+  - C（transcribeStream）：`transcribeStream(req, emit)` → 分段推理 → emit provisional → emit final。
+  - D（自定義模型）：`warmup({ modelPath: '/path/to/vibevoice' })` → 從 IndexedDB/本地加載自定義模型。
+  - E（RTF 觀測）：`ASRResult.rtf` = 推理耗時 / 音頻時長（應 < 1 表示實時）。
+- 預期：模型正確加載；推理結果帶時間軸；流式 emit provisional → final；自定義模型可加載。
+- 落點：單元 `test/unit/local-whisper.test.ts`（mock transformers.js pipeline → ASRResult）。
+
+#### TC-M2-05 CloudASR 雲端推理（對應 M2-06）
+- 步驟：
+  - A（OpenAI Whisper API）：`CloudASR.transcribe({ endpoint: 'https://api.openai.com/v1' })` → `POST /v1/audio/transcriptions`（multipart/form-data，`file` 為 WAV blob）→ `ASRResult`。
+  - B（Deepgram WebSocket）：`CloudASR.transcribeStream({ endpoint: 'wss://...deepgram...' })` → WebSocket `wss://api.deepgram.com/v1/listen` → emit provisional → emit final。
+  - C（端點自動識別）：endpoint 含 `deepgram` → WebSocket；其他 → OpenAI 兼容。
+  - D（錯誤處理）：HTTP 4xx/5xx → `ASRRequestError`；WebSocket 斷開 → 發 `engine-degraded` 事件。
+- 預期：雙實現正確路由；流式 emit provisional → final；錯誤處理走降級機制。
+- 落點：單元 `test/unit/cloud-asr.test.ts`（mock fetch/WebSocket → ASRResult）。
+
+#### TC-M2-06 RealtimeASRStrategy 完整鏈路（對應 M2-08）
+- 步驟：
+  - A（isApplicable）：`config.asr.type !== 'none'` && `tabCaptureAuthorized` → `true`；否則 `false` + 寫診斷 `realtime-asr: tabCapture not authorized`。
+  - B（run 鏈路）：`TabCaptureAudioSource.open()` → `onChunk()` → VAD 過濾 → `ASRPipeline.transcribeStream` → 翻譯 → emit `segments-updated`（provisional）→ emit `segments-ready`（final）。
+  - C（stop 清理）：`stop()` → `AudioSourceHandle.stop()` + 清理所有訂閱（§5.4 R4）。
+  - D（錯誤降級）：tabCapture 失敗 → 發 `pipeline-error`（code `tab-capture-failed`）→ 策略鏈降級。
+- 預期：完整鏈路打通；provisional → final 正確 emit；stop 完全清理；錯誤走降級。
+- 落點：集成 `test/integration/realtime-asr-strategy.test.ts`（mock AudioSource + ASR → emit 事件序列）。
+
+#### TC-M2-07 provisional 字幕修正（對應 M2-11）
+- 步驟：
+  - A（segments-updated）：ASR emit provisional → `segments-updated` → content-script `onEvent` → `cues[i].provisional = true` → `OverlayRenderer.updateProvisional(cue)` 原地更新。
+  - B（segments-ready）：ASR emit final → `segments-ready` → content-script `onEvent` → `cues[i].provisional = false` → `OverlayRenderer.render(cues, currentTime)` 定稿。
+  - C（revision 遞增）：provisional 多次更新 → `cue.revision` 遞增（同一 id 原地替換，不新增 DOM 節點）。
+- 預期：provisional 字幕先顯示 → final 修正；同一 id 原地更新不閃爍。
+- 落點：單元 `test/unit/overlay-renderer.test.ts`（updateProvisional 原地替換）；集成 `test/integration/content-script.test.ts`（onEvent segments-updated/ready 處理）。
+
+#### TC-M2-08 性能觀測（對應 M2-12）
+- 步驟：
+  - A（RTF 收集）：`ASRPipeline.emitMetric('asr', ms, seq, rtf)` → `PipelineEvent.metrics` → `PerfMetrics` 收集。
+  - B（P50/P95 計算）：`PerfMetrics.summary()` → 計算各階段 P50/P95 延遲。
+  - C（動態降檔）：RTF > 1 持續 30s → 自動降 tiny → 仍不達標 → 切雲端。
+- 預期：性能指標正確收集；P50/P95 可查詢；動態降檔觸發正常。
+- 落點：單元 `test/unit/perf-metrics.test.ts`（RTF 收集 + P50/P95 計算）。
 
 #### TC-F08 預緩衝提前處理與降級（對應 F-08）
 - 前置：可預取音頻的 mock 場景。
@@ -611,8 +693,16 @@ jobs:
 | TC-F20 | F-11 | 單元（已實裝） |
 | TC-F21 | F-01 | 集成/E2E（已實裝） |
 | TC-F22 | F-01 | 集成（已實裝） |
-| TC-F06 | F-06 | E2E |
-| TC-F07 | F-07 | 集成 |
+| TC-F06 | F-06 | 單元/集成/E2E（M2 實裝） |
+| TC-F07 | F-07 | 單元/集成（M2 實裝） |
+| TC-M2-01 | M2-09 | 單元/集成 |
+| TC-M2-02 | M2-14 | 集成 |
+| TC-M2-03 | M2-07 | 單元 |
+| TC-M2-04 | M2-05 | 單元 |
+| TC-M2-05 | M2-06 | 單元 |
+| TC-M2-06 | M2-08 | 集成 |
+| TC-M2-07 | M2-11 | 單元/集成 |
+| TC-M2-08 | M2-12 | 單元 |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

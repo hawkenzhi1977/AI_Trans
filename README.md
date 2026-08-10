@@ -25,13 +25,16 @@ AI_Trans grabs a video's captions (or, later, transcribes its audio), translates
 - **Low-latency chunked translation** — long videos are translated in chunks (`CHUNK_SIZE=60` segments) that stream in progressively: the first chunk appears within seconds and later chunks update the overlay incrementally, instead of waiting minutes for the whole video. Chunk results are cached (LRU, up to 100 entries, keyed by model + language + content hash) so replays, language switches, and tab reloads don't re-request; the cache is invalidated automatically when engine config changes. Transient failures (network aborts, timeouts, HTTP 429/5xx, body read or JSON errors) are retried up to 2× with backoff, and a chunk that exhausts retries falls back to showing its **original text** without blocking the rest of the video — while permanent errors (e.g. HTTP 400, malformed response) still fail fast and trigger the pipeline degradation with a traceable diagnostic.
 - **Debug logging gate** — console logs are organized into eight categories (overlay / llm / capture / pipeline / strategy / content / bridge / interceptor) that are **all off by default**; enable individual categories in Settings → Debug logging when diagnosing an issue. Logged lines are prefixed `[AI_Trans:diag][category]` for easy filtering. Error and degradation messages are **not** gated — they always appear, so the "last failure" line and `console.warn` breadcrumbs stay reliable even with debug logging disabled.
 
+### Implemented (Milestone M2)
+
+- **Real-time ASR for captionless videos** (`F-06`, `F-07`) — captures tab audio via `chrome.tabCapture` and runs streaming ASR + translation for videos without native captions. **Offscreen Document architecture** — ASR runs in a dedicated offscreen document (declared in manifest) to avoid service worker suspension; communicates with the content script via `chrome.runtime.connect` port (long-lived connection, not one-shot messaging). **Tab audio capture** — `TabCaptureAudioSource` adapter captures the tab's audio stream; user authorization via Popup's "Enable ASR" button triggers `chrome.tabCapture.getMediaStream` with proper lifecycle management (start/stop events). **Energy-based VAD** — `EnergyVAD` (root-mean-square threshold, no external dependencies) splits continuous audio into speech segments by detecting active speech vs silence, enabling chunked ASR processing. **Local Whisper ASR** — `LocalWhisperASR` adapter uses `@huggingface/transformers` (transformers.js v3, WASM/WebGPU) to run Whisper models locally; model files are downloaded on-demand and cached in IndexedDB (not `chrome.storage.local`, which has a 5MB limit — Whisper tiny is ~150MB). **Cloud ASR** — `CloudASR` adapter supports both OpenAI Whisper API (multipart POST to `/v1/audio/transcriptions`) and Deepgram (WebSocket streaming); endpoint URL auto-detection (contains `deepgram` → WebSocket, otherwise → OpenAI-compatible). **Streaming ASR interface** — `ASRPipeline.transcribeStream()` yields incremental segments; `RealtimeASRStrategy` orchestrates the full flow: audio capture → VAD segmentation → ASR transcription → translation → overlay rendering. **Provisional subtitle correction** — intermediate ASR results are shown as "provisional" subtitles (distinct styling) and corrected when final results arrive, providing immediate feedback. **Performance monitoring** — `PerfMetrics` tracks ASR latency with a sliding window (100 samples), computes P50/P95 statistics, and triggers automatic downgrade (e.g., from local Whisper to cloud ASR, or from high-quality to lightweight model) when real-time factor exceeds 1.0 for 30s. **Model tier configuration** — Options UI supports selecting model tier (tiny/base/small/medium for local Whisper; cloud endpoint + model ID); custom local ASR models (e.g., vibevoice) are supported via endpoint configuration. **Comprehensive diagnostics** — ASR pipeline failures (tab capture authorization denied, capture failed, offscreen communication error, ASR engine failure, performance downgrade, VAD silence split, model download error, endpoint identification) all emit traceable diagnostic events visible in Popup's "last failure" line.
+
 ### Planned (later milestones)
 
-- **M2 — Real-time ASR** (`F-06`, `F-07`): capture tab audio and run streaming ASR + translation for videos without captions. Local Whisper (WASM/WebGPU) and cloud ASR, both configurable.
 - **M3 — Look-ahead pre-buffering** (`F-08`): for captionless-but-prefetchable videos, transcribe buffered audio ahead of playback (higher risk / optimization).
 - **Additional platforms** beyond YouTube.
 
-> Only M1 (native-caption path) is production-ready today. The three-tier subtitle strategy (native → pre-buffer ASR → real-time ASR) is fully designed; see `doc/`.
+> M1 (native-caption path) and M2 (real-time ASR) are production-ready. The three-tier subtitle strategy (native → pre-buffer ASR → real-time ASR) is two-thirds complete; see `doc/`.
 
 ---
 
@@ -40,7 +43,7 @@ AI_Trans grabs a video's captions (or, later, transcribes its audio), translates
 Prebuilt artifacts live in [`release/`](./release/):
 
 - `release/ai-trans-extension/` — unpacked extension folder (recommended).
-- `release/ai-trans-extension-v0.1.0.zip` — zipped archive.
+- `release/ai-trans-extension-v0.2.0.zip` — zipped archive.
 
 Loading is **identical on Windows, macOS, and Linux** and on any Chromium browser (Chrome / Edge / Brave):
 

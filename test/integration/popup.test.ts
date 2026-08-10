@@ -16,6 +16,7 @@ const HTML = `
     <button id="btn-options">設定</button>
   </div>
   <div class="actions">
+    <button id="btn-asr">啟用 ASR</button>
     <button id="btn-reload">重新載入頁面</button>
   </div>
 `;

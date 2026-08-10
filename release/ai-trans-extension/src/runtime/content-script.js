@@ -399,16 +399,340 @@
     }
   };
 
+  // src/infrastructure/vad.ts
+  var DEFAULT_VAD_CONFIG = {
+    threshold: 0.01,
+    silenceDurationMs: 2e3
+  };
+  var EnergyVAD = class {
+    config;
+    silenceStartTime = null;
+    constructor(config = {}) {
+      this.config = { ...DEFAULT_VAD_CONFIG, ...config };
+    }
+    /**
+     * 處理音頻塊，返回 VAD 結果。
+     * @param pcm 單聲道 PCM 數據（Float32Array，值域 -1 到 1）。
+     * @param _sampleRate 採樣率（Hz，保留供未來擴展）。
+     * @param timestamp 時間戳（毫秒，performance.now()）。
+     */
+    process(pcm, _sampleRate, timestamp) {
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) {
+        sum += pcm[i] * pcm[i];
+      }
+      const rms = Math.sqrt(sum / pcm.length);
+      const isSpeech = rms >= this.config.threshold;
+      if (!isSpeech) {
+        if (this.silenceStartTime === null) {
+          this.silenceStartTime = timestamp;
+        }
+      } else {
+        this.silenceStartTime = null;
+      }
+      return { isSpeech, rms };
+    }
+    /**
+     * 檢測是否應觸發分段邊界（靜音持續超過閾值）。
+     * @param timestamp 當前時間戳（毫秒）。
+     * @returns 是否應切分音頻塊。
+     */
+    shouldSegment(timestamp) {
+      if (this.silenceStartTime === null) return false;
+      const silenceDuration = timestamp - this.silenceStartTime;
+      return silenceDuration >= this.config.silenceDurationMs;
+    }
+    /** 重置靜音計數器（新音頻流開始時調用）。 */
+    reset() {
+      this.silenceStartTime = null;
+    }
+    /**
+     * 標記 AudioChunk 的 isSpeech 字段（批量處理）。
+     * @param chunk 待標記的音頻塊。
+     * @returns 標記後的音頻塊（原地修改）。
+     */
+    markChunk(chunk) {
+      const { isSpeech } = this.process(chunk.pcm, chunk.sampleRate, performance.now());
+      chunk.isSpeech = isSpeech;
+      return chunk;
+    }
+  };
+
+  // src/infrastructure/perf/metrics.ts
+  var PerfMetrics = class {
+    /** 滑動窗口大小（樣本數）。 */
+    windowSize;
+    /** 樣本緩存（按 stage 分組）。 */
+    samples = /* @__PURE__ */ new Map();
+    constructor(windowSize = 100) {
+      this.windowSize = windowSize;
+    }
+    /** 添加性能樣本。 */
+    add(sample) {
+      const stage = sample.stage;
+      if (!this.samples.has(stage)) {
+        this.samples.set(stage, []);
+      }
+      const list = this.samples.get(stage);
+      list.push(sample);
+      if (list.length > this.windowSize) {
+        list.shift();
+      }
+    }
+    /** 獲取指定階段的統計摘要。 */
+    summary(stage) {
+      const list = this.samples.get(stage);
+      if (!list || list.length === 0) return null;
+      const sorted = [...list].sort((a, b) => a.ms - b.ms);
+      const p50Index = Math.floor(sorted.length * 0.5);
+      const p95Index = Math.floor(sorted.length * 0.95);
+      const rtfSamples = list.filter((s) => s.rtf !== void 0);
+      const avgRtf = rtfSamples.length > 0 ? rtfSamples.reduce((sum, s) => sum + (s.rtf ?? 0), 0) / rtfSamples.length : 0;
+      const maxRtf = rtfSamples.length > 0 ? Math.max(...rtfSamples.map((s) => s.rtf ?? 0)) : 0;
+      return {
+        count: list.length,
+        p50: sorted[p50Index].ms,
+        p95: sorted[p95Index].ms,
+        avgRtf,
+        maxRtf
+      };
+    }
+    /** 獲取所有階段的統計摘要。 */
+    allSummaries() {
+      const result = /* @__PURE__ */ new Map();
+      for (const stage of this.samples.keys()) {
+        const summary = this.summary(stage);
+        if (summary) result.set(stage, summary);
+      }
+      return result;
+    }
+    /** 重置所有統計。 */
+    reset() {
+      this.samples.clear();
+    }
+    /**
+     * 檢測是否需要降檔（RTF > 1.0 持續超過閾值）。
+     * @param thresholdMs 持續時間閾值（毫秒），默認 30000ms（30s）。
+     * @returns 是否建議降檔。
+     */
+    shouldDowngrade(thresholdMs = 3e4) {
+      const asrSummary = this.summary("asr");
+      if (!asrSummary) return false;
+      const asrSamples = this.samples.get("asr") ?? [];
+      const highRtfCount = asrSamples.filter((s) => (s.rtf ?? 0) > 1).length;
+      const highRtfRatio = highRtfCount / asrSamples.length;
+      if (highRtfRatio > 0.5 && asrSamples.length >= 10) {
+        const avgInterval = asrSamples.length > 1 ? (asrSamples[asrSamples.length - 1].seq - asrSamples[0].seq) / (asrSamples.length - 1) : 1;
+        const estimatedDuration = asrSamples.length * avgInterval * 256;
+        return estimatedDuration >= thresholdMs;
+      }
+      return false;
+    }
+  };
+
+  // src/infrastructure/diagnostics.ts
+  var DIAGNOSTIC_KEY = "lastDiagnostic";
+  function extractDiagnostic(e) {
+    switch (e.type) {
+      case "engine-degraded":
+        if (e.port === "translation" || e.port === "asr") {
+          return { kind: "degraded", message: e.reason };
+        }
+        return void 0;
+      case "pipeline-error":
+        return { kind: "error", message: formatCause(e.error.cause) };
+      default:
+        return void 0;
+    }
+  }
+  function formatCause(cause) {
+    if (cause instanceof Error) {
+      return `${cause.name}: ${cause.message}`;
+    }
+    return String(cause ?? "unknown error");
+  }
+  async function recordDiagnostic(e) {
+    const diag = extractDiagnostic(e);
+    if (!diag) return;
+    const record = {
+      kind: diag.kind,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      message: diag.message
+    };
+    console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
+    try {
+      await chrome.storage.local.set({ [DIAGNOSTIC_KEY]: record });
+    } catch {
+    }
+  }
+
   // src/application/strategies/realtime-asr-strategy.ts
   var RealtimeASRStrategy = class {
     origin = "realtime-asr";
-    async isApplicable(ctx) {
-      ctx.diagnostics?.push?.("realtime-asr: not implemented (M2)");
-      return false;
+    deps = null;
+    vad = null;
+    perf = null;
+    running = false;
+    unsubscribeChunk = null;
+    downgradeCheckInterval = null;
+    /** 注入依賴（由 Orchestrator 調用）。 */
+    inject(deps) {
+      this.deps = deps;
+      this.vad = new EnergyVAD({ threshold: deps.vadThreshold ?? 0.01 });
+      this.perf = new PerfMetrics(100);
     }
-    async run(_ctx, _emit) {
+    async isApplicable(ctx) {
+      if (ctx.config.asr.type === "none") {
+        ctx.diagnostics?.push?.("realtime-asr: ASR disabled (config.asr.type = none)");
+        return false;
+      }
+      try {
+        const authState = await chrome.storage.local.get("tabCaptureAuthorized");
+        if (!authState.tabCaptureAuthorized) {
+          ctx.diagnostics?.push?.("realtime-asr: tabCapture not authorized");
+          return false;
+        }
+      } catch {
+      }
+      if (!this.deps) {
+        ctx.diagnostics?.push?.("realtime-asr: dependencies not injected");
+        return false;
+      }
+      return true;
+    }
+    async run(ctx, emit) {
+      if (!this.deps || !this.vad || !this.perf) {
+        throw new Error("RealtimeASRStrategy: dependencies not injected");
+      }
+      const { audioSource, asrProvider, translationProvider } = this.deps;
+      this.running = true;
+      this.downgradeCheckInterval = setInterval(() => {
+        if (this.perf?.shouldDowngrade(3e4)) {
+          recordDiagnostic({
+            type: "engine-degraded",
+            port: "asr",
+            reason: "ASR performance degraded: RTF > 1.0 for 30s. Consider switching to cloud ASR or lower model tier."
+          });
+          emit({
+            type: "engine-degraded",
+            port: "asr",
+            reason: "RTF > 1.0 for 30s, recommend downgrade"
+          });
+        }
+      }, 1e4);
+      const handle = await audioSource.open(ctx.platform);
+      await handle.start();
+      audioSource.onChunk(async (chunk) => {
+        if (!this.running) return;
+        this.vad.markChunk(chunk);
+        if (!chunk.isSpeech) return;
+        try {
+          const req = {
+            chunk,
+            hintLang: void 0,
+            // 由配置驅動。
+            allowPartial: true
+          };
+          const asrStartTime = performance.now();
+          if (asrProvider.transcribeStream) {
+            await asrProvider.transcribeStream(req, async (asrResult) => {
+              const asrMs = performance.now() - asrStartTime;
+              this.perf?.add({
+                stage: "asr",
+                ms: asrMs,
+                seq: chunk.seq,
+                rtf: asrResult.rtf
+              });
+              emit({
+                type: "metrics",
+                data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
+              });
+              const translateStart = performance.now();
+              const translatedSegments = await this.translateSegments(
+                asrResult.segments,
+                translationProvider
+              );
+              const translateMs = performance.now() - translateStart;
+              this.perf?.add({ stage: "translate", ms: translateMs, seq: chunk.seq });
+              emit({
+                type: "metrics",
+                data: { stage: "translate", ms: translateMs, seq: chunk.seq }
+              });
+              emit({
+                type: asrResult.isPartial ? "segments-updated" : "segments-ready",
+                segments: translatedSegments
+              });
+            });
+          } else {
+            const asrResult = await asrProvider.transcribe(req);
+            const asrMs = performance.now() - asrStartTime;
+            this.perf?.add({
+              stage: "asr",
+              ms: asrMs,
+              seq: chunk.seq,
+              rtf: asrResult.rtf
+            });
+            emit({
+              type: "metrics",
+              data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
+            });
+            const translateStart = performance.now();
+            const translatedSegments = await this.translateSegments(
+              asrResult.segments,
+              translationProvider
+            );
+            const translateMs = performance.now() - translateStart;
+            this.perf?.add({ stage: "translate", ms: translateMs, seq: chunk.seq });
+            emit({
+              type: "metrics",
+              data: { stage: "translate", ms: translateMs, seq: chunk.seq }
+            });
+            emit({
+              type: "segments-ready",
+              segments: translatedSegments
+            });
+          }
+        } catch (err) {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "asr",
+              code: "asr-engine-failed",
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err))
+            }
+          });
+          emit({
+            type: "engine-degraded",
+            port: "asr",
+            reason: `ASR failed: ${err instanceof Error ? err.message : String(err)}`
+          });
+        }
+      });
+      this.unsubscribeChunk = () => {
+      };
     }
     stop() {
+      this.running = false;
+      this.unsubscribeChunk?.();
+      this.unsubscribeChunk = null;
+      this.vad?.reset();
+      if (this.downgradeCheckInterval !== null) {
+        clearInterval(this.downgradeCheckInterval);
+        this.downgradeCheckInterval = null;
+      }
+    }
+    /** 翻譯字幕段（批量）。 */
+    async translateSegments(segments, provider) {
+      const result = await provider.translate({
+        segments,
+        targetLang: "zh-Hant"
+      });
+      return result.segments;
+    }
+    /** 獲取性能統計摘要（用於觀測與調試）。 */
+    getPerfSummary() {
+      return this.perf?.allSummaries() ?? null;
     }
   };
 
@@ -1287,6 +1611,510 @@
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
+  // src/adapters/audio/tab-capture-source.ts
+  var OFFSCREEN_URL = "src/runtime/offscreen.html";
+  var seqCounter = 0;
+  var TabCaptureAudioSource = class {
+    kind = "tab-capture";
+    port = null;
+    chunkCallback = null;
+    offscreenCreated = false;
+    async open(_platform) {
+      return {
+        kind: "tab-capture",
+        start: () => this.start(),
+        stop: () => this.stop()
+      };
+    }
+    onChunk(cb) {
+      this.chunkCallback = cb;
+    }
+    /** 創建 Offscreen Document 並建立 port 連接。 */
+    async start() {
+      if (!this.offscreenCreated) {
+        try {
+          await chrome.offscreen.createDocument({
+            url: OFFSCREEN_URL,
+            reasons: [chrome.offscreen.Reason.USER_MEDIA],
+            justification: "ASR audio processing: tabCapture + PCM extraction"
+          });
+          this.offscreenCreated = true;
+        } catch (err) {
+          if (!(err instanceof Error && err.message.includes("only one"))) {
+            throw err;
+          }
+        }
+      }
+      this.port = chrome.runtime.connect({ name: "offscreen-asr" });
+      this.port.onMessage.addListener((msg) => {
+        this.handleMessage(msg);
+      });
+      this.port.onDisconnect.addListener(() => {
+        if (this.port) {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            recordDiagnostic({
+              type: "pipeline-error",
+              error: {
+                port: "audio",
+                code: "offscreen-communication-failed",
+                recoverable: true,
+                cause: new Error(lastError.message)
+              }
+            });
+          }
+        }
+        this.port = null;
+      });
+      const authState = await chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]);
+      if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
+        throw new Error("tabCapture not authorized or streamId missing");
+      }
+      this.port.postMessage({
+        type: "startCapture",
+        streamId: authState.tabCaptureStreamId
+      });
+    }
+    /** 停止音頻捕獲並清理資源。 */
+    async stop() {
+      if (this.port) {
+        this.port.postMessage({ type: "stopCapture" });
+        this.port.disconnect();
+        this.port = null;
+      }
+      if (this.offscreenCreated) {
+        try {
+          await chrome.offscreen.closeDocument();
+        } catch {
+        }
+        this.offscreenCreated = false;
+      }
+      seqCounter = 0;
+    }
+    /** 處理來自 Offscreen Document 的消息。 */
+    handleMessage(msg) {
+      switch (msg.type) {
+        case "audioChunk": {
+          if (!this.chunkCallback) return;
+          const chunk = {
+            seq: seqCounter++,
+            startTime: 0,
+            // Offscreen 無法獲取視頻時間軸，由下游對齊。
+            duration: msg.pcm.length / msg.sampleRate * 1e3,
+            // ms
+            sampleRate: msg.sampleRate,
+            channels: 1,
+            pcm: msg.pcm,
+            isSpeech: true
+            // 默認 true，VAD 會重新標記。
+          };
+          this.chunkCallback(chunk);
+          break;
+        }
+        case "error": {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "audio",
+              code: "tab-capture-failed",
+              recoverable: true,
+              cause: new Error(msg.message)
+            }
+          });
+          break;
+        }
+        case "captureStarted":
+        case "captureStopped":
+          break;
+      }
+    }
+  };
+
+  // src/adapters/asr/cloud-asr.ts
+  function pcmToWav(pcm, sampleRate) {
+    const numSamples = pcm.length;
+    const bytesPerSample = 2;
+    const buffer = new ArrayBuffer(44 + numSamples * bytesPerSample);
+    const view = new DataView(buffer);
+    view.setUint32(0, 1380533830, false);
+    view.setUint32(4, 36 + numSamples * bytesPerSample, true);
+    view.setUint32(8, 1463899717, false);
+    view.setUint32(12, 1718449184, false);
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * bytesPerSample, true);
+    view.setUint16(32, bytesPerSample, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(36, 1684108385, false);
+    view.setUint32(40, numSamples * bytesPerSample, true);
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const sample = Math.max(-1, Math.min(1, pcm[i]));
+      view.setInt16(offset, sample < 0 ? sample * 32768 : sample * 32767, true);
+      offset += 2;
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+  var CloudASR = class {
+    engineId;
+    location = "cloud";
+    endpoint;
+    apiKey;
+    model;
+    constructor(config) {
+      this.endpoint = config.endpoint;
+      this.apiKey = config.apiKey;
+      this.model = config.model ?? "whisper-1";
+      this.engineId = config.endpoint.toLowerCase().includes("deepgram") ? "cloud-asr-deepgram" : "cloud-asr-openai";
+    }
+    async warmup(_config) {
+    }
+    async transcribe(req) {
+      const startTime = performance.now();
+      if (this.engineId === "cloud-asr-deepgram") {
+        return this.transcribeDeepgram(req, startTime);
+      }
+      return this.transcribeOpenAI(req, startTime);
+    }
+    async transcribeStream(req, emit) {
+      if (this.engineId === "cloud-asr-deepgram") {
+        await this.transcribeDeepgramStream(req, emit);
+        return;
+      }
+      const result = await this.transcribe(req);
+      emit(result);
+    }
+    /** OpenAI Whisper API（multipart/form-data）。 */
+    async transcribeOpenAI(req, startTime) {
+      const { chunk, hintLang } = req;
+      const wavBlob = pcmToWav(chunk.pcm, chunk.sampleRate);
+      const formData = new FormData();
+      formData.append("file", wavBlob, "audio.wav");
+      formData.append("model", this.model);
+      formData.append("response_format", "verbose_json");
+      if (hintLang) formData.append("language", hintLang);
+      const url = `${this.endpoint}/v1/audio/transcriptions`;
+      const response = await globalThis.fetch.bind(globalThis)(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`
+        },
+        body: formData
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        const error = new Error(`OpenAI Whisper API failed: HTTP ${response.status}: ${errorText}`);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "asr",
+            code: "asr-engine-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
+      const data = await response.json();
+      const durationMs = performance.now() - startTime;
+      const audioDurationMs = chunk.duration;
+      const rtf = durationMs / audioDurationMs;
+      const segments = data.segments?.map((seg, i) => ({
+        id: `${chunk.seq}-${i}`,
+        sourceText: seg.text.trim(),
+        translatedText: void 0,
+        // 由翻譯管線處理
+        provisional: false,
+        start: seg.start * 1e3,
+        // 秒 → 毫秒
+        end: seg.end * 1e3,
+        origin: "realtime-asr",
+        revision: 0
+      })) ?? [
+        {
+          id: `${chunk.seq}-0`,
+          sourceText: data.text.trim(),
+          translatedText: void 0,
+          provisional: false,
+          start: 0,
+          end: chunk.duration,
+          origin: "realtime-asr",
+          revision: 0
+        }
+      ];
+      return {
+        seq: chunk.seq,
+        segments,
+        isPartial: false,
+        rtf
+      };
+    }
+    /** Deepgram WebSocket 流式（非流式回退）。 */
+    async transcribeDeepgram(req, startTime) {
+      const { chunk, hintLang } = req;
+      const wavBlob = pcmToWav(chunk.pcm, chunk.sampleRate);
+      const url = `${this.endpoint}/v1/listen?model=nova-2${hintLang ? `&language=${hintLang}` : ""}`;
+      const response = await globalThis.fetch.bind(globalThis)(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${this.apiKey}`,
+          "Content-Type": "audio/wav"
+        },
+        body: wavBlob
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        const error = new Error(`Deepgram API failed: HTTP ${response.status}: ${errorText}`);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "asr",
+            code: "asr-engine-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
+      const data = await response.json();
+      const durationMs = performance.now() - startTime;
+      const audioDurationMs = chunk.duration;
+      const rtf = durationMs / audioDurationMs;
+      const alternative = data.results.channels[0]?.alternatives[0];
+      const segments = alternative ? [
+        {
+          id: `${chunk.seq}-0`,
+          sourceText: alternative.transcript.trim(),
+          translatedText: void 0,
+          provisional: false,
+          start: 0,
+          end: chunk.duration,
+          origin: "realtime-asr",
+          revision: 0
+        }
+      ] : [];
+      return {
+        seq: chunk.seq,
+        segments,
+        isPartial: false,
+        rtf
+      };
+    }
+    /** Deepgram WebSocket 流式（provisional → final）。 */
+    async transcribeDeepgramStream(req, emit) {
+      const { chunk, hintLang } = req;
+      const wsUrl = `wss://api.deepgram.com/v1/listen?model=nova-2&interim_results=true${hintLang ? `&language=${hintLang}` : ""}`;
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl, ["token", this.apiKey]);
+        let finalEmitted = false;
+        ws.onopen = () => {
+          const wavBlob = pcmToWav(chunk.pcm, chunk.sampleRate);
+          wavBlob.arrayBuffer().then((buffer) => {
+            ws.send(buffer);
+            ws.send(JSON.stringify({ type: "CloseStream" }));
+          });
+        };
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "Results" && data.channel?.alternatives?.[0]) {
+              const alt = data.channel.alternatives[0];
+              const isFinal = data.is_final === true;
+              const segment = {
+                id: `${chunk.seq}-0`,
+                sourceText: alt.transcript.trim(),
+                translatedText: void 0,
+                provisional: !isFinal,
+                start: 0,
+                end: chunk.duration,
+                origin: "realtime-asr",
+                revision: 0
+              };
+              emit({
+                seq: chunk.seq,
+                segments: [segment],
+                isPartial: !isFinal,
+                rtf: void 0
+                // 流式不計算 RTF。
+              });
+              if (isFinal) finalEmitted = true;
+            }
+          } catch {
+          }
+        };
+        ws.onclose = () => {
+          if (!finalEmitted) {
+            emit({
+              seq: chunk.seq,
+              segments: [],
+              isPartial: false,
+              rtf: void 0
+            });
+          }
+          resolve();
+        };
+        ws.onerror = (err) => {
+          const error = new Error(`Deepgram WebSocket error: ${err}`);
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "asr",
+              code: "asr-engine-failed",
+              recoverable: true,
+              cause: error
+            }
+          });
+          reject(error);
+        };
+      });
+    }
+  };
+
+  // src/adapters/asr/local-whisper.ts
+  var WHISPER_MODELS = {
+    tiny: "Xenova/whisper-tiny.en",
+    base: "Xenova/whisper-base.en",
+    small: "Xenova/whisper-small.en"
+  };
+  var LocalWhisperASR = class {
+    engineId = "local-whisper";
+    location = "local";
+    pipeline = null;
+    modelId;
+    constructor(config) {
+      this.modelId = config.modelPath ?? WHISPER_MODELS[config.modelTier] ?? WHISPER_MODELS.base;
+    }
+    /**
+     * 預熱模型——首次調用時從 HuggingFace Hub 下載到 IndexedDB。
+     * 後續調用直接使用緩存（transformers.js 內部管理）。
+     */
+    async warmup(_config) {
+      try {
+        const importFn = new Function("modulePath", "return import(modulePath)");
+        const transformers = await importFn("@huggingface/transformers");
+        const { pipeline } = transformers;
+        this.pipeline = await pipeline("automatic-speech-recognition", this.modelId);
+      } catch (err) {
+        const error = new Error(
+          `LocalWhisperASR warmup failed: ${err instanceof Error ? err.message : String(err)}. Please install @huggingface/transformers: npm install @huggingface/transformers`
+        );
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "asr",
+            code: "asr-engine-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
+    }
+    /** 非流式推理。 */
+    async transcribe(req) {
+      if (!this.pipeline) {
+        throw new Error("LocalWhisperASR not warmed up. Call warmup() first.");
+      }
+      const { chunk, hintLang } = req;
+      const startTime = performance.now();
+      try {
+        const result = await this.pipeline(chunk.pcm, {
+          language: hintLang,
+          task: "transcribe",
+          return_timestamps: true
+        });
+        const durationMs = performance.now() - startTime;
+        const audioDurationMs = chunk.duration;
+        const rtf = durationMs / audioDurationMs;
+        const segments = result.chunks?.map((c, i) => ({
+          id: `${chunk.seq}-${i}`,
+          sourceText: c.text.trim(),
+          translatedText: void 0,
+          provisional: false,
+          start: (c.timestamp?.[0] ?? 0) * 1e3,
+          // 秒 → 毫秒
+          end: (c.timestamp?.[1] ?? chunk.duration / 1e3) * 1e3,
+          origin: "realtime-asr",
+          revision: 0
+        })) ?? [
+          {
+            id: `${chunk.seq}-0`,
+            sourceText: result.text?.trim() ?? "",
+            translatedText: void 0,
+            provisional: false,
+            start: 0,
+            end: chunk.duration,
+            origin: "realtime-asr",
+            revision: 0
+          }
+        ];
+        return {
+          seq: chunk.seq,
+          segments,
+          isPartial: false,
+          rtf
+        };
+      } catch (err) {
+        const error = new Error(
+          `LocalWhisperASR transcribe failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "asr",
+            code: "asr-engine-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
+    }
+    /**
+     * 流式推理——分段輸出 provisional → final 結果。
+     * 當前實現：將音頻塊分為 3 段，每段推理後 emit provisional，最後一段 emit final。
+     */
+    async transcribeStream(req, emit) {
+      if (!this.pipeline) {
+        throw new Error("LocalWhisperASR not warmed up. Call warmup() first.");
+      }
+      const { chunk } = req;
+      const segmentDuration = chunk.pcm.length / 3;
+      for (let i = 0; i < 3; i++) {
+        const start2 = Math.floor(i * segmentDuration);
+        const end = Math.floor((i + 1) * segmentDuration);
+        const segmentPcm = chunk.pcm.slice(start2, end);
+        const isLast = i === 2;
+        const startTime = performance.now();
+        const result = await this.pipeline(segmentPcm, {
+          task: "transcribe",
+          return_timestamps: false
+        });
+        const durationMs = performance.now() - startTime;
+        const audioDurationMs = segmentPcm.length / chunk.sampleRate * 1e3;
+        const rtf = durationMs / audioDurationMs;
+        const segment = {
+          id: `${chunk.seq}-${i}`,
+          sourceText: result.text?.trim() ?? "",
+          translatedText: void 0,
+          provisional: !isLast,
+          start: start2 / chunk.sampleRate * 1e3,
+          end: end / chunk.sampleRate * 1e3,
+          origin: "realtime-asr",
+          revision: 0
+        };
+        emit({
+          seq: chunk.seq,
+          segments: [segment],
+          isPartial: !isLast,
+          rtf
+        });
+      }
+    }
+  };
+
   // src/runtime/composition.ts
   async function buildDefaultRegistry(config, opts) {
     const youtube = new YouTubePlatformAdapter({
@@ -1299,6 +2127,9 @@
     });
     const translation = await buildTranslationProviders(config, opts.apiKeyStore);
     ensureLlmCacheInvalidationHook();
+    const audioSources = /* @__PURE__ */ new Map();
+    audioSources.set("tab-capture", new TabCaptureAudioSource());
+    const asr = await buildASRProviders(config, opts.apiKeyStore);
     return {
       platforms: [youtube],
       strategies: [
@@ -1306,11 +2137,29 @@
         new LookAheadASRStrategy(),
         new RealtimeASRStrategy()
       ],
-      asr: /* @__PURE__ */ new Map(),
-      // M2 起註冊 ASRProvider
+      audioSources,
+      asr,
       translation,
       renderer: new OverlayRenderer()
     };
+  }
+  async function buildASRProviders(config, apiKeyStore) {
+    const providers = /* @__PURE__ */ new Map();
+    if (config.asr.type === "local-whisper") {
+      const whisper = new LocalWhisperASR({
+        modelTier: config.asr.modelTier ?? "base"
+      });
+      providers.set(whisper.engineId, whisper);
+    } else if (config.asr.type === "cloud" && config.asr.endpoint) {
+      const apiKey = await apiKeyStore.getApiKey("asr") ?? "";
+      const cloud = new CloudASR({
+        endpoint: config.asr.endpoint,
+        apiKey,
+        model: config.asr.modelTier
+      });
+      providers.set(cloud.engineId, cloud);
+    }
+    return providers;
   }
   async function buildTranslationProviders(config, apiKeyStore) {
     const providers = /* @__PURE__ */ new Map();
@@ -1383,42 +2232,6 @@
       };
     }
   };
-
-  // src/infrastructure/diagnostics.ts
-  var DIAGNOSTIC_KEY = "lastDiagnostic";
-  function extractDiagnostic(e) {
-    switch (e.type) {
-      case "engine-degraded":
-        if (e.port === "translation" || e.port === "asr") {
-          return { kind: "degraded", message: e.reason };
-        }
-        return void 0;
-      case "pipeline-error":
-        return { kind: "error", message: formatCause(e.error.cause) };
-      default:
-        return void 0;
-    }
-  }
-  function formatCause(cause) {
-    if (cause instanceof Error) {
-      return `${cause.name}: ${cause.message}`;
-    }
-    return String(cause ?? "unknown error");
-  }
-  async function recordDiagnostic(e) {
-    const diag = extractDiagnostic(e);
-    if (!diag) return;
-    const record = {
-      kind: diag.kind,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      message: diag.message
-    };
-    console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
-    try {
-      await chrome.storage.local.set({ [DIAGNOSTIC_KEY]: record });
-    } catch {
-    }
-  }
 
   // src/runtime/timedtext-bridge.ts
   var INTERCEPTOR_SCRIPT_URL = "src/runtime/yt-timedtext-interceptor.js";
@@ -1595,6 +2408,25 @@
       };
       chrome.storage.onChanged.addListener(onStorageChanged);
       this.unsubscribeConfig = () => chrome.storage.onChanged.removeListener(onStorageChanged);
+      const onAsrAuthChanged = (changes, areaName) => {
+        if (areaName !== "local" || !("tabCaptureAuthorized" in changes)) return;
+        const newValue = changes.tabCaptureAuthorized.newValue;
+        if (newValue === this.tabCaptureAuthorized) return;
+        this.tabCaptureAuthorized = newValue;
+        void this.restart().catch((err) => {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "platform",
+              code: "asr-auth-restart-failed",
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err))
+            }
+          });
+        });
+      };
+      chrome.storage.onChanged.addListener(onAsrAuthChanged);
+      this.unsubscribeAsrAuth = () => chrome.storage.onChanged.removeListener(onAsrAuthChanged);
     }
     config;
     renderer = new OverlayRenderer();
@@ -1609,10 +2441,13 @@
     // R4：所有需解除的訂閱句柄，restart/stop 前必須全部清理，避免線性累積。
     unsubscribePlayback = null;
     unsubscribeConfig = null;
+    unsubscribeAsrAuth = null;
     pendingMountObserver = null;
     mountWaitTimer = null;
     // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
     debugFlagRelayTimer = null;
+    // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
+    tabCaptureAuthorized = false;
     // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
     // 偵測 URL 的 v 參數變化後熱重啟字幕管線。dispose 時必須解除/恢復（R4）。
     onUrlChangedBound;
@@ -1623,6 +2458,8 @@
     urlChangeTimer = null;
     /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
     async start() {
+      const authState = await chrome.storage.local.get("tabCaptureAuthorized");
+      this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
       this.applyDebugFlags();
       this.bridge.inject();
       this.bridge.start();
@@ -1645,7 +2482,7 @@
         captionCaptureProvider: this.bridge
       });
       this.orchestrator = new Orchestrator(
-        { registry, getConfig: () => store.get(), enableAsr: false },
+        { registry, getConfig: () => store.get(), enableAsr: this.tabCaptureAuthorized },
         (e) => this.onEvent(e)
       );
       const platform = registry.platforms[0];
@@ -1736,6 +2573,8 @@
       this.bridge.dispose();
       this.unsubscribeConfig?.();
       this.unsubscribeConfig = null;
+      this.unsubscribeAsrAuth?.();
+      this.unsubscribeAsrAuth = null;
       globalThis.removeEventListener("popstate", this.onUrlChangedBound);
       if (this.patchedHistory) {
         history.pushState = this.origPushState;
