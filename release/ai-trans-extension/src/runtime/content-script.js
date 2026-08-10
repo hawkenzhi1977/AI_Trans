@@ -49646,6 +49646,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var CHUNK_SIZE = 15;
   var MAX_RETRIES = 2;
   var RETRY_DELAYS_MS = [500, 1500];
+  var INCOMPLETE_MAX_RETRIES = 2;
+  var INCOMPLETE_RETRY_DELAY_MS = 300;
   var BODY_TIMEOUT_MS = 3e5;
   var CACHE_MAX_ENTRIES = 100;
   function djb2Hash(text) {
@@ -49742,7 +49744,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         });
       }
     }
-    /** 塊翻譯 + 快取 + 重試。瞬態失敗（transient）重試，永久失敗直接拋。 */
+    /** 塊翻譯 + 快取 + 重試。瞬態失敗（transient）重試，永久失敗直接拋。不完整翻譯額外重試。 */
     async translateChunkWithRetry(chunk, req) {
       const cacheKey = this.cacheKey(chunk, req.targetLang);
       const cached = llmCache.get(cacheKey);
@@ -49758,6 +49760,27 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
           const map = await this.translateChunkOnce(chunk, req);
+          if (map.size < chunk.length) {
+            let missing = this.getMissingIndices(chunk, map);
+            diagLog("llm", `incomplete translation (${map.size}/${chunk.length}), retrying with missing indices: ${missing.join(",")}`);
+            for (let incAttempt = 0; incAttempt < INCOMPLETE_MAX_RETRIES; incAttempt++) {
+              await sleep(INCOMPLETE_RETRY_DELAY_MS);
+              const retryMap = await this.translateChunkOnce(chunk, req, missing);
+              if (retryMap.size >= chunk.length) {
+                llmCache.set(cacheKey, retryMap);
+                return chunk.map((s, i) => ({
+                  ...s,
+                  translatedText: retryMap.get(String(i)) ?? s.sourceText,
+                  targetLang: req.targetLang
+                }));
+              }
+              missing = this.getMissingIndices(chunk, retryMap);
+              diagLog("llm", `incomplete retry ${incAttempt + 1} still missing ${missing.length} lines`);
+            }
+            console.warn(
+              `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries \u2014 expected ${chunk.length} lines, got ${map.size}. Some segments will show original text as translation.`
+            );
+          }
           llmCache.set(cacheKey, map);
           return chunk.map((s, i) => ({
             ...s,
@@ -49781,9 +49804,23 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         targetLang: req.targetLang
       }));
     }
+    /** 計算 chunk 中缺失的索引列表。 */
+    getMissingIndices(chunk, map) {
+      const missing = [];
+      for (let i = 0; i < chunk.length; i++) {
+        if (!map.has(String(i))) missing.push(i);
+      }
+      return missing;
+    }
     /** 塊翻譯一輪：fetch + parse；失敗拋 LLMRequestError（瞬態/永久按語義標記）。 */
-    async translateChunkOnce(chunk, req) {
+    async translateChunkOnce(chunk, req, missingIndices) {
       const lines = chunk.map((s, i) => `${i}	${s.sourceText}`);
+      let userContent = lines.join("\n");
+      if (missingIndices?.length) {
+        userContent += `
+
+IMPORTANT: Previous attempt missed indices ${missingIndices.join(", ")}. Translate ALL lines.`;
+      }
       const body = {
         model: this.opts.model,
         temperature: 0.2,
@@ -49791,14 +49828,22 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         messages: [
           {
             role: "system",
-            content: `Translate each line to ${req.targetLang}. Format: "index\\ttranslation"
+            content: `Translate each numbered line to ${req.targetLang}.
+Rules:
+- Output EVERY line with its index, format: "index\\ttranslation"
+- Translation must be in ${req.targetLang} only, no English
+- Do not skip any line
+
+Input example:
 0	Hello world
-0	\u4F60\u597D\u4E16\u754C
 1	Good morning
+
+Output example:
+0	\u4F60\u597D\u4E16\u754C
 1	\u65E9\u4E0A\u597D`
           },
           ...req.context?.length ? [{ role: "user", content: `Context: ${req.context.join("\n")}` }] : [],
-          { role: "user", content: lines.join("\n") }
+          { role: "user", content: userContent }
         ]
       };
       const response = await this.fetchDirectly({
@@ -49844,12 +49889,6 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         if (m) map.set(m[1], m[2]);
       }
       diagLog("llm", "parsed map size =", map.size, ", map =", Object.fromEntries(map));
-      if (map.size < chunk.length) {
-        const missing = chunk.length - map.size;
-        console.warn(
-          `[AI_Trans:diag] LLM: incomplete translation \u2014 expected ${chunk.length} lines, got ${map.size} (missing ${missing}). Some segments will show original text as translation.`
-        );
-      }
       const valueCounts = /* @__PURE__ */ new Map();
       for (const v of map.values()) {
         valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
@@ -49960,6 +49999,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var NO_CUE_LOG_INTERVAL_MS = 5e3;
   var OverlayRenderer = class {
     root = null;
+    styleEl = null;
     style = {};
     cues = [];
     currentId = null;
@@ -49970,6 +50010,20 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     mount(container, style = {}) {
       diagLog("overlay", "mount() called, container:", container.tagName, container.className);
       this.style = style;
+      const styleEl = document.createElement("style");
+      styleEl.textContent = `
+      .ai-trans-src {
+        font-size: 0.75em;
+        opacity: 0.7;
+        display: block;
+        margin-bottom: 0.2em;
+      }
+      .ai-trans-dst {
+        display: block;
+      }
+    `;
+      container.appendChild(styleEl);
+      this.styleEl = styleEl;
       const root = document.createElement("div");
       root.className = "ai-trans-overlay";
       const base = {
@@ -50013,6 +50067,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     unmount() {
       this.root?.remove();
       this.root = null;
+      this.styleEl?.remove();
+      this.styleEl = null;
       this.currentId = null;
     }
     draw(currentTime) {
@@ -50046,7 +50102,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         parts.push(`<span class="ai-trans-src">${escapeHtml(cue.sourceText)}</span>`);
       }
       parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
-      this.root.innerHTML = parts.join("<br/>");
+      this.root.innerHTML = parts.join("");
       this.root.dataset.provisional = String(cue.provisional);
     }
     clear() {

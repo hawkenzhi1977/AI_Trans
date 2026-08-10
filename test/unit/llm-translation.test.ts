@@ -43,7 +43,7 @@ function okResponse(body: unknown): Response {
 }
 
 const llmBody = {
-  choices: [{ message: { content: '0\t譯文零\n1\t譯文一' } }],
+  choices: [{ message: { content: '0\t譯文零\n1\t譯文一\n2\t譯文二\n3\t譯文三\n4\t譯文四\n5\t譯文五\n6\t譯文六\n7\t譯文七\n8\t譯文八\n9\t譯文九\n10\t譯文十\n11\t譯文十一\n12\t譯文十二\n13\t譯文十三\n14\t譯文十四' } }],
 };
 
 // 模塊級 LRU 快取跨測試共享：每個用例前後清空，避免快取命中污染斷言。
@@ -422,8 +422,8 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     vi.restoreAllMocks();
   });
 
-  it('LLM 返回行數少於輸入段數時輸出 warn 診斷', async () => {
-    // LLM 只返回 1 行翻譯，但輸入有 3 段 → 應觸發 incomplete warning。
+  it('LLM 返回行數少於輸入段數時重試並最終輸出 warn 診斷', async () => {
+    // LLM 每次只返回 1 行翻譯，但輸入有 3 段 → 應觸發重試，最終 incomplete warning。
     const incompleteBody = {
       choices: [{ message: { content: '0\t譯文零' } }],
     };
@@ -447,11 +447,49 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     expect(result.segments[0].translatedText).toBe('譯文零');
     expect(result.segments[1].translatedText).toBe('line-1');
     expect(result.segments[2].translatedText).toBe('line-2');
-    // §5.6：不完整輸出必須留痕。
+    // 應調用 fetch 3 次（1 次初始 + 2 次 incomplete 重試）
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // §5.6：不完整輸出最終必須留痕。
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('incomplete translation')
+      expect.stringContaining('incomplete translation after')
     );
     warnSpy.mockRestore();
+  });
+
+  it('LLM 不完整翻譯重試後成功返回完整翻譯', async () => {
+    // 第一次返回不完整（缺 index 1, 2），第二次返回完整
+    const incompleteBody = {
+      choices: [{ message: { content: '0\t譯文零' } }],
+    };
+    const completeBody = {
+      choices: [{ message: { content: '0\t譯文零\n1\t譯文一\n2\t譯文二' } }],
+    };
+
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount++;
+      return callCount === 1 ? okResponse(incompleteBody) : okResponse(completeBody);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    // 重試後應返回完整翻譯
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+    // 應調用 fetch 2 次（1 次初始 + 1 次重試成功）
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('LLM 返回完整行數時不輸出 warn', async () => {

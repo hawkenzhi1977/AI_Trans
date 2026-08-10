@@ -11,6 +11,7 @@ const NO_CUE_LOG_INTERVAL_MS = 5_000;
 
 export class OverlayRenderer implements SubtitleRenderer {
   private root: HTMLElement | null = null;
+  private styleEl: HTMLStyleElement | null = null;
   private style: Record<string, string> = {};
   private cues: RenderableCue[] = [];
   private currentId: string | null = null;
@@ -22,6 +23,22 @@ export class OverlayRenderer implements SubtitleRenderer {
   mount(container: HTMLElement, style: Record<string, string> = {}): void {
     diagLog('overlay', 'mount() called, container:', container.tagName, container.className);
     this.style = style;
+
+    // 注入 class 樣式：原文縮小+半透明，譯文正常顯示
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `
+      .ai-trans-src {
+        font-size: 0.75em;
+        opacity: 0.7;
+        display: block;
+        margin-bottom: 0.2em;
+      }
+      .ai-trans-dst {
+        display: block;
+      }
+    `;
+    container.appendChild(styleEl);
+    this.styleEl = styleEl;
 
     const root = document.createElement('div');
     root.className = 'ai-trans-overlay';
@@ -74,6 +91,8 @@ export class OverlayRenderer implements SubtitleRenderer {
   unmount(): void {
     this.root?.remove();
     this.root = null;
+    this.styleEl?.remove();
+    this.styleEl = null;
     this.currentId = null;
   }
 
@@ -111,7 +130,7 @@ export class OverlayRenderer implements SubtitleRenderer {
       parts.push(`<span class="ai-trans-src">${escapeHtml(cue.sourceText)}</span>`);
     }
     parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
-    this.root.innerHTML = parts.join('<br/>');
+    this.root.innerHTML = parts.join('');
     this.root.dataset.provisional = String(cue.provisional);
   }
 

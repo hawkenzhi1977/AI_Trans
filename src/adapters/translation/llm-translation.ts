@@ -42,6 +42,12 @@ const MAX_RETRIES = 2;
 /** 重試退避間隔（毫秒）：第 1 次重試前 500ms，第 2 次 1500ms。 */
 const RETRY_DELAYS_MS = [500, 1500];
 
+/** 不完整翻譯重試上限：LLM 返回行數不足時額外重試次數。 */
+const INCOMPLETE_MAX_RETRIES = 2;
+
+/** 不完整翻譯重試退避間隔（毫秒）。 */
+const INCOMPLETE_RETRY_DELAY_MS = 300;
+
 /**
  * Body 讀取階段超時（毫秒）：headers 已到達但 body 生成慢（本地 LLM 推理長輸出）時
  * 給出遠大於 headers 階段的窗口（M1-53 兩階段超時）。5 分鐘後仍無 body → abort。
@@ -193,7 +199,7 @@ export class LLMTranslationProvider implements TranslationProvider {
     }
   }
 
-  /** 塊翻譯 + 快取 + 重試。瞬態失敗（transient）重試，永久失敗直接拋。 */
+  /** 塊翻譯 + 快取 + 重試。瞬態失敗（transient）重試，永久失敗直接拋。不完整翻譯額外重試。 */
   private async translateChunkWithRetry(
     chunk: SubtitleSegment[],
     req: TranslationRequest
@@ -213,6 +219,34 @@ export class LLMTranslationProvider implements TranslationProvider {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const map = await this.translateChunkOnce(chunk, req);
+
+        // 不完整翻譯重試：LLM 返回行數不足時，附带缺失索引重試
+        if (map.size < chunk.length) {
+          let missing = this.getMissingIndices(chunk, map);
+          diagLog('llm', `incomplete translation (${map.size}/${chunk.length}), retrying with missing indices: ${missing.join(',')}`);
+
+          for (let incAttempt = 0; incAttempt < INCOMPLETE_MAX_RETRIES; incAttempt++) {
+            await sleep(INCOMPLETE_RETRY_DELAY_MS);
+            const retryMap = await this.translateChunkOnce(chunk, req, missing);
+            if (retryMap.size >= chunk.length) {
+              llmCache.set(cacheKey, retryMap);
+              return chunk.map((s, i) => ({
+                ...s,
+                translatedText: retryMap.get(String(i)) ?? s.sourceText,
+                targetLang: req.targetLang,
+              }));
+            }
+            // 仍不完整，更新 missing indices 繼續重試
+            missing = this.getMissingIndices(chunk, retryMap);
+            diagLog('llm', `incomplete retry ${incAttempt + 1} still missing ${missing.length} lines`);
+          }
+          // 不完整重試耗盡，使用最後一次結果（部分原文兜底）
+          console.warn(
+            `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries — expected ${chunk.length} lines, got ${map.size}. ` +
+            `Some segments will show original text as translation.`
+          );
+        }
+
         llmCache.set(cacheKey, map);
         return chunk.map((s, i) => ({
           ...s,
@@ -239,12 +273,27 @@ export class LLMTranslationProvider implements TranslationProvider {
     }));
   }
 
+  /** 計算 chunk 中缺失的索引列表。 */
+  private getMissingIndices(chunk: SubtitleSegment[], map: Map<string, string>): number[] {
+    const missing: number[] = [];
+    for (let i = 0; i < chunk.length; i++) {
+      if (!map.has(String(i))) missing.push(i);
+    }
+    return missing;
+  }
+
   /** 塊翻譯一輪：fetch + parse；失敗拋 LLMRequestError（瞬態/永久按語義標記）。 */
   private async translateChunkOnce(
     chunk: SubtitleSegment[],
-    req: TranslationRequest
+    req: TranslationRequest,
+    missingIndices?: number[]
   ): Promise<Map<string, string>> {
     const lines: string[] = chunk.map((s, i) => `${i}\t${s.sourceText}`);
+
+    let userContent = lines.join('\n');
+    if (missingIndices?.length) {
+      userContent += `\n\nIMPORTANT: Previous attempt missed indices ${missingIndices.join(', ')}. Translate ALL lines.`;
+    }
 
     const body = {
       model: this.opts.model,
@@ -254,16 +303,22 @@ export class LLMTranslationProvider implements TranslationProvider {
         {
           role: 'system',
           content:
-            `Translate each line to ${req.targetLang}. Format: "index\\ttranslation"\n` +
+            `Translate each numbered line to ${req.targetLang}.\n` +
+            `Rules:\n` +
+            `- Output EVERY line with its index, format: "index\\ttranslation"\n` +
+            `- Translation must be in ${req.targetLang} only, no English\n` +
+            `- Do not skip any line\n\n` +
+            `Input example:\n` +
             `0\tHello world\n` +
+            `1\tGood morning\n\n` +
+            `Output example:\n` +
             `0\t你好世界\n` +
-            `1\tGood morning\n` +
             `1\t早上好`,
         },
         ...(req.context?.length
           ? [{ role: 'user', content: `Context: ${req.context.join('\n')}` }]
           : []),
-        { role: 'user', content: lines.join('\n') },
+        { role: 'user', content: userContent },
       ],
     };
 
@@ -325,15 +380,6 @@ export class LLMTranslationProvider implements TranslationProvider {
       if (m) map.set(m[1], m[2]);
     }
     diagLog('llm', 'parsed map size =', map.size, ', map =', Object.fromEntries(map));
-    // §5.6：LLM 輸出不完整（跳過行/截斷）時必須留痕——缺失的段會回退顯示原文，
-    // 雙語模式下用戶會看到「英文+英文」，卻無從得知是 LLM 輸出被截斷。
-    if (map.size < chunk.length) {
-      const missing = chunk.length - map.size;
-      console.warn(
-        `[AI_Trans:diag] LLM: incomplete translation — expected ${chunk.length} lines, got ${map.size} (missing ${missing}). ` +
-        `Some segments will show original text as translation.`
-      );
-    }
     // §5.6：LLM 重複翻譯檢測——小模型可能在長輸出中「迷失」，對不同 index 輸出相同翻譯，
     // 導致後續所有翻譯與原文錯位（英中不同步）。必須留痕讓用戶/開發者能定位問題。
     const valueCounts = new Map<string, number>();
