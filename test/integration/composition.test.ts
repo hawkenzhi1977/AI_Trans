@@ -166,4 +166,21 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('local-whisper ASR 配置 customModelPath 時優先於 modelTier', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({
+        asr: {
+          type: 'local-whisper',
+          modelTier: 'base',
+          customModelPath: 'custom/vibevoice-model',
+        },
+      }),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    const asr = registry.asr.get('local-whisper');
+    expect(asr).toBeDefined();
+    expect(asr?.engineId).toBe('local-whisper');
+    expect(asr?.location).toBe('local');
+  });
 });

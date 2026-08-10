@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-07（**回填治理缺口**：新增 TC-F26 LLM 直接 fetch 架構（F-04/M1-48，SW 代理移除 + 僅配置管理）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50），TC-F09 字幕樣式從佔位升級為已實裝（F-09/M1-49，三重對比默認樣式 + 背景預設/自定義雙模式 + transparent 向後兼容）。新增 **TC-F24 調試日誌門控（F-12/M1-51，八分類開關 + 錯誤日誌不受門控）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52，CHUNK_SIZE=60 分塊 + translateStream 漸進 emit + LRU 快取 100 條 + 瞬態重試 ≤2 次 + 超時覆蓋 body 讀取；M1-53 擴展為兩階段超時：headers `timeoutMs` 30s + body `BODY_TIMEOUT_MS` 300s，新增 H/H'/J/K 用例）**；先前：TC-F11 翻譯失敗診斷可見性、TC-F12 Popup 測試連接、TC-F13 全鏈不適用診斷 + 策略 run 失敗診斷、TC-F14 軌列表三態診斷、TC-F15 M2/M3 佔位診斷、TC-F16 timedtext 真實格式兼容、TC-F17 外部接口調用節點診斷證據化、TC-F18 pot token 攔截複用、TC-F19 捕獲鏈路 E2E（M1-43）、TC-F20 LLM body 讀取失敗與非 JSON 區分（M1-44）、TC-F21 SPA 換視頻後字幕重新出現（M1-45）、TC-F22 攔截器重播修復捕獲早於監聽器註冊競態（M1-46）、TC-F23 消息通信 CustomEvent 修復 + 字幕模組驅動增強 + 翻譯失敗降級（M1-47）；測試合計 113→139→153→164→168→175→182→183→…→unit 89（+2 M1-53 兩階段超時）+ integration 117 + contract 11 + E2E 15）
+> 最後更新：2026-08-10（**M2-18 治理回填**：新增 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列））；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 93 + integration 124 + contract 11 = 228
 
 ---
 
@@ -588,6 +588,13 @@ jobs:
 - 預期：性能指標正確收集；P50/P95 可查詢；動態降檔觸發正常。
 - 落點：單元 `test/unit/perf-metrics.test.ts`（RTF 收集 + P50/P95 計算）。
 
+#### TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（對應 M2-17/M2-18）
+- 步驟：
+  - A（ASR warmup 模塊打包）：`@huggingface/transformers` 被 esbuild 完整打包進 content-script IIFE（移除 `external` 配置），bundle 無裸 `import("@huggingface/transformers")`；Vitest 的 `resolve.alias` 映射到 `test/support/mock-huggingface-transformers.ts`（測試環境不依賴真實包）。
+  - B（DOM 解析兜底）：`player.getOption('captions', 'tracklist')` 返回空陣列時，`getCaptionTracksFromPlayerResponse()` 從 DOM `<script id="ytInitialPlayerResponse">` 解析 `ytInitialPlayerResponse`（支持 `var ytInitialPlayerResponse = {...};` JS 賦值形式），提取 `captionTracks` 作為首要來源。
+- 預期：A 中 content-script bundle 可獨立解析 `@huggingface/transformers`（Chrome content script 無 node_modules）；B 中播放器 API 返回空時仍從 DOM 獲取字幕軌。
+- 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（M2-18 用例：getOption 返回空陣列時 DOM 解析兜底成功，斷言 `setOption('captions', 'track', { languageCode: 'zh-Hant' })` + `__aiTransCaptionTracks === 2`）。
+
 #### TC-F08 預緩衝提前處理與降級（對應 F-08）
 - 前置：可預取音頻的 mock 場景。
 - 步驟 A：預取可用 → 走二級 look-ahead。
@@ -703,6 +710,7 @@ jobs:
 | TC-M2-06 | M2-08 | 集成 |
 | TC-M2-07 | M2-11 | 單元/集成 |
 | TC-M2-08 | M2-12 | 單元 |
+| TC-M2-09 | M2-17/M2-18 | 集成（已實裝） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

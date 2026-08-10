@@ -112,7 +112,7 @@ npm run test:e2e     # Playwright E2E（需先構建）
 打開擴充的 **設定**（Options 頁）可配置：
 
 - **翻譯引擎**：雲端 LLM / 本地 / MT，模型、端點、API Key、兜底引擎。
-- **ASR 引擎**（供未來 M2）：本地 Whisper / 雲端，模型檔位，端點。
+- **ASR 引擎**：本地 Whisper / 雲端，模型檔位，端點，自定義模型路徑。
 - **目標語言**、**顯示模式**（單語/雙語）、**性能檔位**。
 - **字幕樣式**：字號、顏色、背景。
 - **調試日誌**（用於排查問題）：按需開啟個別分類（overlay / llm / capture / pipeline / strategy / content / bridge / interceptor）。預設全部關閉。

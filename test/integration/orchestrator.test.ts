@@ -8,6 +8,8 @@ import { MockYouTubeAdapter, staticTrack } from '../support/mock-youtube';
 import { StubTranslationProvider } from '../support/stub-engines';
 import type { TranslationProvider } from '../../src/domain/ports/translation-provider';
 import { resetChromeMock } from '../support/setup-dom';
+import { StubASRProvider } from '../support/stub-engines';
+import type { ASRProvider } from '../../src/domain/ports/asr-provider';
 
 function nativeSeg(i: number): SubtitleSegment {
   return {
@@ -120,5 +122,66 @@ describe('Orchestrator 集成：原生字幕策略閉環', () => {
     expect(orch.platformId).toBe('youtube');
     orch.stop();
     expect(orch.platformId).toBeNull();
+  });
+});
+
+describe('Orchestrator 集成：M2 ASR 依賴注入（§5.6 不靜默）', () => {
+  beforeEach(() => resetChromeMock());
+
+  it('enableAsr=true 時 RealtimeASRStrategy 被注入依賴，ASR warmup 被調用', async () => {
+    const asrStub = new StubASRProvider({ engineId: 'test-asr' });
+    const asrMap = new Map<string, ASRProvider>([['test-asr', asrStub]]);
+    const registry = buildTestRegistry({ asr: asrMap });
+    const events: PipelineEvent[] = [];
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: true },
+      (e) => events.push(e)
+    );
+
+    await orch.start(WATCH_URL);
+    // warmup 被調用（StubASRProvider.warmed 標記）。
+    expect(asrStub.warmed).toBe(true);
+    // 無原生字幕時，RealtimeASRStrategy 應被選中（isApplicable=true）。
+    // 但 tabCaptureAuthorized 在測試環境默認未授權，策略會跳過 → 無 segments-ready。
+    const ready = events.find((e) => e.type === 'segments-ready');
+    expect(ready).toBeUndefined();
+  });
+
+  it('enableAsr=false 時 ASR 不預熱，RealtimeASRStrategy 不被注入', async () => {
+    const asrStub = new StubASRProvider({ engineId: 'test-asr' });
+    const asrMap = new Map<string, ASRProvider>([['test-asr', asrStub]]);
+    const registry = buildTestRegistry({ asr: asrMap });
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: false },
+      () => {}
+    );
+
+    await orch.start(WATCH_URL);
+    // warmup 不被調用。
+    expect(asrStub.warmed).toBe(false);
+  });
+
+  it('ASR warmup 失敗時發 engine-degraded 事件（§5.6 不靜默）', async () => {
+    const failingAsr = new StubASRProvider({ engineId: 'failing-asr' });
+    // 覆蓋 warmup 使其拋錯。
+    failingAsr.warmup = async () => {
+      throw new Error('warmup exploded');
+    };
+    const asrMap = new Map<string, ASRProvider>([['failing-asr', failingAsr]]);
+    const registry = buildTestRegistry({ asr: asrMap });
+    const events: PipelineEvent[] = [];
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: true },
+      (e) => events.push(e)
+    );
+
+    await orch.start(WATCH_URL);
+    // 等待 warmup 的 catch 回調。
+    await new Promise((r) => setTimeout(r, 10));
+    const degraded = events.find(
+      (e) => e.type === 'engine-degraded' && e.port === 'asr'
+    );
+    expect(degraded).toBeDefined();
+    expect((degraded as { reason: string }).reason).toContain('warmup exploded');
   });
 });

@@ -83,6 +83,7 @@ async function buildASRProviders(
   if (config.asr.type === 'local-whisper') {
     const whisper = new LocalWhisperASR({
       modelTier: config.asr.modelTier ?? 'base',
+      modelPath: config.asr.customModelPath,
     });
     providers.set(whisper.engineId, whisper);
   } else if (config.asr.type === 'cloud' && config.asr.endpoint) {

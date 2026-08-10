@@ -100,6 +100,7 @@ function readForm(): EngineConfig {
       type: asrType,
       modelTier,
       endpoint: $<HTMLInputElement>('asr-endpoint').value || undefined,
+      customModelPath: $<HTMLInputElement>('asr-custom-model').value || undefined,
     },
     targetLang: $<HTMLInputElement>('target-lang').value || 'zh-Hant',
     displayMode: $<HTMLSelectElement>('display-mode').value as 'mono' | 'bilingual',
@@ -131,6 +132,7 @@ function fillForm(config: EngineConfig): void {
   $<HTMLSelectElement>('asr-type').value = config.asr.type;
   $<HTMLSelectElement>('asr-tier').value = config.asr.modelTier ?? 'base';
   $<HTMLInputElement>('asr-endpoint').value = config.asr.endpoint ?? '';
+  $<HTMLInputElement>('asr-custom-model').value = config.asr.customModelPath ?? '';
   $<HTMLInputElement>('target-lang').value = config.targetLang;
   $<HTMLSelectElement>('display-mode').value = config.displayMode;
   $<HTMLSelectElement>('performance-profile').value = config.performanceProfile;

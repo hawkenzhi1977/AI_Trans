@@ -50,12 +50,15 @@ export class LocalWhisperASR implements ASRProvider {
    */
   async warmup(_config: ASRConfig): Promise<void> {
     try {
-      // 動態導入 @huggingface/transformers（可選依賴）。
-      // 使用 Function 構造函數避免靜態分析錯誤（Vite 會在構建時檢查 import）。
-      const importFn = new Function('modulePath', 'return import(modulePath)');
-      const transformers = await importFn('@huggingface/transformers');
+      // 動態導入 @huggingface/transformers（esbuild 打包進 bundle，不使用 new Function
+      // 以避免 Chrome 擴展 CSP 禁止 unsafe-eval）。
+      const transformers = await import('@huggingface/transformers');
       const { pipeline } = transformers;
-      this.pipeline = await pipeline('automatic-speech-recognition', this.modelId);
+      // 轉型以匹配本地 WhisperPipeline 接口（transformers.js 返回類型更複雜）。
+      this.pipeline = (await pipeline(
+        'automatic-speech-recognition',
+        this.modelId
+      )) as unknown as WhisperPipeline;
     } catch (err) {
       const error = new Error(
         `LocalWhisperASR warmup failed: ${err instanceof Error ? err.message : String(err)}. ` +

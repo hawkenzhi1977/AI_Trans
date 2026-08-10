@@ -12,6 +12,7 @@ const HTML = `
   <select id="asr-type"><option value="cloud">雲端</option><option value="local-whisper">本地 Whisper</option></select>
   <select id="asr-tier"><option value="tiny">tiny</option><option value="base">base</option><option value="small">small</option></select>
   <input id="asr-endpoint" />
+  <input id="asr-custom-model" />
   <input id="target-lang" />
   <select id="display-mode"><option value="mono">僅譯文</option><option value="bilingual">雙語</option></select>
   <select id="performance-profile"><option value="streaming">streaming</option><option value="balanced">balanced</option><option value="quality">quality</option></select>
@@ -146,5 +147,37 @@ describe('Options — M1-51 調試日誌開關區', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect((document.getElementById('dbg-overlay') as HTMLInputElement).checked).toBe(false);
     expect((document.getElementById('dbg-llm') as HTMLInputElement).checked).toBe(false);
+  });
+});
+
+describe('Options — M2 自定義 ASR 模型路徑', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('讀取配置後自定義模型路徑被回填到表單', async () => {
+    const configWithCustomModel: EngineConfig = {
+      ...SAVED_CONFIG,
+      asr: {
+        ...SAVED_CONFIG.asr,
+        customModelPath: '/path/to/vibevoice',
+      },
+    };
+    await chrome.storage.local.set({ engineConfig: configWithCustomModel });
+    await loadOptions();
+    expect((document.getElementById('asr-custom-model') as HTMLInputElement).value).toBe('/path/to/vibevoice');
+  });
+
+  it('保存後自定義模型路徑被持久化到配置', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    (document.getElementById('asr-custom-model') as HTMLInputElement).value = 'my-custom-model';
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('engineConfig');
+    const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
+    expect(saved.asr.customModelPath).toBe('my-custom-model');
+    expect(document.getElementById('status')!.textContent).toContain('配置已保存');
   });
 });

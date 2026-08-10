@@ -49,7 +49,7 @@
     <input id="translation-api-key" type="password" autocomplete="off" placeholder="sk-..." />
   </fieldset>
 
-  <h2>語音識別（ASR，M2 起用）</h2>
+  <h2>語音識別（ASR）</h2>
   <fieldset>
     <div class="row">
       <div>
@@ -68,6 +68,8 @@
         </select>
       </div>
     </div>
+    <label for="asr-custom-model">自定義模型路徑（可選，優先於模型檔）</label>
+    <input id="asr-custom-model" type="text" placeholder="例如：/path/to/vibevoice 或 HuggingFace 模型 ID" />
     <label for="asr-endpoint">雲端端點</label>
     <input id="asr-endpoint" type="text" placeholder="https://api.openai.com/v1/audio/transcriptions" />
     <label for="asr-api-key">API Key（本地安全存儲）</label>

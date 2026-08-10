@@ -16,4 +16,10 @@ export default defineConfig({
       include: ['src/domain/**', 'src/application/**'],
     },
   },
+  resolve: {
+    alias: {
+      // @huggingface/transformers 為可選依賴，測試中 mock 為空模塊。
+      '@huggingface/transformers': new URL('./test/support/mock-huggingface-transformers.ts', import.meta.url).pathname,
+    },
+  },
 });

@@ -162,7 +162,8 @@
       asr: {
         type: asrType,
         modelTier,
-        endpoint: $("asr-endpoint").value || void 0
+        endpoint: $("asr-endpoint").value || void 0,
+        customModelPath: $("asr-custom-model").value || void 0
       },
       targetLang: $("target-lang").value || "zh-Hant",
       displayMode: $("display-mode").value,
@@ -191,6 +192,7 @@
     $("asr-type").value = config.asr.type;
     $("asr-tier").value = config.asr.modelTier ?? "base";
     $("asr-endpoint").value = config.asr.endpoint ?? "";
+    $("asr-custom-model").value = config.asr.customModelPath ?? "";
     $("target-lang").value = config.targetLang;
     $("display-mode").value = config.displayMode;
     $("performance-profile").value = config.performanceProfile;

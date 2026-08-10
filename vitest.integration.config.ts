@@ -11,4 +11,10 @@ export default defineConfig({
     setupFiles: ['test/support/setup-dom.ts'],
     reporters: ['default', ['junit', { outputFile: 'reports/junit/integration.xml' }]],
   },
+  resolve: {
+    alias: {
+      // @huggingface/transformers 為可選依賴，測試中 mock 為空模塊。
+      '@huggingface/transformers': new URL('./test/support/mock-huggingface-transformers.ts', import.meta.url).pathname,
+    },
+  },
 });

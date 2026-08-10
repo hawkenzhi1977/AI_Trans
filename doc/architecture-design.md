@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：架構設計 — 組件劃分、數據結構、接口、實時性分析
 > 關聯文檔：`doc/requirements-design.md`
-> 最後更新：2026-08-07（**回填治理缺口 M1-48/M1-49/M1-50**：§7.5 補 M1-48 LLM 直接 fetch 架構（service worker 代理移除、SW 精簡為配置管理、MV3 SW 不宜做實時代理教訓）、§7.6 補 M1-49 字幕背景樣式三重對比增強（F-09 實裝）與 M1-50 日誌降壓 + interceptor arraybuffer 支援、§12 里程碑映射增列 M1-48/49/50。並：§5.1 目錄樹 infrastructure 補 `debug-log.ts`、§6.6 配置補 `DebugLogCategory`/`DebugLogConfig`/`DEBUG_LOG_OFF`/`EngineConfig.debugLog` 與調試日誌門控機制（F-12/M1-51，CustomEvent 跨 world 同步、錯誤日誌不受門控）、§7.5 TranslationProvider 補字幕翻譯延遲優化（F-13/M1-52：CHUNK_SIZE=60 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取 100 條上限 + storage 變更失效、瞬態失敗重試 ≤2 次退避 + 永久失敗 fail-fast、AbortController 超時覆蓋 body 讀取）；§7.5 補兩階段超時（M1-53：headers 超時 `timeoutMs` 30s + body 超時 `BODY_TIMEOUT_MS` 300s，修復本地 LLM 慢生成被 30s 誤殺全片回退原文）、§12 里程碑映射增列 F-12/F-13。先前：§7 補外部接口調用節點診斷全掃描補齊 M1-41；§5 目錄樹補 timedtext-bridge/yt-timedtext-interceptor、§7.1 補 M1-42 pot token 攔截複用機制與 M1-43 捕獲時序修復；M1-45 攔截器 document_start MAIN world 注入 + SPA 換視頻熱重啟 + 跨視頻捕獲失效校驗；M1-46 攔截器重播 lastCapture 修復「捕獲早於 bridge 監聽器註冊」競態 + 放寬 timedtext hostname 匹配 + 調試輔助；**M1-47 消息通信從 postMessage 改為 CustomEvent 修復 isolated world 與 MAIN world 通信失敗 + 字幕模組驅動重試增強（MAX_RETRIES 20→60 + 立即觸發）+ 翻譯失敗降級顯示原文字幕**）
+> 最後更新：2026-08-10（**M2-17/M2-18 治理回填**：§7.1 補 M2-17 CSP 違規修復（`new Function` → 直接 import）+ M2-18 ASR warmup 模塊解析（external 方案推翻 → esbuild 打包 transformers 進 IIFE）+ M2-18 字幕攔截器 DOM 解析（`getCaptionTracksFromPlayerResponse()` 首要來源兜底 `getOption` 空陣列）；§12 里程碑映射增列 M2-16/17/18）；先前：回填治理缺口 M1-48/M1-49/M1-50；§7.5 補 M1-48 LLM 直接 fetch 架構、§7.6 補 M1-49/M1-50、§12 增列 M1-48/49/50；§5.1 目錄樹補 `debug-log.ts`、§6.6 補調試日誌門控（F-12/M1-51）；§7.5 補 F-13/M1-52 分塊翻譯 + M1-53 兩階段超時；先前：M1-41/M1-42/M1-43/M1-45/M1-46/M1-47
 
 ---
 
@@ -417,6 +417,12 @@ export interface PlatformAdapter {
 >
 > 測試落點：集成 +1（`yt-timedtext-interceptor.test.ts` 的 `set-target-lang` 消息測試改用 `CustomEvent`）。
 >
+> **CSP 違規修復 + ASR warmup 模塊解析（M2-17/M2-18，Chrome content script 模塊解析限制）**：M2-17 初版用 `new Function('modulePath', 'return import(modulePath)')` 動態導入 `@huggingface/transformers`，觸發 Chrome 擴展 CSP 禁止 `unsafe-eval`。M2-17 修復為 `await import('@huggingface/transformers')` + `build.mjs` 標記 `external`（保留裸 import 不被打包）。**M2-18 推翻 external 方案**：Chrome content script（IIFE bundle）無 node_modules 解析路徑，運行時拋 `Failed to resolve module specifier`。修復：`npm install` 安裝包 + 移除 `external` → esbuild 將 transformers 完整打包進 content-script IIFE（bundle 含 38 處 "huggingface" 字樣，無裸 import）。`local-whisper.ts` 用 `as unknown as WhisperPipeline` 類型轉換（v3 返回類型過複雜）。Vitest `resolve.alias` 映射到 `test/support/mock-huggingface-transformers.ts` 避免測試依賴真實包。
+>
+> **字幕攔截器 DOM 解析修復（M2-18，`getOption` 不可靠根因修復）**：`player.getOption('captions', 'tracklist')` 在真實 YouTube 持續返回 `[]`（即使視頻有字幕），導致 `ensureCaptionModuleLoaded()` 字幕模組驅動失敗。修復：新增 `getCaptionTracksFromPlayerResponse()` 直接從 DOM `<script>` 標籤解析 `ytInitialPlayerResponse`（支持 `var ytInitialPlayerResponse = {...};` JS 賦值形式與純 JSON 兩種格式），作為**首要來源**；`getOption` 降為備用。`ensureCaptionModuleLoaded()` 先嘗試 DOM 解析，失敗才回退 `getOption`。教訓：播放器 API 不可靠時直接解析頁面內嵌結構化數據（`ytInitialPlayerResponse`）更穩定。
+>
+> 測試落點：集成 +1（`yt-timedtext-interceptor.test.ts` M2-18 用例：getOption 返回空陣列時 DOM 解析兜底成功）。對應 TC-M2-09（system-test-design §4）。
+>
 > **訂閱/Observer 洩漏**（restart 路徑）：`SubtitleController` 的 `observePlayback` 返回 unsubscribe 必須保存為實例字段並在 `stop()` 調用；`MutationObserver` 等待播放器就緒時須保存 handle 供 stop 中斷，並加 15s 超時避免 Promise 永久懸掛（SPA 導航離開 watch 頁時播放器永不出現）。每次 restart（配置變更）前必須完整清理上一輪全部訂閱/Observer/rAF，否則監聽器線性累積 → 內存洩漏 + CPU 空轉。
 >
 > **外部 JSON 容錯**：`fetchTrackList` 選擇器優先取具名 `#ytInitialPlayerResponse`，回退掃描內聯腳本時用正則匹配 `ytInitialPlayerResponse = {...}` 賦值，避免 `script:not([src])` 誤匹配頁面首個任意內聯 JS。`JSON.parse` 外部內容必須 try/catch 兜底返回 `[]`，禁止 parse 錯誤冒泡成功能降級誤判。
@@ -795,7 +801,7 @@ export interface PerfSample {
 | 里程碑 | 落地的適配器/模塊 | 先定義後實現的接口 |
 |---|---|---|
 | M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容）；LLM 直接 fetch + SW 精簡（M1-48）；字幕背景樣式增強（F-09/M1-49）；日誌降壓 + interceptor arraybuffer 支援（M1-50）；`debug-log.ts` 調試日誌門控（F-12/M1-51）；LLM 分塊翻譯 + `translateStream` 漸進交付 + LRU 快取 + 瞬態失敗重試（F-13/M1-52） | 全部端口先定義 |
-| M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD（`EnergyVAD`）、`perf/metrics`、Offscreen Document（`src/runtime/offscreen.ts`）、tabCapture 授權流程 | ASR 流式接口啟用；Offscreen port 長連接通信；transformers.js 本地推理；Deepgram/OpenAI 雲端雙實現；provisional 字幕修正 |
+| M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD（`EnergyVAD`）、`perf/metrics`、Offscreen Document（`src/runtime/offscreen.ts`）、tabCapture 授權流程；ASR 依賴注入修復 + 自定義模型路徑（M2-16）；CSP 違規修復（M2-17）；ASR warmup 模塊解析（esbuild 打包 transformers 進 IIFE）+ 字幕攔截器 DOM 解析（`getCaptionTracksFromPlayerResponse` 首要來源）（M2-18） | ASR 流式接口啟用；Offscreen port 長連接通信；transformers.js 本地推理（IIFE 打包，非 external）；Deepgram/OpenAI 雲端雙實現；provisional 字幕修正；字幕軌 DOM 解析兜底 |
 | M3 預緩衝 | `BufferedAudioSource`、`LookAheadASRStrategy` | 復用 M2 管線，僅換音頻源 |
 | M4 優化 | 動態引擎選擇、性能檔位、樣式與多語言加固 | — |
 

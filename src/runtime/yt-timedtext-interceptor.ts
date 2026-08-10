@@ -186,13 +186,60 @@ function pickTargetTrack(tracklist: YtCaptionTrack[]): YtCaptionTrack {
 let captionModuleDriven = false;
 
 /**
- * 主動驅動播放器字幕模組發出 timedtext 請求（M1-47 核心修復）。
+ * 從 DOM 中的 ytInitialPlayerResponse 解析字幕軌列表（M2-18 修復）。
+ * 
+ * 背景：YouTube 播放器 API `getOption('captions', 'tracklist')` 在某些情況下
+ * 持續返回空陣列（即使視頻有字幕），導致字幕驅動失敗。本函式直接從頁面內嵌的
+ * `ytInitialPlayerResponse` JSON 提取字幕軌信息，繞過播放器 API。
+ * 
+ * @returns 字幕軌列表；解析失敗或無字幕時返回 undefined。
+ */
+function getCaptionTracksFromPlayerResponse(): YtCaptionTrack[] | undefined {
+  // 掃描所有內聯腳本，尋找 ytInitialPlayerResponse 賦值。
+  // YouTube 頁面中該腳本通常形如 `var ytInitialPlayerResponse = {...};`
+  // 或純 JSON（某些頁面/版本）。
+  const scripts = document.querySelectorAll('script:not([src])');
+  for (const el of Array.from(scripts)) {
+    const text = el.textContent ?? '';
+    if (!text.includes('ytInitialPlayerResponse')) continue;
+    
+    // 嘗試提取 JSON 對象。
+    let jsonStr: string | undefined;
+    
+    // 形式 1: `var ytInitialPlayerResponse = {...};`（JavaScript 賦值）
+    const assignMatch = /ytInitialPlayerResponse\s*=\s*(\{[\s\S]*?\})\s*;/.exec(text);
+    if (assignMatch) {
+      jsonStr = assignMatch[1];
+    } else if (text.trim().startsWith('{')) {
+      // 形式 2: 純 JSON（script#ytInitialPlayerResponse 可能只含 JSON）
+      jsonStr = text.trim();
+    }
+    
+    if (!jsonStr) continue;
+    
+    try {
+      const data = JSON.parse(jsonStr);
+      const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (Array.isArray(tracks)) return tracks as YtCaptionTrack[];
+    } catch {
+      // JSON 解析失敗，繼續嘗試下一個腳本。
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 主動驅動播放器字幕模組發出 timedtext 請求（M1-47 核心修復 + M2-18 增強）。
  *
  * 背景：真實環境中若用戶未開啟字幕（CC 關閉），播放器**根本不發** timedtext 請求，
  * 攔截器永遠捕獲不到帶 pot 的 URL → waitForCapture 超時 → 回退直接 fetch（無 pot）
  * → YouTube 返回 HTML 登錄頁（empty body）→ 解析失敗。M1-46 的重播只能重發「已捕獲」
  * 的響應，捕獲不到時無濟於事。此函式透過播放器 API 主動載入字幕模組並選軌，
  * 逼播放器自己發帶 pot 的請求，供攔截器捕獲；隨後復位抑制原生字幕顯示。
+ *
+ * M2-18 增強：`getOption('captions', 'tracklist')` 在某些情況下持續返回空陣列
+ * （即使視頻有字幕）。新增 fallback：直接從 DOM 中的 `ytInitialPlayerResponse` 解析
+ * 字幕軌信息，繞過播放器 API。
  *
  * 播放器 API（loadModule/getOption/setOption）未文件化且版本多變，全程 try/catch，
  * 失敗不致命（僅回退到原捕獲路徑）。
@@ -210,7 +257,7 @@ function ensureCaptionModuleLoaded(): void {
     diagLog('interceptor', 'Player element not found');
     return;
   }
-  if (typeof player.loadModule !== 'function' || typeof player.getOption !== 'function' || typeof player.setOption !== 'function') {
+  if (typeof player.loadModule !== 'function' || typeof player.setOption !== 'function') {
     diagLog('interceptor', 'Player API not available');
     return; // 播放器未就緒/API 未暴露：由重試定時器稍後再試。
   }
@@ -221,24 +268,38 @@ function ensureCaptionModuleLoaded(): void {
     // 載入失敗（可能已載入）：繼續嘗試讀軌列表。
   }
   
+  // 獲取字幕軌列表：優先從 DOM 解析（M2-18），fallback 到播放器 API。
   let tracklist: YtCaptionTrack[] | undefined;
-  try {
-    const raw = player.getOption('captions', 'tracklist');
-    diagLog('interceptor', 'Tracklist:', raw, 'isArray:', Array.isArray(raw));
-    if (Array.isArray(raw)) tracklist = raw as YtCaptionTrack[];
-  } catch (err) {
-    diagLog('interceptor', 'getOption error:', err);
-    return; // 讀軌列表拋錯：播放器尚未就緒，稍後重試。
+  let source = 'unknown';
+  
+  // 優先從 ytInitialPlayerResponse 解析（繞過播放器 API 可能返回空的問題）。
+  const domTracks = getCaptionTracksFromPlayerResponse();
+  if (domTracks && domTracks.length > 0) {
+    tracklist = domTracks;
+    source = 'ytInitialPlayerResponse (DOM)';
+    diagLog('interceptor', 'Got tracks from ytInitialPlayerResponse:', domTracks.length, 'tracks');
+  } else if (typeof player.getOption === 'function') {
+    // Fallback: 播放器 API。
+    try {
+      const raw = player.getOption('captions', 'tracklist');
+      diagLog('interceptor', 'getOption tracklist:', raw, 'isArray:', Array.isArray(raw));
+      if (Array.isArray(raw) && raw.length > 0) {
+        tracklist = raw as YtCaptionTrack[];
+        source = 'player.getOption';
+      }
+    } catch (err) {
+      diagLog('interceptor', 'getOption error:', err);
+    }
   }
   
   if (!tracklist || tracklist.length === 0) {
-    diagLog('interceptor', 'No caption tracks available');
+    diagLog('interceptor', 'No caption tracks available (video may have no captions)');
     // 無字幕軌：可能真無字幕，或軌列表尚未就緒。標記調試碼，讓重試繼續（真無字幕時無害）。
     Reflect.set(globalThis, '__aiTransCaptionTracks', 0);
     return;
   }
   
-  diagLog('interceptor', 'Found', tracklist.length, 'caption tracks');
+  diagLog('interceptor', 'Found', tracklist.length, 'caption tracks from', source);
   Reflect.set(globalThis, '__aiTransCaptionTracks', tracklist.length);
   const track = pickTargetTrack(tracklist);
   

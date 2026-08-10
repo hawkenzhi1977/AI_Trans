@@ -110,6 +110,28 @@
     return manual ?? tracklist[0];
   }
   var captionModuleDriven = false;
+  function getCaptionTracksFromPlayerResponse() {
+    const scripts = document.querySelectorAll("script:not([src])");
+    for (const el of Array.from(scripts)) {
+      const text = el.textContent ?? "";
+      if (!text.includes("ytInitialPlayerResponse")) continue;
+      let jsonStr;
+      const assignMatch = /ytInitialPlayerResponse\s*=\s*(\{[\s\S]*?\})\s*;/.exec(text);
+      if (assignMatch) {
+        jsonStr = assignMatch[1];
+      } else if (text.trim().startsWith("{")) {
+        jsonStr = text.trim();
+      }
+      if (!jsonStr) continue;
+      try {
+        const data = JSON.parse(jsonStr);
+        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (Array.isArray(tracks)) return tracks;
+      } catch {
+      }
+    }
+    return void 0;
+  }
   function ensureCaptionModuleLoaded() {
     if (captionModuleDriven) return;
     const player = document.getElementById("movie_player");
@@ -117,7 +139,7 @@
       diagLog("interceptor", "Player element not found");
       return;
     }
-    if (typeof player.loadModule !== "function" || typeof player.getOption !== "function" || typeof player.setOption !== "function") {
+    if (typeof player.loadModule !== "function" || typeof player.setOption !== "function") {
       diagLog("interceptor", "Player API not available");
       return;
     }
@@ -126,20 +148,30 @@
     } catch {
     }
     let tracklist;
-    try {
-      const raw = player.getOption("captions", "tracklist");
-      diagLog("interceptor", "Tracklist:", raw, "isArray:", Array.isArray(raw));
-      if (Array.isArray(raw)) tracklist = raw;
-    } catch (err) {
-      diagLog("interceptor", "getOption error:", err);
-      return;
+    let source = "unknown";
+    const domTracks = getCaptionTracksFromPlayerResponse();
+    if (domTracks && domTracks.length > 0) {
+      tracklist = domTracks;
+      source = "ytInitialPlayerResponse (DOM)";
+      diagLog("interceptor", "Got tracks from ytInitialPlayerResponse:", domTracks.length, "tracks");
+    } else if (typeof player.getOption === "function") {
+      try {
+        const raw = player.getOption("captions", "tracklist");
+        diagLog("interceptor", "getOption tracklist:", raw, "isArray:", Array.isArray(raw));
+        if (Array.isArray(raw) && raw.length > 0) {
+          tracklist = raw;
+          source = "player.getOption";
+        }
+      } catch (err) {
+        diagLog("interceptor", "getOption error:", err);
+      }
     }
     if (!tracklist || tracklist.length === 0) {
-      diagLog("interceptor", "No caption tracks available");
+      diagLog("interceptor", "No caption tracks available (video may have no captions)");
       Reflect.set(globalThis, "__aiTransCaptionTracks", 0);
       return;
     }
-    diagLog("interceptor", "Found", tracklist.length, "caption tracks");
+    diagLog("interceptor", "Found", tracklist.length, "caption tracks from", source);
     Reflect.set(globalThis, "__aiTransCaptionTracks", tracklist.length);
     const track = pickTargetTrack(tracklist);
     try {

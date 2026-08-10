@@ -616,4 +616,38 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
     vi.advanceTimersByTime(1_000); // 重驅動輪
     expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
   });
+
+  it('[M2-18] 播放器 API 返回空軌時，從 ytInitialPlayerResponse (DOM) 提取字幕軌', async () => {
+    // 模擬播放器 getOption('captions', 'tracklist') 返回空陣列（用戶報告的真實問題）。
+    const { setOption } = mountMockPlayer([]);
+    
+    // 在 DOM 中注入 ytInitialPlayerResponse（含字幕軌數據）。
+    // 使用 JavaScript 賦值形式（避免 jsdom 嘗試執行純 JSON 拋 SyntaxError）。
+    const playerResponseData = {
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [
+            { languageCode: 'zh-Hant' },
+            { languageCode: 'en', kind: 'asr' },
+          ],
+        },
+      },
+    };
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.textContent = `var ytInitialPlayerResponse = ${JSON.stringify(playerResponseData)};`;
+    document.body.appendChild(script);
+    
+    // 驗證 script 已正確加入 DOM。
+    const foundScript = document.querySelector('script#ytInitialPlayerResponse');
+    expect(foundScript).not.toBeNull();
+    expect(foundScript?.textContent).toContain('captionTracks');
+    
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    
+    // 應從 DOM 提取軌並選人工軌（kind !== 'asr'）。
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'zh-Hant' });
+    expect(Reflect.get(globalThis, '__aiTransCaptionTracks')).toBe(2);
+  });
 });

@@ -17,6 +17,8 @@ export interface ASRConfig {
   apiKeyRef?: string;
   /** VAD 能量閾值（0-1），低於此值視為靜音。默認 0.01。 */
   vadThreshold?: number;
+  /** 自定義模型路徑（用於 vibevoice 等本地模型，優先於 modelTier）。 */
+  customModelPath?: string;
 }
 
 /**

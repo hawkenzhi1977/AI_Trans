@@ -112,7 +112,7 @@ npm run test:e2e     # Playwright E2E (requires a build first)
 Open the extension's **Settings** (Options page) to set:
 
 - **Translation engine**: cloud LLM / local / MT, model, endpoint, API key, fallback.
-- **ASR engine** (for future M2): local Whisper / cloud, model tier, endpoint.
+- **ASR engine**: local Whisper / cloud, model tier, endpoint, custom model path.
 - **Target language**, **display mode** (mono/bilingual), **performance profile**.
 - **Subtitle style**: font size, color, background.
 - **Debug logging** (for diagnosing issues): toggle individual categories (overlay / llm / capture / pipeline / strategy / content / bridge / interceptor). All off by default.

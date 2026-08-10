@@ -7,6 +7,7 @@ import type { StrategyContext } from '../domain/ports/caption-strategy';
 import type { Registry } from './registry';
 import { selectPlatform } from './registry';
 import { TranslationPipeline } from './translation-pipeline';
+import { RealtimeASRStrategy } from './strategies/realtime-asr-strategy';
 
 /** ASR 未啟用時的空實現，保證 StrategyContext.asr 端口可空。 */
 class NoopASR implements ASRProvider {
@@ -94,8 +95,32 @@ export class Orchestrator {
 
     // 組裝 ASR 上下文（M2 起啟用；M1 用 no-op 保證端口可空實現）。
     const asrProvider: ASRProvider = this.deps.enableAsr
-      ? (this.deps.registry.asr.get('asr') ?? NoopASR.instance)
+      ? (this.deps.registry.asr.values().next().value ?? NoopASR.instance)
       : NoopASR.instance;
+
+    // M2 修復：注入 RealtimeASRStrategy 依賴並預熱 ASR。
+    const realtimeStrategy = this.deps.registry.strategies.find(
+      (s): s is RealtimeASRStrategy => s instanceof RealtimeASRStrategy
+    );
+    if (realtimeStrategy && this.deps.enableAsr && asrProvider !== NoopASR.instance) {
+      const audioSource = this.deps.registry.audioSources.get('tab-capture');
+      if (audioSource) {
+        realtimeStrategy.inject({
+          audioSource,
+          asrProvider,
+          translationProvider: translationPipeline,
+          vadThreshold: config.asr.vadThreshold,
+        });
+        // 預熱 ASR 模型（消除首次推理抖動）。
+        void asrProvider.warmup(config.asr).catch((err) => {
+          this.onEvent({
+            type: 'engine-degraded',
+            port: 'asr',
+            reason: `ASR warmup failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        });
+      }
+    }
 
     // 監聽播放狀態，供策略與渲染使用。
     const unsubscribe = platform.observePlayback((state) => {
