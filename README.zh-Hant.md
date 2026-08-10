@@ -125,6 +125,11 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 
 > **reasoning 模型提示**：會輸出長 `<think>` 思考的模型已支援（思考塊會被剝離）。採兩階段超時後，body 生成給足 5 分鐘（僅服務不響應/不可達才命中 30s 響應頭超時），但單次翻譯仍可能耗時 30–40s。要即時字幕建議改用非推理（instruct）模型。
 
+> **翻譯模型選擇建議**：要即時字幕請選**翻譯專用（MT）或小參數 instruct 模型**，而非大型通用模型——分塊翻譯仍從片頭開始，慢模型在跳播到遠位置時字幕會明顯落後。實測推薦：
+> - **騰訊混元翻譯大模型**——`HY-MT1.5-1.8B` / `HY-MT2-1.8B`：專為機器翻譯設計（約 1.8B 參數），本地服務上速度極快；`HY-MT2-1.8B` 為新一代。
+> - **通義千問小參數模型**——`Qwen2.5-3B-Instruct` / `Qwen2.5-7B-Instruct`：通用但體積小，翻譯品質與速度均衡；追求低延遲用 3B，重視品質用 7B。
+> 模型 ID 需與伺服器實際名稱完全一致。**避免填 ASR/語音轉文字模型**（如 VibeVoice-ASR）——它們走 `/v1/audio/transcriptions` 而非 `/v1/chat/completions`，連接測試會回 HTTP 400。
+
 > **排查提示 — 字幕不出現時**：先開 Popup 點**「測試連接」**——它會向配置端點發真實請求，直接告訴你失敗在哪一環（端點不可達/模型名不符/響應異常）。也可看**「最近失敗」**行（常駐顯示，如模型 404 `LLM translation failed: HTTP 404`）或 DevTools console 的 `[AI_Trans] translation degraded` 麵包屑。若原因為 `no caption strategies applicable`，則屬**字幕軌抓取失敗**（與翻譯失敗不同），cause 會進一步區分三種子情況——找不到 player-response JSON / JSON 解析失敗 / 視頻確實無字幕軌。若原因為 `timedtext XML: missing transcript root` 或 timedtext 解析錯誤，說明字幕響應格式未被識別——擴充現已優先請求 `fmt=json3` 並回退 srv3 XML 解析；若 timedtext 請求被 YouTube 的 `pot` token 防護攔截，擴充會透明複用播放器自身的字幕響應。常見原因：模型 ID 與伺服器實際名稱不符（omlx 會回 404 Model not found）；端點格式（`http://127.0.0.1:8000/v1` 與 `http://127.0.0.1:8000/v1/chat/completions` 都會自動規範化）。**注意**：Chrome 對 `127.0.0.1`/`localhost` 的明文 HTTP 有 mixed-content 豁免，本地端點用 `http://127.0.0.1:PORT/v1` 即可，無需 HTTPS。**進階診斷字幕捕獲**：開頁面 DevTools console 讀取 `window.__aiTransTimedtextInterceptorInstalled`（MAIN world 攔截器已載入？）、`window.__aiTransTimedtextRequests`（已捕獲字幕響應數——`0` 表示攔截器從未匹配請求）、`window.__aiTransTimedtextLastCapture`（最近捕獲響應，含 `videoId`）。
 
 ---

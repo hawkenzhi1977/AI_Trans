@@ -210,6 +210,20 @@
 - **診斷增強**: XHR onLoad 中新增 `xhr.status` 和 `xhr.responseType` 日誌，便於區分「空響應」是 HTTP 錯誤、responseType 不支援、還是真實無字幕。
 - **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`readXhrResponseText` arraybuffer 分支 + onLoad status/responseType 日誌）
 
+### 2.16 字幕解析格式與時間戳範圍診斷（M1-54，「翻譯成功但字幕不顯示」定位）
+
+- **現象**: 日誌顯示翻譯成功（`parsed map size = N`、`emit segments-ready/updated`、`render() called, cues: N`），但 overlay 持續 `draw() no active cue for currentTime: <大值> cues: N`，且 `first cue range` 的數值遠小於 `currentTime`（如 cue 範圍 `16 - 6287` vs currentTime `1548650`）——所有 cue 的時間戳「擠」在視頻開頭幾秒，與播放位置不匹配，字幕永不命中。
+- **根因方向**: 字幕時間戳單位異常——若源數據以「秒」為單位卻被當作「毫秒」（缺少 ×1000），或格式識別走錯分支（srv3 毫秒 vs 傳統秒），會導致 cue 時間範圍與 `<video>.currentTime`（毫秒）錯位。overlay 的 `draw()` 用 `currentTime >= c.start && currentTime < c.end` 匹配，單位錯位則永遠無 active cue。
+- **診斷日誌**（`capture` 分類，默認關；Options 開啟「捕獲」調試分類後輸出）:
+  - `parseTimedText: lang: <lang> format: <json|xml> length: <N> prefix: "<前120字符>"` — 進入解析時記錄原始響應的格式判定與前綴片段，用於區分 json3 / srv3 / 傳統格式。
+  - `parseJson: events: <N> first tStartMs: <值> first dDurationMs: <值>` — json3 分支的原始時間戳（應為毫秒）。
+  - `parseXml: detected srv3 format (timedtext>p, t/d 為毫秒)` / `parseXml: legacy format (transcript/text, start/dur 為秒→×1000), root: <tag> nodes: <N>` — XML 分支走 srv3（毫秒）還是傳統（秒×1000）。
+  - `<source>: segments: <N> start range: <min> - <max> max end: <值> median dur: <值> ms [— SUSPECT: timestamps may be seconds treated as ms (missing ×1000)]` — 每個解析分支結束時輸出時間戳範圍與中位時長；當「段數 ≥ 50 且 maxStart < 10_000ms」時追加 SUSPECT 標記，提示單位可能為秒被當毫秒。
+- **開發者響應**: 對照 `parseTimedText` 的 `format` 與各分支 `start range`——若 SUSPECT 出現，說明源時間戳單位與解析分支假設不符（如 srv3 的 `t` 實際為秒、或傳統格式漏乘 1000）；再核對 overlay `first cue range` 與 `currentTime` 量級是否一致（都應為毫秒）。
+- **真實環境定位結果（2026-08-10）**: 開啟「捕獲」調試分類後日誌完整輸出——`format: json`、prefix 為 `{ "wireMagic": "pb3", "pens": [...] }`（**pb3 格式**，與 json3 結構兼容：均有 `events[].tStartMs/dDurationMs/segs[].utf8`，`parseJson` 直接解析成功）；`parseJson: events: 431 first tStartMs: 16 first dDurationMs: 6271`；`parseJson: segments: 431 start range: 16 - 2312116 max end: 2328666 median dur: 1261 ms`——時間戳單位**正確**（毫秒）、`currentTime: 1460953` 落在 `16 - 2312116` 範圍內、**無 SUSPECT 標記**。**結論：非時間戳單位問題，而是 M1-52 分塊翻譯進度**——翻譯從片頭開始，用戶把進度條拉到遠位置（24 分鐘）時首塊僅覆蓋前幾秒（`first cue range: 16 - 6287`），需等翻譯進度追上播放位置才出現字幕；換用更快本地模型後自愈。
+- **過程教訓**: M1-54 診斷日誌最初「永遠缺失」——不是調用鏈斷，而是 `dist/` 未重建（舊構建不含診斷代碼），`npm run build` + 重新加載擴充後才正常輸出。**改動影響 `dist/` 產物的代碼必須重新構建部署，否則診斷「永遠缺失」會被誤判為上游斷鏈**。
+- **代碼落點**: src/adapters/platform/youtube/timedtext.ts（`parseTimedText` 入口日誌、`parseJson`/`parseSrv3`/`parseXml`(legacy) 分支日誌、`logSegmentTimespan` 輔助）
+
 
 ---
 

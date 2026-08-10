@@ -1,4 +1,5 @@
 import type { CaptionTrack, SubtitleSegment } from '../../../domain/models/subtitle';
+import { diagLog } from '../../../infrastructure/debug-log';
 
 /**
  * YouTube timedtext 字幕解析——契約測試鎖定對象。
@@ -20,7 +21,17 @@ export interface TimedTextDocument {
 /** 解析 YouTube timedtext JSON/XML 為內部結構。時間換算為毫秒。 */
 export function parseTimedText(raw: string, lang: string): SubtitleSegment[] {
   const trimmed = raw.trim();
-  if (trimmed.startsWith('{')) {
+  // 診斷：記錄原始響應的格式特徵與前綴片段，用於區分 json3 / srv3 / 傳統格式
+  // （真實環境播放器捕獲的響應可能為任意格式，時間戳單位也可能不同——見 §4.8.1 根因排查）。
+  const isJson = trimmed.startsWith('{');
+  diagLog(
+    'capture',
+    'parseTimedText: lang:', lang,
+    'format:', isJson ? 'json' : 'xml',
+    'length:', raw.length,
+    'prefix:', snippet(raw, 120)
+  );
+  if (isJson) {
     return parseJson(trimmed, lang);
   }
   return parseXml(trimmed, lang);
@@ -48,7 +59,14 @@ function parseJson(raw: string, lang: string): SubtitleSegment[] {
   if (!Array.isArray(doc.events)) {
     throw new Error('timedtext JSON: missing events array');
   }
-  return doc.events
+  // 診斷：原始事件首個含 tStartMs 的值，用於確認 json3 時間戳單位（應為毫秒）。
+  const firstEv = doc.events.find((e) => typeof e.tStartMs === 'number');
+  diagLog(
+    'capture',
+    'parseJson: events:', doc.events.length,
+    'first tStartMs:', firstEv?.tStartMs, 'first dDurationMs:', firstEv?.dDurationMs
+  );
+  const segments = doc.events
     .map((ev, i) => {
       const text = (ev.segs ?? []).map((s) => s.utf8 ?? '').join('').trim();
       if (!text) return null;
@@ -57,6 +75,8 @@ function parseJson(raw: string, lang: string): SubtitleSegment[] {
       return toSegment(String(i), start, start + dur, text, lang);
     })
     .filter((s): s is SubtitleSegment => s !== null);
+  logSegmentTimespan('parseJson', segments);
+  return segments;
 }
 
 function parseXml(raw: string, lang: string): SubtitleSegment[] {
@@ -75,6 +95,7 @@ function parseXml(raw: string, lang: string): SubtitleSegment[] {
   // 真實 YouTube 默認返回此格式（我們已改為請求 fmt=json3，此處為兜底）。
   const timedtextRoot = doc.getElementsByTagName('timedtext')[0];
   if (timedtextRoot && timedtextRoot.getElementsByTagName('p').length > 0) {
+    diagLog('capture', 'parseXml: detected srv3 format (timedtext>p, t/d 為毫秒)');
     return parseSrv3(timedtextRoot, lang);
   }
   // 傳統格式：<transcript><text start=".." dur="..">text</text></transcript>
@@ -93,6 +114,12 @@ function parseXml(raw: string, lang: string): SubtitleSegment[] {
   }
   const nodes = transcribe.children;
   const segments: SubtitleSegment[] = [];
+  diagLog(
+    'capture',
+    'parseXml: legacy format (transcript/text, start/dur 為秒→×1000), root:',
+    doc.documentElement?.tagName,
+    'nodes:', nodes.length
+  );
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (node.tagName !== 'text') continue;
@@ -104,6 +131,7 @@ function parseXml(raw: string, lang: string): SubtitleSegment[] {
       toSegment(String(i), Math.round(start * 1000), Math.round((start + dur) * 1000), text, lang)
     );
   }
+  logSegmentTimespan('parseXml(legacy)', segments);
   return segments;
 }
 
@@ -122,6 +150,7 @@ function parseSrv3(root: Element, lang: string): SubtitleSegment[] {
       toSegment(String(i), Math.round(start), Math.round(start + dur), text, lang)
     );
   }
+  logSegmentTimespan('parseXml(srv3)', segments);
   return segments;
 }
 
@@ -155,6 +184,39 @@ function toSegment(
     provisional: false,
     revision: 0,
   };
+}
+
+/**
+ * 診斷輔助：輸出解析結果的時間戳範圍與時長分佈，用於判斷時間戳單位是否異常。
+ * - 若 maxStart 很小（如 < 10_000）而段數多，可能單位是「秒」被當成毫秒（×1000 缺失）。
+ * - 若中位時長 < 50ms，說明 dur 單位/解析可能異常（正常字幕段時長應為秒級）。
+ */
+function logSegmentTimespan(source: string, segments: SubtitleSegment[]): void {
+  if (segments.length === 0) {
+    diagLog('capture', `${source}: 0 segments parsed`);
+    return;
+  }
+  const starts = segments.map((s) => s.start);
+  const ends = segments.map((s) => s.end);
+  const durations = segments.map((s) => s.end - s.start);
+  const minStart = Math.min(...starts);
+  const maxStart = Math.max(...starts);
+  const maxEnd = Math.max(...ends);
+  const sortedDur = [...durations].sort((a, b) => a - b);
+  const medianDur = sortedDur[Math.floor(sortedDur.length / 2)];
+  // 診斷：時間戳範圍與中位時長。maxStart < 10s 但段數多 → 單位可能為秒被當毫秒（×1000 缺失）。
+  const unitSuspicion =
+    segments.length >= 50 && maxStart < 10_000
+      ? ' — SUSPECT: timestamps may be seconds treated as ms (missing ×1000)'
+      : '';
+  diagLog(
+    'capture',
+    `${source}: segments:`, segments.length,
+    'start range:', minStart, '-', maxStart,
+    'max end:', maxEnd,
+    'median dur:', medianDur, 'ms',
+    unitSuspicion
+  );
 }
 
 /** 由已解析的段構建 CaptionTrack 實現（靜態段，供測試/緩存用）。 */
