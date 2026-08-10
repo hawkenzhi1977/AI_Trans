@@ -712,4 +712,62 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
 
     window.history.replaceState({}, '', '/');
   });
+
+  it('[M2-22] lastCapture 已有當前視頻數據時，跳過字幕模組驅動（避免 stale DOM 軌覆蓋正確請求）', async () => {
+    // 當前頁面 URL 為新視頻（v=newVideo）。
+    window.history.replaceState({}, '', '/watch?v=newVideo');
+
+    // 播放器 API 返回空（模擬真實場景：SPA 導航後 getOption 持續返回空陣列）。
+    const { setOption } = mountMockPlayer([]);
+
+    // DOM 中注入舊視頻的 ytInitialPlayerResponse（videoId 不匹配，但 tracks 的 baseUrl 指向舊視頻）。
+    const stalePlayerResponseData = {
+      videoDetails: { videoId: 'oldVideo' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [
+            {
+              languageCode: 'en',
+              kind: 'asr',
+              baseUrl: 'https://www.youtube.com/api/timedtext?v=oldVideo&lang=en',
+            },
+          ],
+        },
+      },
+    };
+    const script = document.createElement('script');
+    script.id = 'ytInitialPlayerResponse';
+    script.textContent = `var ytInitialPlayerResponse = ${JSON.stringify(stalePlayerResponseData)};`;
+    document.body.appendChild(script);
+
+    await loadInterceptor();
+
+    // 先捕獲一個當前視頻的 timedtext 響應（lastCapture 被設置為 newVideo）。
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=newVideo&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(xhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+
+    // 驗證 lastCapture 已包含當前視頻數據。
+    const lastCapture = Reflect.get(globalThis, '__aiTransTimedtextLastCapture') as { videoId?: string };
+    expect(lastCapture).not.toBe(null);
+    expect(lastCapture.videoId).toBe('newVideo');
+
+    setOption.mockClear();
+
+    // 推進計時器觸發 retry（ensureCaptionModuleLoaded 被調用）。
+    vi.advanceTimersByTime(1_000);
+
+    // 關鍵驗證：setOption 不應被調用（因為 lastCapture 已有當前視頻數據，跳過驅動）。
+    // 這避免了 stale DOM 軌（baseUrl 指向 oldVideo）覆蓋播放器的正確請求。
+    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', expect.any(Object));
+
+    window.history.replaceState({}, '', '/');
+  });
 });

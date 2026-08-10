@@ -3,7 +3,7 @@
 > 版本：v0.1（草案）
 > 狀態：系統測試設計 — 全閉環自動化測試、測試用例
 > 關聯文檔：`doc/requirements-design.md`、`doc/architecture-design.md`
-> 最後更新：2026-08-10（**M2-22 治理回填**：新增 TC-M2-10 視頻切換 URL 輪詢偵測（M2-21，pushState patch 被覆蓋兜底 + URL 輪詢 1.5s 檢查 `v` 參數變化）+ TC-M2-11 視頻切換 SPA 導航字幕修復（M2-22，videoId 驗證 + 播放器 API fallback + `ai-trans:video-changed` 事件清空 stale 捕獲 + 攔截器 videoId 驗證））；先前：M2-18 治理回填 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列）；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 101 + integration 130 + contract 11 = 242
+> 最後更新：2026-08-10（**M2-22 補充治理回填**：新增 TC-M2-12 stale DOM 軌列表覆蓋播放器正確請求修復（M2-22 補充，`ensureCaptionModuleLoaded()` 開頭 early return：若 `lastCapture.videoId === currentVideoId` 則跳過驅動，避免 stale DOM 軌覆蓋播放器正確請求））；先前：M2-22 治理回填 TC-M2-10 視頻切換 URL 輪詢偵測（M2-21，pushState patch 被覆蓋兜底 + URL 輪詢 1.5s 檢查 `v` 參數變化）+ TC-M2-11 視頻切換 SPA 導航字幕修復（M2-22，videoId 驗證 + 播放器 API fallback + `ai-trans:video-changed` 事件清空 stale 捕獲 + 攔截器 videoId 驗證）；先前：M2-18 治理回填 TC-M2-09 ASR warmup 模塊解析 + 字幕攔截器 DOM 解析（M2-17/M2-18，esbuild 打包 `@huggingface/transformers` 進 IIFE + `getCaptionTracksFromPlayerResponse()` DOM 首要來源兜底 `getOption` 空陣列）；先前：回填治理缺口 TC-F26 LLM 直接 fetch 架構（F-04/M1-48）、TC-F27 interceptor arraybuffer 支援 + 渲染日誌降壓（F-01/F-11/M1-50）、TC-F09 字幕樣式已實裝（F-09/M1-49）、TC-F24 調試日誌門控（F-12/M1-51）、TC-F25 字幕翻譯分塊/快取/重試（F-13/M1-52/M1-53）；先前：TC-F11~F23；測試合計 unit 101 + integration 131 + contract 11 = 243
 
 ---
 
@@ -615,6 +615,13 @@ jobs:
 - 預期：A 中 videoId 不匹配時記錄診斷並嘗試 fallback；B 中播放器 API 返回當前視頻字幕軌；C 中攔截器收到 `ai-trans:video-changed` 事件後清空 stale 捕獲並重新驅動字幕模組；D 中 stale 捕獲被拒絕；E 中 stale DOM 字幕軌被拒絕。
 - 落點：集成 `test/integration/platform-adapter.test.ts`（+3：videoId 不匹配時 fallback 播放器 API 返回當前視頻軌 / videoId 不匹配且無播放器 API 返回空並記錄診斷 / videoId 匹配時正常返回不觸發 fallback）+ `test/integration/yt-timedtext-interceptor.test.ts`（+2：`ai-trans:video-changed` 事件清空 `lastCapture` 並重新驅動字幕模組 / videoId 不匹配時 DOM 字幕軌被拒絕 fallback 播放器 API）。
 
+#### TC-M2-12 stale DOM 軌列表覆蓋播放器正確請求修復（對應 M2-22 補充）
+- 步驟：
+  - A（lastCapture 已有當前視頻數據時跳過驅動）：`ensureCaptionModuleLoaded()` 開頭新增 early return——若 `lastCapture.videoId === currentVideoId`，表示播放器已自行發出正確的 timedtext 請求，直接標記 `captionModuleDriven = true` 並返回。
+  - B（避免 stale DOM 軌覆蓋）：重試定時器 `startCaptionModuleDriver()` 持續調用 `ensureCaptionModuleLoaded()`，當 DOM `ytInitialPlayerResponse` 被部分更新（或正則匹配到其他 script 塊）時，`getCaptionTracksFromPlayerResponse()` 可能返回 tracks——但 `baseUrl` 仍指向舊視頻。修復後因 `lastCapture` 已匹配當前視頻，跳過驅動，避免 `setOption('captions', 'track', staleTrack)` 覆蓋播放器自身的正確 timedtext 請求。
+- 預期：A 中 `lastCapture` 已包含當前視頻數據時，retry timer 觸發但 `setOption` 不被調用；B 中 stale DOM 軌列表不會被用來驅動播放器請求舊視頻字幕。
+- 落點：集成 `test/integration/yt-timedtext-interceptor.test.ts`（+1：lastCapture 已有當前視頻數據時，retry timer 觸發但 `setOption` 不被調用，斷言 `expect(setOption).not.toHaveBeenCalledWith('captions', 'track', expect.any(Object))`）。
+
 #### TC-F08 預緩衝提前處理與降級（對應 F-08）
 - 前置：可預取音頻的 mock 場景。
 - 步驟 A：預取可用 → 走二級 look-ahead。
@@ -733,6 +740,7 @@ jobs:
 | TC-M2-09 | M2-17/M2-18 | 集成（已實裝） |
 | TC-M2-10 | M2-21 | 集成（已實裝） |
 | TC-M2-11 | M2-22 | 集成（已實裝） |
+| TC-M2-12 | M2-22 補充 | 集成（已實裝） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

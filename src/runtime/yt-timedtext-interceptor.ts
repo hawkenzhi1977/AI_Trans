@@ -261,6 +261,17 @@ function getCaptionTracksFromPlayerResponse(): YtCaptionTrack[] | undefined {
  */
 function ensureCaptionModuleLoaded(): void {
   if (captionModuleDriven) return;
+  // M2-22 修復：若 lastCapture 已有當前視頻的數據，表示播放器已自行發出正確的 timedtext 請求，
+  // 無需再驅動字幕模組（避免使用 stale DOM 軌列表驅動播放器請求舊視頻字幕）。
+  if (lastCapture) {
+    const captureVid = lastCapture.videoId ?? '';
+    const currentVid = extractVideoId(globalThis.location?.href ?? '');
+    if (currentVid && captureVid === currentVid) {
+      diagLog('interceptor', 'lastCapture already has current video data (videoId:', currentVid, '), skipping caption module drive');
+      captionModuleDriven = true;
+      return;
+    }
+  }
   const player = document.getElementById('movie_player') as unknown as {
     loadModule?: (m: string) => void;
     getOption?: (m: string, k: string) => unknown;

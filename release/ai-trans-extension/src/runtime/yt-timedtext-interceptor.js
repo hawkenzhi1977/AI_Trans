@@ -142,6 +142,15 @@
   }
   function ensureCaptionModuleLoaded() {
     if (captionModuleDriven) return;
+    if (lastCapture) {
+      const captureVid = lastCapture.videoId ?? "";
+      const currentVid = extractVideoId(globalThis.location?.href ?? "");
+      if (currentVid && captureVid === currentVid) {
+        diagLog("interceptor", "lastCapture already has current video data (videoId:", currentVid, "), skipping caption module drive");
+        captionModuleDriven = true;
+        return;
+      }
+    }
     const player = document.getElementById("movie_player");
     if (!player) {
       diagLog("interceptor", "Player element not found");
