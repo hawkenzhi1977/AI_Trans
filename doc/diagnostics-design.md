@@ -393,6 +393,16 @@
 - **開發者響應**: `ensureLlmCacheInvalidationHook` 以 once-guard 防重複註冊（§5.4）;非擴充環境無 `chrome.storage` 時 try/catch 守護後無操作
 - **代碼落點**: src/adapters/translation/llm-translation.ts（`LruCache` / `invalidateLlmCache` / `ensureLlmCacheInvalidationHook`）
 
+### 4.12 LLM 輸出不完整/重複診斷（M1-55）
+
+- **診斷碼**: `console.warn` 麵包屑（§5.6 不靜默，不落 recordDiagnostic）
+- **用戶可見消息**: 無直接消息；缺失的段顯示原文（`translatedText=sourceText`），雙語模式下可能出現「英文+英文」；重複翻譯導致英中不同步
+- **觸發條件**: **(a) 不完整**——`translateChunkOnce()` 解析 LLM 響應後 `map.size < chunk.length`（LLM 返回行數少於輸入段數）；**(b) 重複**——相同翻譯出現在多個 index（`valueCounts` 有重複值）
+- **根因**: **(a) 不完整**——LLM 服務端 `max_tokens` 限制導致輸出截斷（M1-55 已設 `max_tokens: 4096` 緩解）；模型不願/無法一次性翻譯全部行（跳行/省略）；網絡中斷導致響應不完整；**(b) 重複**——小模型在長輸出中「迷失」，對不同 index 輸出相同翻譯，導致後續所有翻譯與原文錯位。**M1-55 修復背景**：`CHUNK_SIZE=60` 過大時本地 LLM 日誌顯示 60 段僅返回 30-34 行翻譯，且對 index 31, 43, 44, 45 等都輸出相同翻譯「>> 但結果是以色列總理並不滿意該計劃」，導致英中不同步。修復：分塊縮小至 15 + 明確 `max_tokens` + Prompt 改用 few-shot 示例格式（小模型對示例遵循度遠高於文字說明）
+- **用戶響應**: 若大量段顯示原文或英中不同步，檢查本地模型是否支援長輸出；可嘗試換用更快的模型或調整 `CHUNK_SIZE`
+- **開發者響應**: 觀察 `console.warn` 的 `expected N lines, got M (missing K)` 判斷截斷程度；觀察 `duplicate translations detected — N values appear multiple times` 判斷重複程度；若頻繁出現且 `max_tokens` 已設大，可能是模型能力問題而非配置問題
+- **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkOnce` 解析後 `map.size < chunk.length` 判斷 + `valueCounts` 重複檢測 + `console.warn` 輸出）
+
 
 ---
 

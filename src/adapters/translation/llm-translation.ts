@@ -33,8 +33,8 @@ export class LLMRequestError extends Error {
   }
 }
 
-/** 分塊大小（段數）：431 段 ≈ 8 塊，單塊 LLM 輸出可控制在數十秒內。 */
-export const CHUNK_SIZE = 60;
+/** 分塊大小（段數）：過大會導致 LLM 輸出截斷或重複翻譯（小模型能力不足），過小增加請求數。15 段為保守值。 */
+export const CHUNK_SIZE = 15;
 
 /** 瞬態失敗重試次數上限（首次 + 重試共 1+2 次）。 */
 const MAX_RETRIES = 2;
@@ -249,13 +249,16 @@ export class LLMTranslationProvider implements TranslationProvider {
     const body = {
       model: this.opts.model,
       temperature: 0.2,
+      max_tokens: 4096,
       messages: [
         {
           role: 'system',
           content:
-            'You are a subtitle translator. Translate each line to ' +
-            `${req.targetLang}. Keep the segment IDs as prefixes. Reply as "${req.targetLang}" text lines with the same IDs. ` +
-            'Output one translated line per input line, format: "ID<TAB>translation".',
+            `Translate each line to ${req.targetLang}. Format: "index\\ttranslation"\n` +
+            `0\tHello world\n` +
+            `0\t你好世界\n` +
+            `1\tGood morning\n` +
+            `1\t早上好`,
         },
         ...(req.context?.length
           ? [{ role: 'user', content: `Context: ${req.context.join('\n')}` }]
@@ -322,6 +325,28 @@ export class LLMTranslationProvider implements TranslationProvider {
       if (m) map.set(m[1], m[2]);
     }
     diagLog('llm', 'parsed map size =', map.size, ', map =', Object.fromEntries(map));
+    // §5.6：LLM 輸出不完整（跳過行/截斷）時必須留痕——缺失的段會回退顯示原文，
+    // 雙語模式下用戶會看到「英文+英文」，卻無從得知是 LLM 輸出被截斷。
+    if (map.size < chunk.length) {
+      const missing = chunk.length - map.size;
+      console.warn(
+        `[AI_Trans:diag] LLM: incomplete translation — expected ${chunk.length} lines, got ${map.size} (missing ${missing}). ` +
+        `Some segments will show original text as translation.`
+      );
+    }
+    // §5.6：LLM 重複翻譯檢測——小模型可能在長輸出中「迷失」，對不同 index 輸出相同翻譯，
+    // 導致後續所有翻譯與原文錯位（英中不同步）。必須留痕讓用戶/開發者能定位問題。
+    const valueCounts = new Map<string, number>();
+    for (const v of map.values()) {
+      valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
+    }
+    const duplicates = [...valueCounts.entries()].filter(([, c]) => c > 1);
+    if (duplicates.length > 0) {
+      console.warn(
+        `[AI_Trans:diag] LLM: duplicate translations detected — ${duplicates.length} values appear multiple times. ` +
+        `This may cause English-Chinese mismatch. Duplicates: ${duplicates.map(([v, c]) => `"${v.substring(0, 30)}..."×${c}`).join(', ')}`
+      );
+    }
     return map;
   }
 

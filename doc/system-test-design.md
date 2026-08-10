@@ -467,11 +467,11 @@ jobs:
 - 預期：調試日誌按分類可控開關，普通用戶零噪音；開發者按需開啟定位；錯誤/降級信息始終可見（§5.6 不靜默）。
 - 落點：單元 `test/unit/debug-log.test.ts`（+7）；`test/unit/config.test.ts`（DEFAULT_CONFIG 含 `debugLog`）、`test/unit/config-store.test.ts`（merge 保留 debugLog）、`test/integration/options.test.ts`（HTML 模板含調試日誌分區）。
 
-#### TC-F25 字幕翻譯分塊/快取/重試（對應 F-13/M1-52，已實裝；M1-53 兩階段超時）
-- 前置：`LLMTranslationProvider` 機制——`CHUNK_SIZE=60` 分塊、`translateStream` 漸進 emit 累計全量、LRU 快取（key=`model|targetLang|djb2Hash(塊源文)`，上限 100）、瞬態失敗重試 ≤2 次（500ms→1500ms 退避）、**兩階段超時**（M1-53：headers `timeoutMs` 默認 30s + body `bodyTimeoutMs` 默認 `BODY_TIMEOUT_MS=300_000`，共用同一 `AbortController`）。模塊級快取跨測試共享，測試須 `beforeEach/afterEach` 調 `invalidateLlmCache()` 防命中污染。
+#### TC-F25 字幕翻譯分塊/快取/重試（對應 F-13/M1-52，已實裝；M1-53 兩階段超時；M1-55 不完整/重複診斷）
+- 前置：`LLMTranslationProvider` 機制——`CHUNK_SIZE=15` 分塊（M1-55 從 60 降至 15 避免 LLM 輸出截斷/重複）、`translateStream` 漸進 emit 累計全量、LRU 快取（key=`model|targetLang|djb2Hash(塊源文)`，上限 100）、瞬態失敗重試 ≤2 次（500ms→1500ms 退避）、**兩階段超時**（M1-53：headers `timeoutMs` 默認 30s + body `bodyTimeoutMs` 默認 `BODY_TIMEOUT_MS=300_000`，共用同一 `AbortController`）、**max_tokens=4096**（M1-55 明確設置避免服務端默認限制）、**不完整/重複診斷**（M1-55：`map.size < chunk.length` 時 `console.warn` 輸出不完整警告；相同翻譯出現在多個 index 時輸出重複警告）、**Prompt few-shot 簡化**（M1-55：用示例格式代替冗長文字說明，小模型遵循度更高）。模塊級快取跨測試共享，測試須 `beforeEach/afterEach` 調 `invalidateLlmCache()` 防命中污染。
 - 步驟：
-  - A（分塊邊界）：130 段 → `chunkSegments` 為 [60,60,10] 三塊；恰 60 段 → 一塊；空輸入 → `[[]]`。
-  - B（漸進 emit）：130 段 `translateStream` → emit 序列長度遞增 [60,120,130]（每塊完成 emit 累計全量）。
+  - A（分塊邊界）：40 段 → `chunkSegments` 為 [15,15,10] 三塊（M1-55 更新：原 130 段 → 9 塊）；恰 15 段 → 一塊；空輸入 → `[[]]`。
+  - B（漸進 emit）：130 段 `translateStream` → emit 序列長度遞增 [15,30,45,60,75,90,105,120,130]（M1-55 更新：原 [60,120,130]；每塊完成 emit 累計全量）。
   - C（首塊 ready / 後續 updated）：`NativeCaptionStrategy` 走 `translateStream` 時首個 emit 映射 `segments-ready`、後續映射 `segments-updated`；`stop()` 後不再 emit。
   - D（快取命中）：同 key 二次請求零 fetch（mock fetch 計數不增）；換模型/換目標語言 → miss。
   - E（LRU 逐出）：110 個不同 key 依序寫入 → 快取大小收斂至 100（最舊被淘汰）。
@@ -482,8 +482,10 @@ jobs:
   - I（配置變更失效）：`ensureLlmCacheInvalidationHook` 註冊 once-guard；`invalidateLlmCache()` 全量清空（重播零請求→清空後重新請求）。
   - J（**M1-53 headers 快 + body 慢回歸**）：headers 立即返回 + body 延遲（<bodyTimeoutMs）生成 → **不被 headers 超時誤殺**，單次請求成功翻譯、`degraded=false`。此為本次修復核心回歸（本地 LLM 11ms 回 headers、body 生成 >30s 的場景）。
   - K（**M1-53 常數**）：`BODY_TIMEOUT_MS = 300_000`（5 分鐘長輸出窗口）。
-- 預期：長視頻首塊秒級可見、後續增量替換；重播/切配置免重複請求；瞬態抖動自動恢復、單塊失敗原文兜底不阻塞；永久失敗立即降級可診斷；**本地 LLM 慢生成不再被 30s headers 超時誤殺**。
-- 落點：單元 `test/unit/llm-translation.test.ts`（29 用例，含 M1-53 兩階段超時 H/H'/J/K）+ `test/unit/native-caption-strategy.test.ts`（+3 流式）。
+  - L（**M1-55 max_tokens**）：請求 body 含 `max_tokens: 4096`（斷言 JSON.parse(body).max_tokens === 4096）。
+  - M（**M1-55 不完整/重複診斷**）：LLM 返回行數少於輸入段數（如 3 段輸入僅返回 1 行翻譯）→ `console.warn` 輸出含 `incomplete translation`；缺失段回退原文（`translatedText=sourceText`）。相同翻譯出現在多個 index → `console.warn` 輸出含 `duplicate translations detected`。完整翻譯時不觸發 warn。
+- 預期：長視頻首塊秒級可見、後續增量替換；重播/切配置免重複請求；瞬態抖動自動恢復、單塊失敗原文兜底不阻塞；永久失敗立即降級可診斷；**本地 LLM 慢生成不再被 30s headers 超時誤殺**；**LLM 輸出不完整或重複時有明確診斷而非靜默顯示原文**。
+- 落點：單元 `test/unit/llm-translation.test.ts`（33 用例，含 M1-53 兩階段超時 H/H'/J/K + M1-55 max_tokens L + 不完整/重複診斷 M）+ `test/unit/native-caption-strategy.test.ts`（+3 流式）。
 
 #### TC-F12 Popup「測試連接」按鈕（對應 F-11，已實裝）
 - 前置：`connection-test.ts`（`testConnection`）注入 mock fetch；配置為 local/cloud-llm 引擎。

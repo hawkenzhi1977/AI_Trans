@@ -94,6 +94,23 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
     });
   });
 
+  it('請求 body 包含 max_tokens=4096（避免 LLM 輸出截斷）', async () => {
+    const fetchMock = vi.fn(async () => okResponse(llmBody));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+    });
+
+    await provider.translate(req());
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(String((init as RequestInit).body));
+    expect(body.max_tokens).toBe(4096);
+  });
+
   it('[M1-52] HTTP 5xx 屬瞬態：重試耗盡後塊原文兜底（不阻塞字幕）', async () => {
     // 500 為瞬態失敗——重試 MAX_RETRIES 次仍失敗 → 該塊回退原文（translatedText=sourceText），
     // 不再直接拋錯（塊級兜底不中斷其餘塊）。用 fake timers 跳過退避延遲。
@@ -400,6 +417,94 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
   });
 });
 
+describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('LLM 返回行數少於輸入段數時輸出 warn 診斷', async () => {
+    // LLM 只返回 1 行翻譯，但輸入有 3 段 → 應觸發 incomplete warning。
+    const incompleteBody = {
+      choices: [{ message: { content: '0\t譯文零' } }],
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => okResponse(incompleteBody));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    // 缺失的段回退為原文。
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('line-1');
+    expect(result.segments[2].translatedText).toBe('line-2');
+    // §5.6：不完整輸出必須留痕。
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('incomplete translation')
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('LLM 返回完整行數時不輸出 warn', async () => {
+    const completeBody = {
+      choices: [{ message: { content: '0\t譯文零\n1\t譯文一' } }],
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => okResponse(completeBody));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+    });
+
+    await provider.translate(req());
+
+    // 完整翻譯不應觸發 warning。
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('LLM 重複翻譯不同 index 時輸出 warn 診斷', async () => {
+    // LLM 對 index 0, 1, 2 都返回相同翻譯 → 應觸發 duplicate warning。
+    const duplicateBody = {
+      choices: [{ message: { content: '0\t相同譯文\n1\t相同譯文\n2\t相同譯文' } }],
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => okResponse(duplicateBody));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+    });
+
+    await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    // §5.6：重複翻譯必須留痕（小模型可能在長輸出中迷失）。
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('duplicate translations detected')
+    );
+    warnSpy.mockRestore();
+  });
+});
+
 describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -424,19 +529,19 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   }
 
   describe('chunkSegments 分塊', () => {
-    it('不超過 CHUNK_SIZE=60，保持順序與 id', () => {
-      const segs = Array.from({ length: 130 }, (_, i) => seg(i));
+    it('不超過 CHUNK_SIZE=15，保持順序與 id', () => {
+      const segs = Array.from({ length: 40 }, (_, i) => seg(i));
       const chunks = chunkSegments(segs);
-      expect(chunks).toHaveLength(3); // 60 + 60 + 10
-      expect(chunks[0]).toHaveLength(60);
-      expect(chunks[1]).toHaveLength(60);
+      expect(chunks).toHaveLength(3); // 15 + 15 + 10
+      expect(chunks[0]).toHaveLength(15);
+      expect(chunks[1]).toHaveLength(15);
       expect(chunks[2]).toHaveLength(10);
       expect(chunks[0]![0]!.id).toBe('s0');
-      expect(chunks[2]![9]!.id).toBe('s129');
+      expect(chunks[2]![9]!.id).toBe('s39');
     });
 
-    it('恰好 60 段切為單塊', () => {
-      const segs = Array.from({ length: 60 }, (_, i) => seg(i));
+    it('恰好 15 段切為單塊', () => {
+      const segs = Array.from({ length: 15 }, (_, i) => seg(i));
       expect(chunkSegments(segs)).toHaveLength(1);
     });
 
@@ -524,21 +629,21 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   });
 
   describe('分塊請求與流式漸進', () => {
-    it('130 段分 3 塊：translate 發起 3 次請求並合併', async () => {
+    it('130 段分 9 塊：translate 發起 9 次請求並合併', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
       vi.stubGlobal('fetch', fetchMock);
 
       const provider = makeProvider();
       const many = Array.from({ length: 130 }, (_, i) => seg(i));
       const result = await provider.translate({ segments: many, targetLang: 'zh-Hant' });
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(9);
       expect(result.segments).toHaveLength(130);
-      // 每塊內容是該塊的行（塊 1 為 0..59，塊 2 為 60..119…）。
+      // 每塊內容是該塊的行（塊 1 為 0..14，塊 2 為 15..29…）。
       const contents = contentOf(fetchMock);
       expect(contents[0]).toContain('line-0');
-      expect(contents[0]).toContain('line-59');
-      expect(contents[0]).not.toContain('line-60');
-      expect(contents[1]).toContain('line-60');
+      expect(contents[0]).toContain('line-14');
+      expect(contents[0]).not.toContain('line-15');
+      expect(contents[1]).toContain('line-15');
     });
 
     it('translateStream 每次 emit 都是累計全量（首塊後續漸進）', async () => {
@@ -551,12 +656,12 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
       await provider.translateStream({ segments: many, targetLang: 'zh-Hant' }, (r) =>
         emitted.push(r)
       );
-      // 3 塊 → 3 次 emit；每次長度遞增：60、120、130。
-      expect(emitted).toHaveLength(3);
-      expect(emitted.map((e) => e.segments.length)).toEqual([60, 120, 130]);
+      // 9 塊 → 9 次 emit；每次長度遞增：15、30、45、60、75、90、105、120、130。
+      expect(emitted).toHaveLength(9);
+      expect(emitted.map((e) => e.segments.length)).toEqual([15, 30, 45, 60, 75, 90, 105, 120, 130]);
       // 後次 emit 包含前次內容（累計）。
-      expect(emitted[2]!.segments[0].translatedText).toBe('譯文零');
-      expect(emitted[2]!.segments[129].id).toBe('s129');
+      expect(emitted[8]!.segments[0].translatedText).toBe('譯文零');
+      expect(emitted[8]!.segments[129].id).toBe('s129');
     });
 
     it('translateStream 塊間快取共享：重播時不重新請求', async () => {
@@ -566,10 +671,10 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
       const provider = makeProvider();
       const many = Array.from({ length: 130 }, (_, i) => seg(i));
       await provider.translateStream({ segments: many, targetLang: 'zh-Hant' }, () => {});
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(9);
       // 第二次完全相同請求 → 全命中快取，零請求。
       await provider.translateStream({ segments: many, targetLang: 'zh-Hant' }, () => {});
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(9);
     });
   });
 

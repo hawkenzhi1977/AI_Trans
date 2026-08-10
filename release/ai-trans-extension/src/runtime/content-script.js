@@ -49643,7 +49643,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     status;
     transient;
   };
-  var CHUNK_SIZE = 60;
+  var CHUNK_SIZE = 15;
   var MAX_RETRIES = 2;
   var RETRY_DELAYS_MS = [500, 1500];
   var BODY_TIMEOUT_MS = 3e5;
@@ -49787,10 +49787,15 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const body = {
         model: this.opts.model,
         temperature: 0.2,
+        max_tokens: 4096,
         messages: [
           {
             role: "system",
-            content: `You are a subtitle translator. Translate each line to ${req.targetLang}. Keep the segment IDs as prefixes. Reply as "${req.targetLang}" text lines with the same IDs. Output one translated line per input line, format: "ID<TAB>translation".`
+            content: `Translate each line to ${req.targetLang}. Format: "index\\ttranslation"
+0	Hello world
+0	\u4F60\u597D\u4E16\u754C
+1	Good morning
+1	\u65E9\u4E0A\u597D`
           },
           ...req.context?.length ? [{ role: "user", content: `Context: ${req.context.join("\n")}` }] : [],
           { role: "user", content: lines.join("\n") }
@@ -49839,6 +49844,22 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         if (m) map.set(m[1], m[2]);
       }
       diagLog("llm", "parsed map size =", map.size, ", map =", Object.fromEntries(map));
+      if (map.size < chunk.length) {
+        const missing = chunk.length - map.size;
+        console.warn(
+          `[AI_Trans:diag] LLM: incomplete translation \u2014 expected ${chunk.length} lines, got ${map.size} (missing ${missing}). Some segments will show original text as translation.`
+        );
+      }
+      const valueCounts = /* @__PURE__ */ new Map();
+      for (const v of map.values()) {
+        valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
+      }
+      const duplicates = [...valueCounts.entries()].filter(([, c]) => c > 1);
+      if (duplicates.length > 0) {
+        console.warn(
+          `[AI_Trans:diag] LLM: duplicate translations detected \u2014 ${duplicates.length} values appear multiple times. This may cause English-Chinese mismatch. Duplicates: ${duplicates.map(([v, c]) => `"${v.substring(0, 30)}..."\xD7${c}`).join(", ")}`
+        );
+      }
       return map;
     }
     /** 生成快取 key：model|targetLang|hash(塊源文)。 */
