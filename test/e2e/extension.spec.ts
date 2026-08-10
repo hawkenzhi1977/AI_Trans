@@ -39,7 +39,7 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
   });
 
   test('帶原生字幕頁面：覆蓋層含字幕文本', async ({ page }) => {
-    await page.goto('/with-native-captions.html');
+    await page.goto('/with-native-captions.html?v=abc123');
     await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
 
     // 等待 segments-ready 後渲染器開始有文本（播放時鐘推進才顯示對應時間窗字幕）。
@@ -62,7 +62,7 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     // 驗證：(1) 播放器 XHR 發起的 /timedtext 請求計數 = 1（僅播放器自己發）；
     //        (2) 擴充字幕正常顯示（說明複用了捕獲響應而非自己 fetch——若擴充也 fetch，
     //            計數會 ≥ 2）。
-    await page.goto('/with-native-captions.html');
+    await page.goto('/with-native-captions.html?v=abc123');
 
     // 清零計數，避免前序測試（smoke/其他用例）的 timedtext 請求累計干擾。
     await page.evaluate(() =>

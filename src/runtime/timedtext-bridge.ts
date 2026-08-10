@@ -9,7 +9,7 @@
 // - `stop()`（restart 用）保留 latest 緩存；`dispose()`（真正銷毀）清空。
 //
 // 與內容腳本的生命週期綁定：start 注入並啟動輪詢、stop/dispose 清理（R4 洩漏零容忍）。
-import type { TimedTextCapture } from './yt-timedtext-interceptor';
+import type { TimedTextCapture, CapturedTrackInfo } from './yt-timedtext-interceptor';
 import { diagLog } from '../infrastructure/debug-log';
 
 /** content-script 注入 MAIN world 腳本時使用的 runtime URL（web_accessible_resources 聲明）。 */
@@ -17,6 +17,8 @@ export const INTERCEPTOR_SCRIPT_URL = 'src/runtime/yt-timedtext-interceptor.js';
 
 /** 消息通道常量（與 interceptor 側一致）。 */
 const CAPTURE_EVENT = 'ai-trans:timedtext-capture';
+/** 消息通道常量（M2-22 第三層）：MAIN world 發送的軌道信息。 */
+const TRACK_INFO_EVENT = 'ai-trans:track-info';
 
 /** 輪詢探查間隔（毫秒）：每 2 秒檢查一次播放狀態與捕獲就緒度（M1-43）。 */
 export const POLL_INTERVAL_MS = 2_000;
@@ -34,11 +36,15 @@ const VIDEO_SELECTOR = 'video.html5-main-video, #mock-player video';
  */
 export class TimedTextBridge {
   private latest: TimedTextCapture | null = null;
+  /** M2-22 第三層：MAIN world 發現的軌道信息（content script 無法訪問播放器 API 時的 fallback）。 */
+  private capturedTracks: CapturedTrackInfo[] | null = null;
   private readonly onMessageBound: (event: MessageEvent) => void;
   private injected = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** 等待捕獲的 Promise 解析器隊列（waitForCapture 多路等待）。 */
   private readonly waiters = new Set<() => void>();
+  /** M2-22 第四層：等待軌道信息的 Promise 解析器隊列。 */
+  private readonly trackWaiters = new Set<() => void>();
 
   constructor() {
     // R1：監聽器作回調傳遞前綁定接收者（避免移除時 this 丟失）。
@@ -129,6 +135,55 @@ export class TimedTextBridge {
     this.latest = null;
   }
 
+  /**
+   * M2-22 第三層：獲取 MAIN world 發現的軌道信息。
+   * content script（isolated world）無法訪問 `movie_player.getOption()`，
+   * 當 DOM stale 時使用這些信息作為 fallback。
+   * 返回屬於指定視頻的軌道（無 expectedVideoId 時返回所有）。
+   */
+  getCapturedTracks(expectedVideoId?: string): CapturedTrackInfo[] {
+    if (!this.capturedTracks) return [];
+    if (!expectedVideoId) return this.capturedTracks;
+    return this.capturedTracks.filter((t) => t.videoId === expectedVideoId);
+  }
+
+  /**
+   * M2-22 第四層：等待 MAIN world 發現的軌道信息。
+   * 當 DOM stale 且播放器 API 不可用時，fetchTrackList 需要等待 bridge 收到軌道信息。
+   * 類似 waitForCapture，但等待的是軌道信息而非完整捕獲。
+   */
+  waitForCapturedTracks(timeoutMs: number, expectedVideoId: string): Promise<CapturedTrackInfo[]> {
+    diagLog('bridge', 'waitForCapturedTracks called, timeoutMs:', timeoutMs, 'expectedVideoId:', expectedVideoId);
+    const current = this.getCapturedTracks(expectedVideoId);
+    if (current.length > 0) {
+      diagLog('bridge', 'waitForCapturedTracks: tracks available, returning immediately');
+      return Promise.resolve(current);
+    }
+    return new Promise<CapturedTrackInfo[]>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.trackWaiters.delete(onTrack);
+        diagLog('bridge', 'waitForCapturedTracks: timeout after', timeoutMs, 'ms, returning empty');
+        resolve([]);
+      }, timeoutMs);
+      const onTrack = (): void => {
+        if (settled) return;
+        const tracks = this.getCapturedTracks(expectedVideoId);
+        if (tracks.length === 0) return;
+        settled = true;
+        clearTimeout(timer);
+        this.trackWaiters.delete(onTrack);
+        diagLog('bridge', 'waitForCapturedTracks: tracks received, count:', tracks.length);
+        resolve(tracks);
+      };
+      this.trackWaiters.add(onTrack);
+      // 已註冊後再查一次（消息可能在註冊間隙到達）。
+      if (this.getCapturedTracks(expectedVideoId).length > 0) onTrack();
+    });
+  }
+
   /** 停止監聽與輪詢，但保留 latest 緩存（restart 熱重載時不丟已捕獲響應）。 */
   stop(): void {
     globalThis.removeEventListener('message', this.onMessageBound);
@@ -144,6 +199,8 @@ export class TimedTextBridge {
     this.latest = null;
     for (const w of this.waiters) w();
     this.waiters.clear();
+    for (const w of this.trackWaiters) w();
+    this.trackWaiters.clear();
   }
 
   /** 啟動 2s 輪詢（僅一份；探查播放狀態以維持捕獲通道活性）。 */
@@ -166,6 +223,13 @@ export class TimedTextBridge {
     }
   }
 
+  /** M2-22 第四層：通知所有 waitForCapturedTracks 等待者檢查最新軌道信息。 */
+  private notifyTrackWaiters(): void {
+    if (this.capturedTracks) {
+      for (const w of Array.from(this.trackWaiters)) w();
+    }
+  }
+
   private onMessage(event: MessageEvent): void {
     const data = event.data;
     // R7：外部消息必須容錯——非本擴充消息（__aiTrans 標記）直接忽略。
@@ -176,8 +240,15 @@ export class TimedTextBridge {
       // 取最新（後到的覆蓋先到的；雙軌字幕時 en 軌通常最後到）。
       this.latest = payload;
       this.notifyWaiters();
+    } else if (data.type === TRACK_INFO_EVENT) {
+      // M2-22 第三層：接收 MAIN world 發現的軌道信息。
+      const payload = data.payload as CapturedTrackInfo[];
+      if (!Array.isArray(payload)) return;
+      diagLog('bridge', 'received track info:', payload.length, 'tracks');
+      this.capturedTracks = payload;
+      this.notifyTrackWaiters();
     }
   }
 }
 
-export type { TimedTextCapture };
+export type { TimedTextCapture, CapturedTrackInfo };

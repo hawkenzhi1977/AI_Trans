@@ -160,6 +160,9 @@ class SubtitleController {
     // 非 watch 頁時靜默返回（不發降級事件），保持攔截器與 SPA 監聽存活，
     // 待 SPA 導航後由 onUrlChanged→restart 接管。
     const currentUrl = this.currentUrl();
+    // M2-22 補充：非 watch 頁仍需啟動 URL 輪詢，否則從 /feed/history 等頁面
+    // 導航到視頻頁時無法偵測（pushState patch 可能被 YouTube 覆蓋）。
+    this.startUrlPolling();
     if (!isWatchPage(currentUrl)) {
       return;
     }
@@ -205,8 +208,6 @@ class SubtitleController {
     }
 
     await this.orchestrator.start(currentUrl);
-    // M2-21：啟動 URL 輪詢偵測（兜底機制），確保即使 pushState patch 被覆蓋也能偵測到視頻切換。
-    this.startUrlPolling();
   }
 
   /** 取得當前頁面 URL（M1-47：每次 start/restart 都讀最新 location）。 */
