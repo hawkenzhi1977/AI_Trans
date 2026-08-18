@@ -137,7 +137,12 @@ function emitCapture(
   location: Location
 ): void {
   if (!responseText) {
-    diagLog('interceptor', 'emitCapture: empty response, skipping');
+    // M2-24 補充修復十二：空響應通常是 YouTube pot 防護信號（首次無 pot 請求返回空）。
+    // 不轉發（避免污染 latest），但排程重驅動播放器重發帶 pot 的請求，而非被動等待。
+    emptyResponseCount++;
+    Reflect.set(globalThis, '__aiTransTimedtextEmptyResponses', emptyResponseCount);
+    diagLog('interceptor', 'emitCapture: empty response, skipping (pot re-drive scheduled)');
+    schedulePotRedrive();
     return; // 空響應（無登錄態/無字幕）不轉發，也不更新 lastCapture（重播不發空）。
   }
   captureRequestCount++;
@@ -149,6 +154,9 @@ function emitCapture(
     videoId: extractVideoId(url),
   };
   diagLog('interceptor', 'emitCapture: success, captureRequestCount:', captureRequestCount, 'videoId:', capture.videoId);
+  // M2-24 補充修復十二：成功捕獲後重置 pot 重驅動，並排程復位抑制原生字幕（避免雙重顯示）。
+  resetPotRedrive();
+  scheduleSuppressNative();
   // M1-46：更新 lastCapture 供重播，並更新調試輔助全局變量。
   lastCapture = capture;
   Reflect.set(globalThis, '__aiTransTimedtextRequests', captureRequestCount);
@@ -340,6 +348,130 @@ function getCaptionTracksFromPlayerResponse(): YtCaptionTrack[] | undefined {
  * 播放器 API（loadModule/getOption/setOption）未文件化且版本多變，全程 try/catch，
  * 失敗不致命（僅回退到原捕獲路徑）。
  */
+
+/** 播放器字幕 API 的最小接口（未文件化，取用到的欄位；全程 try/catch 容錯）。 */
+interface CaptionPlayer {
+  loadModule?: (m: string) => void;
+  getOption?: (m: string, k: string) => unknown;
+  setOption?: (m: string, k: string, v: unknown) => void;
+}
+
+/** 取播放器元素（字幕模組驅動 / pot 重驅動 / 原生字幕抑制共用）。 */
+function getCaptionPlayer(): CaptionPlayer | null {
+  return document.getElementById('movie_player') as CaptionPlayer | null;
+}
+
+// ── M2-24 補充修復十二：空響應（pot 防護）重驅動 ──
+// 真實環境實測：播放器先發無 pot 的 timedtext 請求 → YouTube 返回空 body（length:0,
+// text/html）→ 攔截器 skip；播放器**稍後**才內部用 pot 重試。舊實作固定 3 秒復位
+// `setOption('captions','track',{})` 可能打斷尚未完成的 pot 重試鏈 → 播放器不再發
+// 第二次請求 → waitForCapture(15s) 超時 → 直接 fetch（無 pot）空 body → native 全鏈失敗。
+// 修復：空響應視為「需要 pot」的信號，排程重驅動（切換軌 off→on）逼播放器重發帶 pot
+// 的請求；復位改為「成功捕獲後抑制原生字幕」+ 10 秒截止，不再用固定 3 秒冒險打斷重試。
+const POT_REDRIVE_DELAY_MS = 2_000;
+const MAX_POT_REDRIVE_ATTEMPTS = 6;
+/** 空響應累計計數（調試輔助：pot 防護命中次數）。 */
+let emptyResponseCount = 0;
+/** pot 重驅動已執行的嘗試次數。 */
+let potRedriveAttempts = 0;
+let potRedriveTimer: ReturnType<typeof setTimeout> | null = null;
+/** 捕獲成功後的復位計時器（抑制原生字幕）。 */
+let suppressNativeTimer: ReturnType<typeof setTimeout> | null = null;
+/** 捕獲始終失敗時的 10 秒截止復位計時器。 */
+let suppressDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * 排程一次 pot 重驅動（已在途不疊加；達上限停止）。
+ * 由 emitCapture 的空響應分支觸發。
+ */
+function schedulePotRedrive(): void {
+  if (potRedriveTimer !== null) return; // 已有排程，避免疊加。
+  if (potRedriveAttempts >= MAX_POT_REDRIVE_ATTEMPTS) {
+    diagLog('interceptor', 'pot re-drive exhausted after', potRedriveAttempts, 'attempts');
+    return;
+  }
+  potRedriveAttempts += 1;
+  Reflect.set(globalThis, '__aiTransPotRedriveAttempts', potRedriveAttempts);
+  diagLog('interceptor', 'pot re-drive scheduled, attempt:', potRedriveAttempts);
+  potRedriveTimer = setTimeout(() => {
+    potRedriveTimer = null;
+    redrivePlayerCaptions();
+  }, POT_REDRIVE_DELAY_MS);
+}
+
+/** 切換字幕軌 off→on，強制播放器重新拉取 timedtext（YouTube 對重複 setOption 可能 no-op）。 */
+function redrivePlayerCaptions(): void {
+  diagLog('interceptor', 'pot re-drive executing, attempt:', potRedriveAttempts);
+  const player = getCaptionPlayer();
+  if (!player || typeof player.setOption !== 'function') {
+    // 播放器暫缺/未就緒：延後再試（仍受 MAX_POT_REDRIVE_ATTEMPTS 上限約束）。
+    schedulePotRedrive();
+    return;
+  }
+  captionModuleDriven = false;
+  try {
+    player.setOption('captions', 'track', {});
+  } catch {
+    /* 復位失敗無害 */
+  }
+  // 延遲一小段再重新選軌，確保播放器感知軌切換而重發請求。
+  setTimeout(() => {
+    try {
+      ensureCaptionModuleLoaded();
+    } catch {
+      /* 重驅動失敗不致命：原有捕獲/重播路徑仍在。 */
+    }
+  }, 150);
+}
+
+/** 重置重驅動計數並清除相關計時器（成功捕獲 / 視頻切換時調用）。 */
+function resetPotRedrive(): void {
+  potRedriveAttempts = 0;
+  Reflect.set(globalThis, '__aiTransPotRedriveAttempts', 0);
+  if (potRedriveTimer !== null) {
+    clearTimeout(potRedriveTimer);
+    potRedriveTimer = null;
+  }
+  if (suppressNativeTimer !== null) {
+    clearTimeout(suppressNativeTimer);
+    suppressNativeTimer = null;
+  }
+  if (suppressDeadlineTimer !== null) {
+    clearTimeout(suppressDeadlineTimer);
+    suppressDeadlineTimer = null;
+  }
+}
+
+/** 捕獲成功後復位字幕軌（抑制原生字幕與覆蓋層重複），捕獲數據已到手，可安全隱藏。 */
+function scheduleSuppressNative(): void {
+  if (suppressNativeTimer !== null) return;
+  suppressNativeTimer = setTimeout(() => {
+    suppressNativeTimer = null;
+    const player = getCaptionPlayer();
+    if (!player || typeof player.setOption !== 'function') return;
+    try {
+      player.setOption('captions', 'track', {});
+      diagLog('interceptor', 'Caption track reset after successful capture to suppress native rendering');
+    } catch {
+      /* 復位失敗無害：原生字幕可能短暫顯示，不影響已捕獲的字幕。 */
+    }
+  }, 800);
+}
+
+/** 捕獲始終失敗時的截止復位（避免原生字幕永久顯示）；成功捕獲會由 resetPotRedrive 取消。 */
+function scheduleSuppressDeadline(player: CaptionPlayer): void {
+  if (suppressDeadlineTimer !== null) return;
+  suppressDeadlineTimer = setTimeout(() => {
+    suppressDeadlineTimer = null;
+    try {
+      player.setOption!('captions', 'track', {});
+      diagLog('interceptor', 'Caption track reset (10s deadline) to suppress native rendering');
+    } catch {
+      /* 復位失敗無害 */
+    }
+  }, 10_000);
+}
+
 function ensureCaptionModuleLoaded(): void {
   if (captionModuleDriven) return;
   // M2-22 修復：若 lastCapture 已有當前視頻的數據，表示播放器已自行發出正確的 timedtext 請求，
@@ -353,12 +485,8 @@ function ensureCaptionModuleLoaded(): void {
       return;
     }
   }
-  const player = document.getElementById('movie_player') as unknown as {
-    loadModule?: (m: string) => void;
-    getOption?: (m: string, k: string) => unknown;
-    setOption?: (m: string, k: string, v: unknown) => void;
-  } | null;
-  
+  const player = getCaptionPlayer();
+
   // 診斷日誌
   if (!player) {
     diagLog('interceptor', 'Player element not found');
@@ -413,12 +541,8 @@ function ensureCaptionModuleLoaded(): void {
         player.setOption('captions', 'track', syntheticTrack);
         captionModuleDriven = true;
         diagLog('interceptor', 'Caption module driven with synthetic track for videoId:', currentVid);
-        // 延遲復位抑制原生字幕。
-        setTimeout(() => {
-          try {
-            player.setOption!('captions', 'track', {});
-          } catch { /* 復位失敗無害 */ }
-        }, 3000);
+        // 捕獲失敗時 10 秒截止復位（M2-24 補充修復十二：不再用固定 3 秒打斷 pot 重試）。
+        scheduleSuppressDeadline(player);
         return;
       } catch (err) {
         diagLog('interceptor', 'setOption with synthetic track failed:', err);
@@ -442,16 +566,10 @@ function ensureCaptionModuleLoaded(): void {
     player.setOption('captions', 'track', track);
     captionModuleDriven = true;
     diagLog('interceptor', 'Caption module driven successfully, selected track:', track);
-    // M1-48：增加延遲到 3000ms，確保 timedtext 請求完成後再復位（避免取消請求）。
-    // 原生字幕可能短暫顯示，但捕獲成功後可接受。
-    setTimeout(() => {
-      try {
-        player.setOption!('captions', 'track', {});
-        diagLog('interceptor', 'Caption track reset to suppress native rendering');
-      } catch {
-        /* 復位失敗無害：原生字幕可能短暫顯示，不影響捕獲。 */
-      }
-    }, 3000);
+    // M2-24 補充修復十二：不再用固定 3 秒復位（可能打斷播放器尚未完成的 pot 重試），
+    // 改為「成功捕獲後抑制原生字幕」+ 10 秒截止復位。原生字幕可能短暫顯示，
+    // 但捕獲成功後（scheduleSuppressNative）即被隱藏，可接受。
+    scheduleSuppressDeadline(player);
   } catch (err) {
     diagLog('interceptor', 'setOption error:', err);
     // 選軌失敗：不標記成功，重試定時器會再試。
@@ -474,6 +592,8 @@ function startCaptionModuleDriver(): void {
 
 /** SPA 換視頻時重置驅動狀態並重新觸發（M1-47）。 */
 function resetAndRedriveCaptionModule(): void {
+  // M2-24 補充修復十二：重置 pot 重驅動計數並清除排程（視頻切換/熱重啟時重新開始）。
+  resetPotRedrive();
   captionModuleDriven = false;
   // 立即嘗試一次（處理播放器已就緒的情況）
   ensureCaptionModuleLoaded();
@@ -525,6 +645,9 @@ function install(): void {
   // 調試輔助（M1-27 真實環境驗證）：暴露計數器與最近捕獲對象到 window。
   Reflect.set(globalThis, '__aiTransTimedtextRequests', 0);
   Reflect.set(globalThis, '__aiTransTimedtextLastCapture', null);
+  // M2-24 補充修復十二：暴露 pot 重驅動相關計數（真實環境分流「空響應有無觸發重驅動」）。
+  Reflect.set(globalThis, '__aiTransTimedtextEmptyResponses', 0);
+  Reflect.set(globalThis, '__aiTransPotRedriveAttempts', 0);
 
   // ── XHR hook（播放器常用路徑）──
   const origOpen = XMLHttpRequest.prototype.open;

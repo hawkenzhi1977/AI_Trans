@@ -224,6 +224,17 @@
 - **過程教訓**: M1-54 診斷日誌最初「永遠缺失」——不是調用鏈斷，而是 `dist/` 未重建（舊構建不含診斷代碼），`npm run build` + 重新加載擴充後才正常輸出。**改動影響 `dist/` 產物的代碼必須重新構建部署，否則診斷「永遠缺失」會被誤判為上游斷鏈**。
 - **代碼落點**: src/adapters/platform/youtube/timedtext.ts（`parseTimedText` 入口日誌、`parseJson`/`parseSrv3`/`parseXml`(legacy) 分支日誌、`logSegmentTimespan` 輔助）
 
+### 2.17 timedtext 空響應 pot 重驅動（M2-24 補充修復十二，「重新加載插件後完全無字幕」定位）
+
+- **現象**: 控制台顯示 `XHR timedtext response received, length: 0 content-type: text/html; charset=UTF-8` → `emitCapture: empty response, skipping (pot re-drive scheduled)`，最終 `native: run failed — timedtext XML: parse error (not valid XML) — root <html>, (empty body)` 且**連原文字幕都無**（native 全鏈失敗 → lookahead M3 未實現 → realtime-asr 未授權）。
+- **根因**: 攔截器捕獲的首次 timedtext 請求**無 pot**（YouTube pot 防護探測信號）→ 空 body。播放器內部稍後才用 pot 重試，但 `ensureCaptionModuleLoaded` 選軌後**固定 3 秒復位** `setOption('captions','track',{})` 打斷了尚未完成的 pot 重試鏈 → 播放器不再發第二次請求 → `waitForCapture(15s)` 超時 → 直接 fetch（無 pot）空 body。
+- **修復後行為**: 空響應觸發 `schedulePotRedrive()`（2s 間隔、上限 6 次）——切換軌 off→on 強制播放器重發帶 pot 請求；復位改為「成功捕獲後 800ms 抑制原生字幕」+ 10 秒截止，不再用固定 3 秒冒險打斷重試。
+- **調試日誌**（`interceptor` 分類）: `pot re-drive scheduled, attempt: <N>` / `pot re-drive executing, attempt: <N>` / `pot re-drive exhausted after <N> attempts` / `Caption track reset after successful capture to suppress native rendering` / `Caption track reset (10s deadline) to suppress native rendering`。
+- **調試輔助全局變量**（MAIN world）: `window.__aiTransTimedtextEmptyResponses`（空響應累計，pot 防護命中次數）、`window.__aiTransPotRedriveAttempts`（已執行的重驅動次數）——`EmptyResponses>0 但 Attempts=0` → 重驅動被取消（成功捕獲/換視頻）或達上限；`Attempts>0 但字幕仍無` → 播放器對重驅動也不響應，需檢查直接 fetch/ASR 降級。
+- **用戶響應**: 重新加載頁面（觸發新的字幕驅動週期）；確認播放器字幕軌存在（`__aiTransCaptionTracks >= 1`）。
+- **開發者響應**: 用調試輔助分流——`__aiTransTimedtextEmptyResponses===0` → 攔截器未捕獲到任何 timedtext 請求（isTimedText 未匹配/播放器未請求）；`EmptyResponses>0` 且 `Attempts` 正常 → pot 重試已由重驅動逼出，檢查下游（parseTimedText / bridge / 翻譯管線）。
+- **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`schedulePotRedrive`/`redrivePlayerCaptions`/`resetPotRedrive`/`scheduleSuppressNative`/`scheduleSuppressDeadline`/`emitCapture` 空響應分支）
+
 
 ---
 

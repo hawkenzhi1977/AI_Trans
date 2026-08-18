@@ -89,7 +89,10 @@
   }
   function emitCapture(url, responseText, contentType, location) {
     if (!responseText) {
-      diagLog("interceptor", "emitCapture: empty response, skipping");
+      emptyResponseCount++;
+      Reflect.set(globalThis, "__aiTransTimedtextEmptyResponses", emptyResponseCount);
+      diagLog("interceptor", "emitCapture: empty response, skipping (pot re-drive scheduled)");
+      schedulePotRedrive();
       return;
     }
     captureRequestCount++;
@@ -101,6 +104,8 @@
       videoId: extractVideoId(url)
     };
     diagLog("interceptor", "emitCapture: success, captureRequestCount:", captureRequestCount, "videoId:", capture.videoId);
+    resetPotRedrive();
+    scheduleSuppressNative();
     lastCapture = capture;
     Reflect.set(globalThis, "__aiTransTimedtextRequests", captureRequestCount);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", capture);
@@ -193,6 +198,89 @@
     }
     return void 0;
   }
+  function getCaptionPlayer() {
+    return document.getElementById("movie_player");
+  }
+  var POT_REDRIVE_DELAY_MS = 2e3;
+  var MAX_POT_REDRIVE_ATTEMPTS = 6;
+  var emptyResponseCount = 0;
+  var potRedriveAttempts = 0;
+  var potRedriveTimer = null;
+  var suppressNativeTimer = null;
+  var suppressDeadlineTimer = null;
+  function schedulePotRedrive() {
+    if (potRedriveTimer !== null) return;
+    if (potRedriveAttempts >= MAX_POT_REDRIVE_ATTEMPTS) {
+      diagLog("interceptor", "pot re-drive exhausted after", potRedriveAttempts, "attempts");
+      return;
+    }
+    potRedriveAttempts += 1;
+    Reflect.set(globalThis, "__aiTransPotRedriveAttempts", potRedriveAttempts);
+    diagLog("interceptor", "pot re-drive scheduled, attempt:", potRedriveAttempts);
+    potRedriveTimer = setTimeout(() => {
+      potRedriveTimer = null;
+      redrivePlayerCaptions();
+    }, POT_REDRIVE_DELAY_MS);
+  }
+  function redrivePlayerCaptions() {
+    diagLog("interceptor", "pot re-drive executing, attempt:", potRedriveAttempts);
+    const player = getCaptionPlayer();
+    if (!player || typeof player.setOption !== "function") {
+      schedulePotRedrive();
+      return;
+    }
+    captionModuleDriven = false;
+    try {
+      player.setOption("captions", "track", {});
+    } catch {
+    }
+    setTimeout(() => {
+      try {
+        ensureCaptionModuleLoaded();
+      } catch {
+      }
+    }, 150);
+  }
+  function resetPotRedrive() {
+    potRedriveAttempts = 0;
+    Reflect.set(globalThis, "__aiTransPotRedriveAttempts", 0);
+    if (potRedriveTimer !== null) {
+      clearTimeout(potRedriveTimer);
+      potRedriveTimer = null;
+    }
+    if (suppressNativeTimer !== null) {
+      clearTimeout(suppressNativeTimer);
+      suppressNativeTimer = null;
+    }
+    if (suppressDeadlineTimer !== null) {
+      clearTimeout(suppressDeadlineTimer);
+      suppressDeadlineTimer = null;
+    }
+  }
+  function scheduleSuppressNative() {
+    if (suppressNativeTimer !== null) return;
+    suppressNativeTimer = setTimeout(() => {
+      suppressNativeTimer = null;
+      const player = getCaptionPlayer();
+      if (!player || typeof player.setOption !== "function") return;
+      try {
+        player.setOption("captions", "track", {});
+        diagLog("interceptor", "Caption track reset after successful capture to suppress native rendering");
+      } catch {
+      }
+    }, 800);
+  }
+  function scheduleSuppressDeadline(player) {
+    if (suppressDeadlineTimer !== null) return;
+    suppressDeadlineTimer = setTimeout(() => {
+      suppressDeadlineTimer = null;
+      try {
+        player.setOption("captions", "track", {});
+        diagLog("interceptor", "Caption track reset (10s deadline) to suppress native rendering");
+      } catch {
+      }
+    }, 1e4);
+  }
   function ensureCaptionModuleLoaded() {
     if (captionModuleDriven) return;
     if (lastCapture) {
@@ -204,7 +292,7 @@
         return;
       }
     }
-    const player = document.getElementById("movie_player");
+    const player = getCaptionPlayer();
     if (!player) {
       diagLog("interceptor", "Player element not found");
       return;
@@ -248,12 +336,7 @@
           player.setOption("captions", "track", syntheticTrack);
           captionModuleDriven = true;
           diagLog("interceptor", "Caption module driven with synthetic track for videoId:", currentVid);
-          setTimeout(() => {
-            try {
-              player.setOption("captions", "track", {});
-            } catch {
-            }
-          }, 3e3);
+          scheduleSuppressDeadline(player);
           return;
         } catch (err) {
           diagLog("interceptor", "setOption with synthetic track failed:", err);
@@ -271,13 +354,7 @@
       player.setOption("captions", "track", track);
       captionModuleDriven = true;
       diagLog("interceptor", "Caption module driven successfully, selected track:", track);
-      setTimeout(() => {
-        try {
-          player.setOption("captions", "track", {});
-          diagLog("interceptor", "Caption track reset to suppress native rendering");
-        } catch {
-        }
-      }, 3e3);
+      scheduleSuppressDeadline(player);
     } catch (err) {
       diagLog("interceptor", "setOption error:", err);
     }
@@ -295,6 +372,7 @@
     }, RETRY_INTERVAL_MS);
   }
   function resetAndRedriveCaptionModule() {
+    resetPotRedrive();
     captionModuleDriven = false;
     ensureCaptionModuleLoaded();
     if (!captionModuleDriven) {
@@ -330,6 +408,8 @@
     startCaptionModuleDriver();
     Reflect.set(globalThis, "__aiTransTimedtextRequests", 0);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);
+    Reflect.set(globalThis, "__aiTransTimedtextEmptyResponses", 0);
+    Reflect.set(globalThis, "__aiTransPotRedriveAttempts", 0);
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function(method, url, async, username, password) {

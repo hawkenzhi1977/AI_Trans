@@ -615,13 +615,130 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
     expect(Reflect.get(globalThis, '__aiTransCaptionTracks')).toBe(0);
   });
 
-  it('選軌後短延遲復位（抑制原生字幕渲染）', async () => {
+  it('選軌後不再用固定 3 秒復位（M2-24 補充修復十二：保留 pot 重試窗口）', async () => {
     const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
     await loadInterceptor();
     vi.advanceTimersByTime(1_000);
     setOption.mockClear();
-    vi.advanceTimersByTime(3_100); // M1-48：延遲增加到 3000ms
+    // 舊 M1-48 行為在 3.1s 復位 setOption({})——可能打斷播放器尚未完成的 pot 重試，
+    // 新實作改為「成功捕獲後抑制」+ 10 秒截止復位。
+    vi.advanceTimersByTime(3_100);
+    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', {});
+  });
+
+  it('捕獲始終失敗時 10 秒截止復位（避免原生字幕永久顯示）', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    setOption.mockClear();
+    vi.advanceTimersByTime(3_100);
+    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', {});
+    vi.advanceTimersByTime(6_900); // 總計 10s → 截止復位
     expect(setOption).toHaveBeenCalledWith('captions', 'track', {});
+  });
+
+  it('空響應（pot 防護）後排程重驅動：切換軌 off→on 逼播放器重發帶 pot 請求', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000); // 首輪驅動
+    setOption.mockClear();
+    // 空響應（無 pot 請求返回空）→ 觸發重驅動排程。
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '', configurable: true });
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    expect(Reflect.get(globalThis, '__aiTransTimedtextEmptyResponses')).toBe(1);
+    // 2s 後重驅動執行：先復位軌再重新選軌。
+    vi.advanceTimersByTime(2_000);
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', {});
+    vi.advanceTimersByTime(200); // 150ms 後重新選軌
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+    expect(Reflect.get(globalThis, '__aiTransPotRedriveAttempts')).toBe(1);
+  });
+
+  it('重驅動達上限（6 次）後停止排程，不再打擾播放器', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    setOption.mockClear();
+    for (let i = 0; i < 8; i++) {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', `https://www.youtube.com/api/timedtext?v=abc&lang=en&i=${i}`);
+      Object.defineProperty(xhr, 'responseText', { value: '', configurable: true });
+      try {
+        xhr.send();
+      } catch {
+        /* ignore */
+      }
+      xhr.dispatchEvent(new Event('load'));
+      vi.advanceTimersByTime(2_000);
+      vi.advanceTimersByTime(200);
+    }
+    // 最多 6 次重驅動，額外空響應不再排程。
+    expect(Reflect.get(globalThis, '__aiTransPotRedriveAttempts')).toBe(6);
+    expect(Reflect.get(globalThis, '__aiTransTimedtextEmptyResponses')).toBe(8);
+  });
+
+  it('捕獲成功後 800ms 復位抑制原生字幕，且取消已排程的重驅動', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    setOption.mockClear();
+    // 先來一個空響應（排程重驅動）。
+    const emptyXhr = new XMLHttpRequest();
+    emptyXhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(emptyXhr, 'responseText', { value: '', configurable: true });
+    try {
+      emptyXhr.send();
+    } catch {
+      /* ignore */
+    }
+    emptyXhr.dispatchEvent(new Event('load'));
+    // 再來一個成功的捕獲。
+    const okXhr = new XMLHttpRequest();
+    okXhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(okXhr, 'responseText', { value: '{"events":[]}', configurable: true });
+    vi.spyOn(okXhr, 'getResponseHeader').mockReturnValue('application/json');
+    try {
+      okXhr.send();
+    } catch {
+      /* ignore */
+    }
+    okXhr.dispatchEvent(new Event('load'));
+    // 成功捕獲重置重驅動 → 推進超過 2s 不應有重驅動選軌；800ms 復位應已觸發。
+    vi.advanceTimersByTime(2_100);
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', {});
+    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: undefined });
+    expect(Reflect.get(globalThis, '__aiTransPotRedriveAttempts')).toBe(0);
+  });
+
+  it('video-changed 取消已排程的 pot 重驅動並重置計數', async () => {
+    const { setOption } = mountMockPlayer([{ languageCode: 'en', kind: undefined }]);
+    await loadInterceptor();
+    vi.advanceTimersByTime(1_000);
+    // 空響應 → 排程重驅動（attempt 1）。
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://www.youtube.com/api/timedtext?v=abc&lang=en');
+    Object.defineProperty(xhr, 'responseText', { value: '', configurable: true });
+    try {
+      xhr.send();
+    } catch {
+      /* ignore */
+    }
+    xhr.dispatchEvent(new Event('load'));
+    expect(Reflect.get(globalThis, '__aiTransPotRedriveAttempts')).toBe(1);
+    // video-changed：重置計數並取消排程（同時依既有行為重新選軌）。
+    document.dispatchEvent(new CustomEvent('ai-trans:video-changed'));
+    expect(Reflect.get(globalThis, '__aiTransPotRedriveAttempts')).toBe(0);
+    setOption.mockClear();
+    // 已排程的重驅動（off→on 切換）不再觸發。
+    vi.advanceTimersByTime(2_100);
+    expect(setOption).not.toHaveBeenCalled();
   });
 
   it('播放器未就緒時不拋錯，後續就緒後重試成功', async () => {
@@ -802,7 +919,9 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
 
     // 關鍵驗證：setOption 不應被調用（因為 lastCapture 已有當前視頻數據，跳過驅動）。
     // 這避免了 stale DOM 軌（baseUrl 指向 oldVideo）覆蓋播放器的正確請求。
-    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', expect.any(Object));
+    // 注意：M2-24 補充修復十二的「捕獲成功後抑制原生字幕」復位會以 {} 呼叫 setOption，
+    // 這裡只斷言**選軌**（含 languageCode 的軌對象）不被呼叫，{} 復位屬預期行為。
+    expect(setOption).not.toHaveBeenCalledWith('captions', 'track', expect.objectContaining({ languageCode: 'en' }));
 
     window.history.replaceState({}, '', '/');
   });
