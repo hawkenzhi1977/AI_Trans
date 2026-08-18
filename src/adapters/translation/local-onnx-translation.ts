@@ -31,22 +31,26 @@ export interface LocalOnnxTranslationConfig {
   modelName: string;
   /** 目標語言（預設 zh-Hant）。 */
   targetLang?: string;
+  /** 是否作為主翻譯引擎（primary）——primary 成功時不標記 degraded，避免誤發降級事件。 */
+  isPrimary?: boolean;
 }
 
 /**
  * 本地 ONNX 翻譯 Provider——透過 Offscreen Document 執行推理。
- * 當雲端 LLM 失敗時自動降級使用，實現完全離線的翻譯兜底。
+ * 可作為主翻譯引擎（type='local-onnx'）或雲端 LLM 失敗時的離線兜底。
  */
 export class LocalONNXTranslationProvider implements TranslationProvider {
   readonly engineId = 'local-onnx';
   readonly location = 'local' as const;
 
   private readonly defaultTargetLang: string;
+  private readonly isPrimary: boolean;
 
   constructor(config: LocalOnnxTranslationConfig) {
     // modelName 保留供未來擴充（如多模型切換），目前仅用於配置顯示。
     void config.modelName;
     this.defaultTargetLang = config.targetLang ?? 'zh-Hant';
+    this.isPrimary = config.isPrimary ?? false;
   }
 
   /**
@@ -94,7 +98,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
       return {
         engineId: this.engineId,
-        degraded: true, // 標記為降級結果（非 primary 引擎）。
+        degraded: !this.isPrimary, // primary 成功不標降級；作 fallback 時仍標記。
         segments,
       };
     } catch (err) {

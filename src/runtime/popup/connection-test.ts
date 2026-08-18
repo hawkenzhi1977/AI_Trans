@@ -26,7 +26,7 @@ export async function testConnection(
   const tc = config.translation;
   // 僅支持需要網絡的引擎。
   if (tc.type !== 'cloud-llm' && tc.type !== 'local') {
-    return { ok: false, error: '當前引擎類型不需要網絡（MT 字典）。請選雲端 LLM 或本地模型。' };
+    return { ok: false, error: '當前引擎類型不需網絡連線（MT 字典 / 本地 ONNX）。請選雲端 LLM 或本地模型。' };
   }
   if (!tc.endpoint) {
     return { ok: false, error: '未填寫端點（Endpoint）。' };

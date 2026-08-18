@@ -134,4 +134,39 @@ describe('LocalONNXTranslationProvider', () => {
     expect(result.segments[0].translatedText).toBe('只有一個翻譯結果');
     expect(result.segments[1].translatedText).toBe('line-1'); // 使用 sourceText 填充
   });
+
+  it('isPrimary=true 時成功結果不標記 degraded', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      targetLang: 'zh-Hant',
+      isPrimary: true,
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({
+      ok: true,
+      translatedText: '你好',
+    });
+
+    const result = await provider.translate(req());
+
+    expect(result.engineId).toBe('local-onnx');
+    expect(result.degraded).toBe(false);
+  });
+
+  it('isPrimary=false（作 fallback）時成功結果仍標記 degraded', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      targetLang: 'zh-Hant',
+      isPrimary: false,
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({
+      ok: true,
+      translatedText: '你好',
+    });
+
+    const result = await provider.translate(req());
+
+    expect(result.degraded).toBe(true);
+  });
 });

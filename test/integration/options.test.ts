@@ -5,7 +5,7 @@ import type { EngineConfig } from '../../src/domain/models/config';
 // options.ts 在 import 時即執行 void init()。測試用動態 import 載入後斷言 DOM。
 const HTML = `
   <h1>AI_Trans 設定</h1>
-  <select id="translation-type"><option value="mt">傳統 MT</option><option value="cloud-llm">雲端 LLM</option><option value="local">本地</option></select>
+  <select id="translation-type"><option value="mt">傳統 MT</option><option value="cloud-llm">雲端 LLM</option><option value="local">本地</option><option value="local-onnx">本地 ONNX</option></select>
   <input id="translation-model" />
   <input id="translation-endpoint" />
   <select id="translation-fallback"><option value="mt">MT</option><option value="local-onnx">本地 ONNX</option><option value="none">無</option></select>
@@ -189,5 +189,16 @@ describe('Options — M2 自定義 ASR 模型路徑', () => {
     const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
     expect(saved.asr.customModelPath).toBe('my-custom-model');
     expect(document.getElementById('status')!.textContent).toContain('配置已保存');
+  });
+
+  it('選擇 local-onnx 作為翻譯引擎後保存，type 被持久化', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    (document.getElementById('translation-type') as HTMLSelectElement).value = 'local-onnx';
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('engineConfig');
+    const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
+    expect(saved.translation.type).toBe('local-onnx');
   });
 });

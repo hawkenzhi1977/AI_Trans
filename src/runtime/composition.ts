@@ -120,11 +120,12 @@ async function buildTranslationProviders(
   });
   providers.set('mt', mt);
 
-  // 本地 ONNX 翻譯兜底——當 fallbackType 為 'local-onnx' 時組裝。
-  if (tc.fallbackType === 'local-onnx') {
+  // 本地 ONNX 翻譯——type 選為 primary 或 fallbackType 為 'local-onnx' 時組裝。
+  if (tc.type === 'local-onnx' || tc.fallbackType === 'local-onnx') {
     const localOnnx = new LocalONNXTranslationProvider({
       modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
       targetLang: config.targetLang,
+      isPrimary: tc.type === 'local-onnx',
     });
     providers.set(localOnnx.engineId, localOnnx);
   }

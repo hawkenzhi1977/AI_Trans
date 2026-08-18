@@ -53,7 +53,13 @@ export class LocalWhisperASR implements ASRProvider {
       // 動態導入 @huggingface/transformers（esbuild 打包進 bundle，不使用 new Function
       // 以避免 Chrome 擴展 CSP 禁止 unsafe-eval）。
       const transformers = await import('@huggingface/transformers');
-      const { pipeline } = transformers;
+      const { pipeline, env } = transformers;
+      // M2-24 補充修復七：WASM 本地化——content-script 中 transformers.js 默認從 CDN
+      // 載入 onnxruntime wasm，YouTube 頁面 CSP 會阻擋 CDN 請求（warmup 失敗）。
+      // 改指向擴充內打包的 wasm（copy-static.mjs 拷貝至 src/runtime/ort/）。
+      if (env.backends?.onnx?.wasm) {
+        env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
+      }
       // 轉型以匹配本地 WhisperPipeline 接口（transformers.js 返回類型更複雜）。
       this.pipeline = (await pipeline(
         'automatic-speech-recognition',

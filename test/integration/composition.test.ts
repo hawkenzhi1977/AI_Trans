@@ -106,6 +106,27 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
     expect(registry.translation.has('llm')).toBe(false);
   });
 
+  it('type=local-onnx 時註冊 local-onnx 引擎（即使 fallbackType 非 local-onnx）', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({ translation: { type: 'local-onnx', fallbackType: 'mt' } }),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    const localOnnx = registry.translation.get('local-onnx');
+    expect(localOnnx).toBeDefined();
+    expect(localOnnx?.engineId).toBe('local-onnx');
+    expect(localOnnx?.location).toBe('local');
+    expect(registry.translation.has('mt')).toBe(true);
+  });
+
+  it('fallbackType=local-onnx 時仍註冊 local-onnx 引擎（兜底路徑不破壞）', async () => {
+    const registry: Registry = await buildDefaultRegistry(
+      CONFIG({ translation: { type: 'cloud-llm', fallbackType: 'local-onnx' } }),
+      { apiKeyStore: new MemoryApiKeyStore() }
+    );
+    expect(registry.translation.get('local-onnx')?.engineId).toBe('local-onnx');
+    expect(registry.translation.has('llm')).toBe(true);
+  });
+
   it('註冊默認策略鏈（native → lookahead → realtime）與 YouTube 平台', async () => {
     const registry: Registry = await buildDefaultRegistry(
       CONFIG({}),

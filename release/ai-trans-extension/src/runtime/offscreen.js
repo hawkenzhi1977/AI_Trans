@@ -48656,18 +48656,64 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   var translationPipeline = null;
+  var loadPromise = null;
   var LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
+  function toReadableError(err) {
+    if (err instanceof Error) {
+      const code = err.code;
+      const codeStr = typeof code === "string" || typeof code === "number" ? `code=${String(code)}` : "";
+      const details = [err.message, codeStr, err.stack].filter((s) => typeof s === "string" && s.length > 0).join(" | ");
+      return new Error(details || "unknown error");
+    }
+    return new Error(`[non-Error ${typeof err}] ${String(err)}`);
+  }
+  async function loadPipeline(progressCallback) {
+    const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
+    const { pipeline, env: env3 } = transformers;
+    env3.allowLocalModels = false;
+    env3.logLevel = "info";
+    if (env3.backends?.onnx?.wasm) {
+      env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
+    }
+    return await pipeline("text-generation", LOCAL_MODEL_NAME, {
+      dtype: "q4",
+      device: "wasm",
+      ...progressCallback ? { progress_callback: progressCallback } : {}
+    });
+  }
+  async function ensurePipelineLoaded(progressCallback) {
+    if (translationPipeline !== null) return translationPipeline;
+    if (!loadPromise) {
+      loadPromise = loadPipeline(progressCallback).then((p) => {
+        translationPipeline = p;
+        return p;
+      }).finally(() => {
+        loadPromise = null;
+      });
+    }
+    return loadPromise;
+  }
   async function checkModelStatus() {
     try {
-      const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
-      const { env: env3 } = transformers;
-      const downloaded = translationPipeline !== null || await hasModelInCache(env3);
-      const response = {
+      const downloaded = await hasModelInCache();
+      if (downloaded && translationPipeline === null) {
+        void ensurePipelineLoaded().catch((err) => {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "translation",
+              code: "local-onnx-pipeline-warmup-failed",
+              recoverable: true,
+              cause: toReadableError(err)
+            }
+          });
+        });
+      }
+      return {
         type: "local-onnx:status",
         downloaded,
         modelName: LOCAL_MODEL_NAME
       };
-      return response;
     } catch (err) {
       recordDiagnostic({
         type: "pipeline-error",
@@ -48675,7 +48721,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           port: "translation",
           code: "local-onnx-status-check-failed",
           recoverable: true,
-          cause: err instanceof Error ? err : new Error(String(err))
+          cause: toReadableError(err)
         }
       });
       return {
@@ -48685,27 +48731,24 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       };
     }
   }
-  async function hasModelInCache(_env) {
+  async function hasModelInCache() {
     try {
-      const dbs = await indexedDB.databases();
-      const hasTransformersCache = dbs.some(
-        (db) => db.name === "transformers-cache" || db.name === "transformers"
-      );
-      if (!hasTransformersCache) return false;
-      return translationPipeline !== null;
+      const cachesApi = globalThis.caches;
+      if (typeof cachesApi === "undefined" || typeof cachesApi.keys !== "function") {
+        return false;
+      }
+      const cacheNames = await cachesApi.keys();
+      const target = cacheNames.find((name) => name === "transformers-cache");
+      if (!target) return false;
+      const cache = await cachesApi.open(target);
+      const requests = await cache.keys();
+      return requests.some((r) => r.url.includes(".onnx") || r.url.includes(LOCAL_MODEL_NAME));
     } catch {
       return false;
     }
   }
   async function downloadModel() {
     try {
-      const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
-      const { pipeline, env: env3 } = transformers;
-      env3.allowLocalModels = false;
-      if (env3.backends?.onnx?.wasm) {
-        env3.backends.onnx.wasm.numThreads = 4;
-        env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
-      }
       const progressCallback = (progress) => {
         console.log("[AI_Trans:local-onnx] progress_callback:", {
           status: progress.status,
@@ -48742,22 +48785,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           });
         }
       };
-      translationPipeline = await pipeline(
-        "text-generation",
-        LOCAL_MODEL_NAME,
-        {
-          dtype: "q4",
-          device: "wasm",
-          // 使用 WASM 以確保兼容性（WebGPU 可後續優化）。
-          progress_callback: progressCallback
-        }
-      );
+      await ensurePipelineLoaded(progressCallback);
       return {
         type: "local-onnx:download-complete",
         ok: true
       };
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
+      const error = toReadableError(err);
       recordDiagnostic({
         type: "pipeline-error",
         error: {
@@ -48812,13 +48846,37 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   async function runInference(text, targetLang, _sourceLang) {
-    if (!translationPipeline) {
-      return {
-        type: "local-onnx:translate-result",
-        ok: false,
-        notDownloaded: true,
-        error: "Local ONNX model not downloaded"
-      };
+    if (translationPipeline === null) {
+      try {
+        if (await hasModelInCache()) {
+          await ensurePipelineLoaded();
+        }
+      } catch (err) {
+        const error = toReadableError(err);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-pipeline-load-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        return {
+          type: "local-onnx:translate-result",
+          ok: false,
+          notDownloaded: true,
+          error: error.message
+        };
+      }
+      if (translationPipeline === null) {
+        return {
+          type: "local-onnx:translate-result",
+          ok: false,
+          notDownloaded: true,
+          error: "Local ONNX model not downloaded"
+        };
+      }
     }
     try {
       const langName = getLanguageName(targetLang);
@@ -48827,8 +48885,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
 Text: ${text}`;
       const pipelineFn = translationPipeline;
       const result = await pipelineFn(prompt, {
-        max_new_tokens: 128,
-        temperature: 0.1,
+        max_new_tokens: 96,
         do_sample: false
       });
       const generatedText = result[0]?.generated_text ?? "";
@@ -48839,7 +48896,7 @@ Text: ${text}`;
         translatedText
       };
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
+      const error = toReadableError(err);
       recordDiagnostic({
         type: "pipeline-error",
         error: {
@@ -48882,6 +48939,15 @@ Text: ${text}`;
     };
     return map[langCode] ?? langCode;
   }
+  function resetLocalOnnxModuleForTest() {
+    translationPipeline = null;
+    loadPromise = null;
+  }
+  var _testExports = {
+    hasModelInCache,
+    checkModelStatus,
+    runInference
+  };
 })();
 /*! Bundled license information:
 

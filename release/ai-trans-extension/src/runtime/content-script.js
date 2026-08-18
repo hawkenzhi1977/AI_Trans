@@ -49049,7 +49049,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       this.currentPlatformId = platform.platformId;
       const config = await this.deps.getConfig();
       const primary = this.deps.registry.translation.get(
-        config.translation.type === "cloud-llm" ? "llm" : config.translation.type === "local" ? "local-llm" : "mt"
+        config.translation.type === "local-onnx" ? "local-onnx" : config.translation.type === "cloud-llm" ? "llm" : config.translation.type === "local" ? "local-llm" : "mt"
       );
       let fallback;
       if (config.translation.fallbackType === "local-onnx") {
@@ -50202,9 +50202,11 @@ Output example:
     engineId = "local-onnx";
     location = "local";
     defaultTargetLang;
+    isPrimary;
     constructor(config) {
       void config.modelName;
       this.defaultTargetLang = config.targetLang ?? "zh-Hant";
+      this.isPrimary = config.isPrimary ?? false;
     }
     /**
      * 非流式翻譯——透過 chrome.runtime.sendMessage 發送請求給 Service Worker。
@@ -50243,8 +50245,8 @@ Output example:
         }));
         return {
           engineId: this.engineId,
-          degraded: true,
-          // 標記為降級結果（非 primary 引擎）。
+          degraded: !this.isPrimary,
+          // primary 成功不標降級；作 fallback 時仍標記。
           segments
         };
       } catch (err) {
@@ -50777,7 +50779,10 @@ Output example:
     async warmup(_config) {
       try {
         const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
-        const { pipeline } = transformers;
+        const { pipeline, env: env3 } = transformers;
+        if (env3.backends?.onnx?.wasm) {
+          env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
+        }
         this.pipeline = await pipeline(
           "automatic-speech-recognition",
           this.modelId
@@ -50960,10 +50965,11 @@ Output example:
       welcome: "\u6B61\u8FCE"
     });
     providers.set("mt", mt);
-    if (tc2.fallbackType === "local-onnx") {
+    if (tc2.type === "local-onnx" || tc2.fallbackType === "local-onnx") {
       const localOnnx = new LocalONNXTranslationProvider({
         modelName: tc2.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
-        targetLang: config.targetLang
+        targetLang: config.targetLang,
+        isPrimary: tc2.type === "local-onnx"
       });
       providers.set(localOnnx.engineId, localOnnx);
     }

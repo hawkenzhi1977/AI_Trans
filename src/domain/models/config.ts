@@ -4,7 +4,7 @@ export const DEFAULT_LOCAL_TRANSLATION_MODEL =
 
 /** 翻譯引擎配置。 */
 export interface TranslationConfig {
-  type: 'cloud-llm' | 'local' | 'mt';
+  type: 'cloud-llm' | 'local' | 'mt' | 'local-onnx';
   model?: string;
   endpoint?: string;
   /** 指向本地安全存儲，不明文散播。 */

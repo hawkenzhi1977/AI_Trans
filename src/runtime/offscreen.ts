@@ -249,32 +249,124 @@ function broadcastToAll(response: OffscreenResponse): void {
 // 本地 ONNX 翻譯模型（Qwen2.5-0.5B-Instruct）處理
 // ============================================================
 
-/** 本地 ONNX 翻譯 pipeline 實例（延遲初始化）。 */
+/** 本地 ONNX 翻譯 pipeline 實例（延遲初始化；Offscreen 重啟後重置為 null）。 */
 let translationPipeline: unknown = null;
+
+/** 共享載入 Promise——防止並發重複載入（§5.5 async 組裝）。 */
+let loadPromise: Promise<unknown> | null = null;
 
 /** 模型名稱（唯讀，預設為 Qwen2.5-0.5B）。 */
 const LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
 
+/** transformers.js 進度回調結構。 */
+interface TransformersProgress {
+  status: string;
+  progress?: number;
+  loaded?: number;
+  total?: number;
+  name?: string;
+  file?: string;
+}
+
 /**
- * 檢查模型狀態——查詢 IndexedDB 是否已有模型快取。
- * 使用 transformers.js 的 env.cacheDir 查詢機制。
+ * 統一錯誤轉換——ORT/transformers 可能拋出「數字型」錯誤碼（如 wasm trap 的
+ * 1835858576，非 Error 對象文本），轉為保留 code/stack 的可讀 Error（§5.6 留痕）。
+ */
+function toReadableError(err: unknown): Error {
+  if (err instanceof Error) {
+    const code = (err as { code?: unknown }).code;
+    const codeStr =
+      typeof code === 'string' || typeof code === 'number' ? `code=${String(code)}` : '';
+    const details = [err.message, codeStr, err.stack]
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+      .join(' | ');
+    return new Error(details || 'unknown error');
+  }
+  return new Error(`[non-Error ${typeof err}] ${String(err)}`);
+}
+
+/**
+ * 載入本地 ONNX 翻譯 pipeline（共享邏輯）。
+ * download / check-status 預熱 / runInference lazy 載入三處複用；
+ * env 配置統一在此設置，避免各調用點不一致導致行為漂移。
+ */
+async function loadPipeline(
+  progressCallback?: (p: TransformersProgress) => void
+): Promise<unknown> {
+  const transformers = await import('@huggingface/transformers');
+  const { pipeline, env } = transformers;
+
+  // 執行後端配置：WASM（WebGPU 可後續優化）。
+  env.allowLocalModels = false;
+  // 詳細日誌：輸出 [ort] 初始化與推理錯誤，便於診斷本地 ONNX 失敗根因（wasm trap / 記憶體 / 算子）。
+  // 類型聲明缺失 logLevel，運行時為 transformers.js/ORT 共用 env 的有效字段。
+  (env as unknown as { logLevel: string }).logLevel = 'info';
+  // WASM 本地化：transformers.js v3 默認從 jsdelivr CDN 載入 wasm，
+  // 網絡不可達會導致 InferenceSession 初始化失敗。改指向擴充內資源。
+  if (env.backends?.onnx?.wasm) {
+    env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
+    // numThreads 交由 transformers.js 自決：Offscreen 無 crossOriginIsolated 時自動降為 1，
+    // 避免手動設 4 與 threaded wasm 初始化衝突（wasm trap 頭號嫌疑）。
+  }
+
+  // 加載模型（首次會從 HuggingFace Hub 下載到 Cache API）。
+  // dtype: 'q4' 下載 INT4 量化版（onnx/model_q4.onnx，約 350MB），避免默認 fp32 大檔。
+  return await pipeline('text-generation', LOCAL_MODEL_NAME, {
+    dtype: 'q4',
+    device: 'wasm',
+    ...(progressCallback ? { progress_callback: progressCallback } : {}),
+  });
+}
+
+/**
+ * 確保 pipeline 已載入——已載入直接返回；否則觸發載入（並發安全）。
+ * 用於 runInference 的 lazy 恢復與 check-status 預熱。
+ */
+async function ensurePipelineLoaded(
+  progressCallback?: (p: TransformersProgress) => void
+): Promise<unknown> {
+  if (translationPipeline !== null) return translationPipeline;
+  if (!loadPromise) {
+    loadPromise = loadPipeline(progressCallback)
+      .then((p) => {
+        translationPipeline = p;
+        return p;
+      })
+      .finally(() => {
+        loadPromise = null;
+      });
+  }
+  return loadPromise;
+}
+
+/**
+ * 檢查模型狀態——以 Cache API 真實快取為準。
+ * transformers.js v3 用 Cache API（非 IndexedDB），且不依賴內存 translationPipeline，
+ * 因此 Offscreen 重啟後狀態依然準確（不再誤報「未下載」）。
  */
 async function checkModelStatus(): Promise<OffscreenResponse> {
   try {
-    // 動態導入 transformers.js（避免硬依賴，esbuild 會 tree-shake）。
-    const transformers = await import('@huggingface/transformers');
-    const { env } = transformers;
+    const downloaded = await hasModelInCache();
+    // 快取存在且未載入 → 後台預熱（非阻塞；失敗僅記錄診斷，不影響狀態判定）。
+    if (downloaded && translationPipeline === null) {
+      void ensurePipelineLoaded().catch((err) => {
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'translation',
+            code: 'local-onnx-pipeline-warmup-failed',
+            recoverable: true,
+            cause: toReadableError(err),
+          },
+        });
+      });
+    }
 
-    // 檢查 cache 中是否有模型（transformers.js 使用 IndexedDB 快取）。
-    // 嘗試打開 pipeline，若模型未下載會拋錯或返回 null。
-    const downloaded = translationPipeline !== null || (await hasModelInCache(env));
-
-    const response: OffscreenResponse = {
+    return {
       type: 'local-onnx:status',
       downloaded,
       modelName: LOCAL_MODEL_NAME,
-    };
-    return response;
+    } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：狀態檢查失敗必須落診斷。
     recordDiagnostic({
@@ -283,7 +375,7 @@ async function checkModelStatus(): Promise<OffscreenResponse> {
         port: 'translation',
         code: 'local-onnx-status-check-failed',
         recoverable: true,
-        cause: err instanceof Error ? err : new Error(String(err)),
+        cause: toReadableError(err),
       },
     });
     return {
@@ -295,22 +387,26 @@ async function checkModelStatus(): Promise<OffscreenResponse> {
 }
 
 /**
- * 查詢 IndexedDB 中是否有模型快取。
- * transformers.js v3 使用 IndexedDB 快取模型檔案。
+ * 查詢本地模型快取——transformers.js v3 使用 Cache API（'transformers-cache'），
+ * 檢查其中是否有模型檔案（.onnx）。不依賴內存 translationPipeline，
+ * Offscreen 重啟後依然準確。
  */
-async function hasModelInCache(_env: { cacheDir?: string }): Promise<boolean> {
+async function hasModelInCache(): Promise<boolean> {
   try {
-    // transformers.js v3 使用 IndexedDB 快取，database 名稱為 'transformers-cache'。
-    const dbs = await indexedDB.databases();
-    const hasTransformersCache = dbs.some(
-      (db) => db.name === 'transformers-cache' || db.name === 'transformers'
-    );
-    if (!hasTransformersCache) return false;
+    const cachesApi = globalThis.caches;
+    if (typeof cachesApi === 'undefined' || typeof cachesApi.keys !== 'function') {
+      return false;
+    }
+    const cacheNames = await cachesApi.keys();
+    const target = cacheNames.find((name) => name === 'transformers-cache');
+    if (!target) return false;
 
-    // 嘗試打開 cache database 檢查是否有對應模型的 entry。
-    // 簡化檢查：若存在 transformers-cache database 且 translationPipeline 已初始化，視為已下載。
-    return translationPipeline !== null;
+    const cache = await cachesApi.open(target);
+    const requests = await cache.keys();
+    // 模型檔案（.onnx）存在即視為已下載。
+    return requests.some((r) => r.url.includes('.onnx') || r.url.includes(LOCAL_MODEL_NAME));
   } catch {
+    // 快取不可查時視為未下載；狀態檢查失敗留痕由調用方（checkModelStatus）記錄。
     return false;
   }
 }
@@ -321,28 +417,8 @@ async function hasModelInCache(_env: { cacheDir?: string }): Promise<boolean> {
  */
 async function downloadModel(): Promise<OffscreenResponse> {
   try {
-    const transformers = await import('@huggingface/transformers');
-    const { pipeline, env } = transformers;
-
-    // 配置執行後端：優先 WebGPU，自動退化至 WASM。
-    env.allowLocalModels = false;
-    // 設置 WASM 線程數（若可用）。
-    if (env.backends?.onnx?.wasm) {
-      env.backends.onnx.wasm.numThreads = 4;
-      // M2-24：WASM 本地化——transformers.js v3 默認從 jsdelivr CDN 載入 wasm，
-      // 網絡不可達會導致模型下載完成後 InferenceSession 初始化失敗。改指向擴充內資源。
-      env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
-    }
-
     // 進度回調：實時回報下載進度給 Options 頁面。
-    const progressCallback = (progress: {
-      status: string;
-      progress?: number;
-      loaded?: number;
-      total?: number;
-      name?: string;
-      file?: string;
-    }) => {
+    const progressCallback = (progress: TransformersProgress): void => {
       // §5.6：記錄所有進度回調以便診斷（進度始終為 0 問題）。
       console.log('[AI_Trans:local-onnx] progress_callback:', {
         status: progress.status,
@@ -384,17 +460,8 @@ async function downloadModel(): Promise<OffscreenResponse> {
       }
     };
 
-    // 加載模型（首次會從 HuggingFace Hub 下載到 IndexedDB）。
-    // dtype: 'q4' 下載 INT4 量化版（onnx/model_q4.onnx，約 350MB），避免默認 fp32 大檔。
-    translationPipeline = await pipeline(
-      'text-generation',
-      LOCAL_MODEL_NAME,
-      {
-        dtype: 'q4',
-        device: 'wasm', // 使用 WASM 以確保兼容性（WebGPU 可後續優化）。
-        progress_callback: progressCallback,
-      }
-    );
+    // 加載模型（首次會從 HuggingFace Hub 下載到 Cache API；env 配置統一在 loadPipeline）。
+    await ensurePipelineLoaded(progressCallback);
 
     return {
       type: 'local-onnx:download-complete',
@@ -402,7 +469,7 @@ async function downloadModel(): Promise<OffscreenResponse> {
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：下載失敗必須落診斷。
-    const error = err instanceof Error ? err : new Error(String(err));
+    const error = toReadableError(err);
     recordDiagnostic({
       type: 'pipeline-error',
       error: {
@@ -477,14 +544,40 @@ async function runInference(
   targetLang: string,
   _sourceLang: string | undefined
 ): Promise<OffscreenResponse> {
-  if (!translationPipeline) {
-    // 模型尚未下載，返回 notDownloaded 標記。
-    return {
-      type: 'local-onnx:translate-result',
-      ok: false,
-      notDownloaded: true,
-      error: 'Local ONNX model not downloaded',
-    } satisfies OffscreenResponse;
+  // lazy 恢復：pipeline 未載入但快取存在 → 自動載入（Offscreen 重啟後無需重新下載）。
+  if (translationPipeline === null) {
+    try {
+      if (await hasModelInCache()) {
+        await ensurePipelineLoaded();
+      }
+    } catch (err) {
+      // §5.6：lazy 載入失敗必須落診斷（不靜默回 notDownloaded）。
+      const error = toReadableError(err);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-pipeline-load-failed',
+          recoverable: true,
+          cause: error,
+        },
+      });
+      return {
+        type: 'local-onnx:translate-result',
+        ok: false,
+        notDownloaded: true,
+        error: error.message,
+      } satisfies OffscreenResponse;
+    }
+    if (translationPipeline === null) {
+      // 快取不存在 → 模型確實未下載。
+      return {
+        type: 'local-onnx:translate-result',
+        ok: false,
+        notDownloaded: true,
+        error: 'Local ONNX model not downloaded',
+      } satisfies OffscreenResponse;
+    }
   }
 
   try {
@@ -493,14 +586,14 @@ async function runInference(
     const prompt = `You are a professional subtitle translator. Translate the following text into ${langName}. Output ONLY the translated text without explanations.\n\nText: ${text}`;
 
     // 執行推理（使用 pipeline 的 text-generation 功能）。
+    // 貪婪解碼（do_sample:false）並降低 max_new_tokens，避免 wasm 記憶體峰值過高觸發 trap。
     const pipelineFn = translationPipeline as (
       input: string,
       options?: Record<string, unknown>
     ) => Promise<Array<{ generated_text: string }>>;
 
     const result = await pipelineFn(prompt, {
-      max_new_tokens: 128,
-      temperature: 0.1,
+      max_new_tokens: 96,
       do_sample: false,
     });
 
@@ -516,7 +609,7 @@ async function runInference(
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
-    const error = err instanceof Error ? err : new Error(String(err));
+    const error = toReadableError(err);
     recordDiagnostic({
       type: 'pipeline-error',
       error: {
@@ -561,3 +654,20 @@ function getLanguageName(langCode: string): string {
   };
   return map[langCode] ?? langCode;
 }
+
+// ============================================================
+// 測試導出（僅集成測試引用；runtime 入口不受影響）
+// ============================================================
+
+/** 重置模組內模型載入狀態（避免跨測試污染）。 */
+export function resetLocalOnnxModuleForTest(): void {
+  translationPipeline = null;
+  loadPromise = null;
+}
+
+/** 供測試直接調用內部狀態檢查/推理邏輯。 */
+export const _testExports = {
+  hasModelInCache,
+  checkModelStatus,
+  runInference,
+};

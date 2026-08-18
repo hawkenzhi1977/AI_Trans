@@ -175,6 +175,8 @@ function describeTranslation(c: EngineConfig): string {
       return `翻譯: 本地模型${model ? ` (${model})` : ''}`;
     case 'mt':
       return '翻譯: 傳統 MT';
+    case 'local-onnx':
+      return '翻譯: 本地 ONNX 模型';
   }
 }
 

@@ -94,6 +94,41 @@ describe('Orchestrator 集成：原生字幕策略閉環', () => {
     );
   });
 
+  it('type=local-onnx 時以 local-onnx 作為 primary 翻譯引擎', async () => {
+    const platform = new MockYouTubeAdapter({
+      tracks: [staticTrack('en', [nativeSeg(0)])],
+    });
+    const localOnnx = new StubTranslationProvider({
+      engineId: 'local-onnx',
+      prefix: '[onnx]',
+      location: 'local',
+    });
+    const registry = buildTestRegistry({
+      platforms: [platform],
+      translation: new Map<string, TranslationProvider>([
+        ['local-onnx', localOnnx],
+        ['mt', new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' })],
+      ]),
+    });
+    const events: PipelineEvent[] = [];
+    const orch = new Orchestrator(
+      {
+        registry,
+        getConfig: async () => ({
+          ...DEFAULT_CONFIG,
+          translation: { type: 'local-onnx', fallbackType: 'mt' },
+        }),
+        enableAsr: false,
+      },
+      (e) => events.push(e)
+    );
+
+    await orch.start(WATCH_URL);
+    const ready = events.find((e) => e.type === 'segments-ready');
+    const segs = (ready as { segments: SubtitleSegment[] }).segments;
+    expect(segs[0].translatedText).toBe('[onnx]native line 0');
+  });
+
   it('無字幕軌時降級（NativeCaptionStrategy 不適用）', async () => {
     const platform = new MockYouTubeAdapter({ tracks: [] });
     const registry = buildTestRegistry({ platforms: [platform] });
