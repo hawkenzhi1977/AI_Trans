@@ -201,4 +201,27 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
       )
       .toBeTruthy();
   });
+
+  test('[補充修復十] 本地 ONNX wasm 資源在網頁上下文可載入（WAR ort 白名單生效）', async ({ page, context }) => {
+    // content-script（LocalWhisperASR）在宿主頁面環境 dynamic-import 擴充內 wasm 需
+    // web_accessible_resources 白名單；缺 `src/runtime/ort/*` 會「Failed to fetch ...
+    // jsep.mjs → no available backend found」。本用例以網頁上下文 fetch 同資源驗證 WAR 生效。
+    await page.goto('/watch?v=war-check');
+
+    let [sw] = context.serviceWorkers();
+    if (!sw) sw = await context.waitForEvent('serviceworker');
+    const extId = new URL(sw.url()).host;
+
+    const result = await page.evaluate(async (id) => {
+      const res = await fetch(
+        `chrome-extension://${id}/src/runtime/ort/ort-wasm-simd-threaded.jsep.mjs`
+      );
+      const text = await res.text();
+      return { status: res.status, ok: res.ok, hasCode: text.includes('import') };
+    }, extId);
+
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe(200);
+    expect(result.hasCode).toBe(true);
+  });
 });

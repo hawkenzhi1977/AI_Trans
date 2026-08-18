@@ -50198,9 +50198,11 @@ Output example:
   };
 
   // src/adapters/translation/local-onnx-translation.ts
-  var LocalONNXTranslationProvider = class {
+  var LocalONNXTranslationProvider = class _LocalONNXTranslationProvider {
     engineId = "local-onnx";
     location = "local";
+    /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
+    static CHUNK_SIZE = 5;
     defaultTargetLang;
     isPrimary;
     constructor(config) {
@@ -50209,19 +50211,44 @@ Output example:
       this.isPrimary = config.isPrimary ?? false;
     }
     /**
-     * 非流式翻譯——透過 chrome.runtime.sendMessage 發送請求給 Service Worker。
-     * Service Worker 轉發給 Offscreen Document 執行 ONNX 推理。
+     * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。
+     * 分塊避免單次輸入過長壓垮小模型（回顯原文根因之一）。
      */
     async translate(req) {
-      const combinedText = req.segments.map((s) => s.sourceText).join("\n");
       const targetLang = req.targetLang ?? this.defaultTargetLang;
-      const request = {
-        topic: "local-onnx:translate",
-        payload: {
-          text: combinedText,
-          targetLang
+      const translatedSegments = [];
+      for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
+        const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
+        const combinedText = chunk.map((s) => s.sourceText).join("\n");
+        const request = {
+          topic: "local-onnx:translate",
+          payload: {
+            text: combinedText,
+            targetLang
+          }
+        };
+        const res = await this.requestTranslate(request);
+        const translatedTexts = (res.translatedText ?? "").split("\n");
+        for (const [j, seg] of chunk.entries()) {
+          translatedSegments.push({
+            ...seg,
+            // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
+            translatedText: translatedTexts[j]?.trim() || seg.sourceText
+          });
         }
+      }
+      return {
+        engineId: this.engineId,
+        degraded: !this.isPrimary,
+        // primary 成功不標降級；作 fallback 時仍標記。
+        segments: translatedSegments
       };
+    }
+    /**
+     * 發送單次翻譯請求並校驗結果。
+     * §5.6：模型未下載/推理失敗/sendMessage 通信失敗都必須落診斷。
+     */
+    async requestTranslate(request) {
       try {
         const response = await chrome.runtime.sendMessage(request);
         const res = response;
@@ -50238,17 +50265,7 @@ Output example:
           });
           throw error;
         }
-        const translatedTexts = (res.translatedText ?? "").split("\n");
-        const segments = req.segments.map((s, i) => ({
-          ...s,
-          translatedText: translatedTexts[i]?.trim() ?? s.sourceText
-        }));
-        return {
-          engineId: this.engineId,
-          degraded: !this.isPrimary,
-          // primary 成功不標降級；作 fallback 時仍標記。
-          segments
-        };
+        return res;
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         recordDiagnostic({

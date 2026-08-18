@@ -170,8 +170,21 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
       });
       return true;
     case 'local-onnx:translate': {
-      const translateMsg = message as { topic: string; text: string; targetLang: string; sourceLang?: string };
-      void runInference(translateMsg.text, translateMsg.targetLang, translateMsg.sourceLang).then((result) => {
+      // 若 SW 轉發 port 通道已建立，本入口跳過——由 port 路徑處理，避免雙重推理
+      // （chrome.runtime.sendMessage 會同時廣播給 SW 與 offscreen）。
+      if (onnxPortConnected) return false;
+      const translateMsg = message as {
+        topic: string;
+        payload?: { text?: string; targetLang?: string; sourceLang?: string };
+        text?: string;
+        targetLang?: string;
+        sourceLang?: string;
+      };
+      void runInference(
+        translateMsg.payload?.text ?? translateMsg.text ?? '',
+        translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? '',
+        translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
+      ).then((result) => {
         sendResponse(result);
         broadcastToAll(result);
       });
@@ -185,11 +198,21 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
  * 主動建立 port 連接到 Service Worker。
  * 確保消息傳遞鏈路可靠（避免 chrome.runtime.sendMessage 的廣播循環問題）。
  */
+let onnxPortConnected = false;
 function connectToServiceWorker(): void {
   const port = chrome.runtime.connect({ name: 'offscreen-onnx' });
+  onnxPortConnected = true;
 
   port.onMessage.addListener(async (message: unknown) => {
-    const msg = message as { topic?: string; type?: string; messageId?: string; text?: string; targetLang?: string; sourceLang?: string };
+    const msg = message as {
+      topic?: string;
+      type?: string;
+      messageId?: string;
+      payload?: { text?: string; targetLang?: string; sourceLang?: string };
+      text?: string;
+      targetLang?: string;
+      sourceLang?: string;
+    };
     const type = msg.topic ?? msg.type;
     const messageId = msg.messageId;
 
@@ -211,7 +234,12 @@ function connectToServiceWorker(): void {
           broadcastToAll(result as OffscreenResponse);
           break;
         case 'local-onnx:translate':
-          result = await runInference(msg.text ?? '', msg.targetLang ?? '', msg.sourceLang);
+          // 統一消息形狀：優先 payload（provider 用 { payload: { text } }），兼容舊頂層 text。
+          result = await runInference(
+            msg.payload?.text ?? msg.text ?? '',
+            msg.payload?.targetLang ?? msg.targetLang ?? '',
+            msg.payload?.sourceLang ?? msg.sourceLang
+          );
           broadcastToAll(result as OffscreenResponse);
           break;
         default:
@@ -227,6 +255,7 @@ function connectToServiceWorker(): void {
 
   port.onDisconnect.addListener(() => {
     // Port 斷開時重新連接（Service Worker 可能重啟）。
+    onnxPortConnected = false;
     setTimeout(() => connectToServiceWorker(), 1000);
   });
 }
@@ -581,31 +610,52 @@ async function runInference(
   }
 
   try {
-    // 構造 Qwen2.5 翻譯 Prompt。
-    const langName = getLanguageName(targetLang);
-    const prompt = `You are a professional subtitle translator. Translate the following text into ${langName}. Output ONLY the translated text without explanations.\n\nText: ${text}`;
+    // 構造 Qwen2.5 翻譯 Prompt（ChatML + 行號標記 + few-shot）。
+    // M2-24 補充修復十一：純文本指令對 0.5B 小模型遵循度極低 → 模型回顯原文
+    // （兩行一模一樣的英文）；改 ChatML 格式 + 行號對齊 + 示例。
+    const sourceLines = text.split('\n');
+    const prompt = buildPrompt(text, targetLang);
 
     // 執行推理（使用 pipeline 的 text-generation 功能）。
-    // 貪婪解碼（do_sample:false）並降低 max_new_tokens，避免 wasm 記憶體峰值過高觸發 trap。
+    // 貪婪解碼 + repetition_penalty 抑制回顯；max_new_tokens 分塊後輸入變短，
+    // 256 足夠完成翻譯（96 曾把預算耗在回顯上）。
     const pipelineFn = translationPipeline as (
       input: string,
       options?: Record<string, unknown>
     ) => Promise<Array<{ generated_text: string }>>;
 
     const result = await pipelineFn(prompt, {
-      max_new_tokens: 96,
+      max_new_tokens: 256,
       do_sample: false,
+      repetition_penalty: 1.1,
     });
 
-    // 解析生成結果——提取翻譯文本。
+    // 解析生成結果——按行號還原譯文。
     const generatedText = result[0]?.generated_text ?? '';
-    // 移除 prompt 前綴，只保留翻譯結果。
-    const translatedText = generatedText.replace(prompt, '').trim();
+    // 麵包屑：保留原始生成文本前 500 字符，供診斷模型行為（§5.6 留痕）。
+    console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
+
+    const { translatedLines, echoed } = parseNumberedOutput(generatedText, sourceLines);
+
+    if (echoed) {
+      // §5.6：模型回顯原文屬低質量輸出——落診斷，popup「最近失敗」可查。
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-echo-output',
+          recoverable: true,
+          cause: new Error(
+            'local ONNX model echoed input instead of translating (low quality output)'
+          ),
+        },
+      });
+    }
 
     return {
       type: 'local-onnx:translate-result',
       ok: true,
-      translatedText,
+      translatedText: translatedLines.join('\n'),
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
@@ -625,6 +675,101 @@ async function runInference(
       error: error.message,
     } satisfies OffscreenResponse;
   }
+}
+
+/**
+ * 目標語言 few-shot 示例（英 → 目標語）。
+ * 小模型對示例的遵循度遠高於文字指令（M1-55 教訓）；示例行號用 9/10 與實際輸入行號
+ * （1..N）區分，避免模型把示例當作輸入內容。未覆蓋語言僅用行號指令（大模型可理解）。
+ */
+const FEW_SHOT_LINES: Record<string, Array<[string, string]>> = {
+  'Traditional Chinese': [
+    ['Hello, world.', '你好，世界。'],
+    ['How are you?', '你好嗎？'],
+  ],
+  'Simplified Chinese': [
+    ['Hello, world.', '你好，世界。'],
+    ['How are you?', '你好吗？'],
+  ],
+  Japanese: [
+    ['Hello, world.', 'こんにちは、世界。'],
+    ['How are you?', 'お元気ですか？'],
+  ],
+  Korean: [
+    ['Hello, world.', '안녕하세요, 세계.'],
+    ['How are you?', '잘 지내세요?'],
+  ],
+  Spanish: [
+    ['Hello, world.', 'Hola, mundo.'],
+    ['How are you?', '¿Cómo estás?'],
+  ],
+  French: [
+    ['Hello, world.', 'Bonjour le monde.'],
+    ['How are you?', 'Comment allez-vous ?'],
+  ],
+  German: [
+    ['Hello, world.', 'Hallo, Welt.'],
+    ['How are you?', 'Wie geht es dir?'],
+  ],
+  Portuguese: [
+    ['Hello, world.', 'Olá, mundo.'],
+    ['How are you?', 'Como você está?'],
+  ],
+  Russian: [
+    ['Hello, world.', 'Привет, мир.'],
+    ['How are you?', 'Как дела?'],
+  ],
+};
+
+/**
+ * 構造翻譯 Prompt——ChatML 格式 + 行號標記 + 目標語言 few-shot。
+ * Qwen2.5 系列（0.5B~72B）均使用 ChatML，換更大 Qwen 模型天然兼容；
+ * 換非 Qwen 架構時僅需修改本函數（單點改動）。
+ * 行號對齊讓模型按「行號 → 譯文」輸出，避免多行重排/錯位導致譯文落回原文。
+ */
+function buildPrompt(text: string, targetLang: string): string {
+  const langName = getLanguageName(targetLang);
+  const numbered = text
+    .split('\n')
+    .map((line, i) => `${i + 1}. ${line}`)
+    .join('\n');
+
+  const fewShot = FEW_SHOT_LINES[langName];
+  const fewShotText = fewShot
+    ? `\nExamples:\n${fewShot.map(([src, dst]) => `9. ${src}\n9. ${dst}`).join('\n')}`
+    : '';
+
+  return `<|im_start|>system
+You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+<|im_end|>
+<|im_start|>user
+${numbered}
+<|im_end|>
+<|im_start|>assistant
+`;
+}
+
+/**
+ * 解析模型的「行號 → 譯文」輸出，按輸入行序還原譯文數組。
+ * 缺行/無效行以原文兜底；全部回顯原文時標記低質量（echo），供調用方留診斷。
+ */
+function parseNumberedOutput(
+  generated: string,
+  sourceLines: string[]
+): { translatedLines: string[]; echoed: boolean } {
+  const parsed = new Map<number, string>();
+  for (const line of generated.split('\n')) {
+    const m = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
+    if (m) {
+      const idx = Number(m[1]) - 1;
+      const val = m[2].trim();
+      if (idx >= 0 && val.length > 0) parsed.set(idx, val);
+    }
+  }
+  const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
+  const echoed =
+    sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
+  return { translatedLines, echoed };
 }
 
 /** 語言代碼映射為語言名稱（用於 Prompt）。 */
@@ -670,4 +815,7 @@ export const _testExports = {
   hasModelInCache,
   checkModelStatus,
   runInference,
+  clearModelCache,
+  buildPrompt,
+  parseNumberedOutput,
 };

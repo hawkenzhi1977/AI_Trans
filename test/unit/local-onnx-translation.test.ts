@@ -135,6 +135,52 @@ describe('LocalONNXTranslationProvider', () => {
     expect(result.segments[1].translatedText).toBe('line-1'); // 使用 sourceText 填充
   });
 
+  it('分塊翻譯：>5 行時按 CHUNK_SIZE 分多次請求並合併對齊', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      targetLang: 'zh-Hant',
+    });
+
+    const segments = Array.from({ length: 6 }, (_, i) => seg(i));
+    // 依請求文本逐行加前綴返回譯文，模擬 Offscreen 行號對齊輸出。
+    vi.mocked(chrome.runtime.sendMessage).mockImplementation(async (msg) => {
+      const reqMsg = msg as { payload?: { text?: string } };
+      const text = reqMsg.payload?.text ?? '';
+      return {
+        ok: true,
+        translatedText: text
+          .split('\n')
+          .map((l) => `T:${l}`)
+          .join('\n'),
+      };
+    });
+
+    const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+    // 6 行 → ceil(6/5) = 2 次請求；結果按序合併。
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(2);
+    expect(result.segments).toHaveLength(6);
+    expect(result.segments[0].translatedText).toBe('T:line-0');
+    expect(result.segments[4].translatedText).toBe('T:line-4');
+    expect(result.segments[5].translatedText).toBe('T:line-5');
+  });
+
+  it('分塊翻譯：空譯文行回退原文（不渲染空行）', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({
+      ok: true,
+      translatedText: '第一行譯文\n',
+    });
+
+    const result = await provider.translate(req());
+
+    expect(result.segments[0].translatedText).toBe('第一行譯文');
+    expect(result.segments[1].translatedText).toBe('line-1'); // 空譯文 → 原文
+  });
+
   it('isPrimary=true 時成功結果不標記 degraded', async () => {
     const provider = new LocalONNXTranslationProvider({
       modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',

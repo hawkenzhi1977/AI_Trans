@@ -43,6 +43,9 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   readonly engineId = 'local-onnx';
   readonly location = 'local' as const;
 
+  /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
+  private static readonly CHUNK_SIZE = 5;
+
   private readonly defaultTargetLang: string;
   private readonly isPrimary: boolean;
 
@@ -54,28 +57,58 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 非流式翻譯——透過 chrome.runtime.sendMessage 發送請求給 Service Worker。
-   * Service Worker 轉發給 Offscreen Document 執行 ONNX 推理。
+   * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。
+   * 分塊避免單次輸入過長壓垮小模型（回顯原文根因之一）。
    */
   async translate(req: TranslationRequest): Promise<TranslationResult> {
-    // 合併所有 segments 的 sourceText 為單一請求（減少推理次數）。
-    const combinedText = req.segments.map((s) => s.sourceText).join('\n');
     const targetLang = req.targetLang ?? this.defaultTargetLang;
+    const translatedSegments: SubtitleSegment[] = [];
 
-    const request: LocalOnnxTranslateRequest = {
-      topic: 'local-onnx:translate',
-      payload: {
-        text: combinedText,
-        targetLang,
-      },
+    for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
+      const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
+      // 合併該 chunk 的 sourceText 為單一請求（減少推理次數）。
+      const combinedText = chunk.map((s) => s.sourceText).join('\n');
+
+      const request: LocalOnnxTranslateRequest = {
+        topic: 'local-onnx:translate',
+        payload: {
+          text: combinedText,
+          targetLang,
+        },
+      };
+
+      const res = await this.requestTranslate(request);
+
+      // 解析翻譯結果——將單一結果拆分回各 segment（行號對齊由 Offscreen 端保證）。
+      const translatedTexts = (res.translatedText ?? '').split('\n');
+      for (const [j, seg] of chunk.entries()) {
+        translatedSegments.push({
+          ...seg,
+          // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
+          translatedText: translatedTexts[j]?.trim() || seg.sourceText,
+        });
+      }
+    }
+
+    return {
+      engineId: this.engineId,
+      degraded: !this.isPrimary, // primary 成功不標降級；作 fallback 時仍標記。
+      segments: translatedSegments,
     };
+  }
 
+  /**
+   * 發送單次翻譯請求並校驗結果。
+   * §5.6：模型未下載/推理失敗/sendMessage 通信失敗都必須落診斷。
+   */
+  private async requestTranslate(
+    request: LocalOnnxTranslateRequest
+  ): Promise<LocalOnnxTranslateResponse> {
     try {
       const response = await chrome.runtime.sendMessage(request);
       const res = response as LocalOnnxTranslateResponse;
 
       if (!res.ok) {
-        // §5.6：模型未下載或推理失敗必須落診斷。
         const error = new Error(res.error ?? 'local-onnx translation failed');
         recordDiagnostic({
           type: 'pipeline-error',
@@ -88,19 +121,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         });
         throw error;
       }
-
-      // 解析翻譯結果——將單一結果拆分回各 segment。
-      const translatedTexts = (res.translatedText ?? '').split('\n');
-      const segments: SubtitleSegment[] = req.segments.map((s, i) => ({
-        ...s,
-        translatedText: translatedTexts[i]?.trim() ?? s.sourceText,
-      }));
-
-      return {
-        engineId: this.engineId,
-        degraded: !this.isPrimary, // primary 成功不標降級；作 fallback 時仍標記。
-        segments,
-      };
+      return res;
     } catch (err) {
       // §5.6：chrome.runtime.sendMessage 失敗（如 SW 崩潰、Offscreen 未建立）必須落診斷。
       const error = err instanceof Error ? err : new Error(String(err));

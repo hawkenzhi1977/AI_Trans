@@ -48599,8 +48599,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         });
         return true;
       case "local-onnx:translate": {
+        if (onnxPortConnected) return false;
         const translateMsg = message;
-        void runInference(translateMsg.text, translateMsg.targetLang, translateMsg.sourceLang).then((result) => {
+        void runInference(
+          translateMsg.payload?.text ?? translateMsg.text ?? "",
+          translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? "",
+          translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
+        ).then((result) => {
           sendResponse(result);
           broadcastToAll(result);
         });
@@ -48609,8 +48614,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     return false;
   });
+  var onnxPortConnected = false;
   function connectToServiceWorker() {
     const port = chrome.runtime.connect({ name: "offscreen-onnx" });
+    onnxPortConnected = true;
     port.onMessage.addListener(async (message) => {
       const msg = message;
       const type = msg.topic ?? msg.type;
@@ -48632,7 +48639,11 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             broadcastToAll(result);
             break;
           case "local-onnx:translate":
-            result = await runInference(msg.text ?? "", msg.targetLang ?? "", msg.sourceLang);
+            result = await runInference(
+              msg.payload?.text ?? msg.text ?? "",
+              msg.payload?.targetLang ?? msg.targetLang ?? "",
+              msg.payload?.sourceLang ?? msg.sourceLang
+            );
             broadcastToAll(result);
             break;
           default:
@@ -48644,6 +48655,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       port.postMessage({ messageId, result, error });
     });
     port.onDisconnect.addListener(() => {
+      onnxPortConnected = false;
       setTimeout(() => connectToServiceWorker(), 1e3);
     });
   }
@@ -48879,21 +48891,34 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       }
     }
     try {
-      const langName = getLanguageName(targetLang);
-      const prompt = `You are a professional subtitle translator. Translate the following text into ${langName}. Output ONLY the translated text without explanations.
-
-Text: ${text}`;
+      const sourceLines = text.split("\n");
+      const prompt = buildPrompt(text, targetLang);
       const pipelineFn = translationPipeline;
       const result = await pipelineFn(prompt, {
-        max_new_tokens: 96,
-        do_sample: false
+        max_new_tokens: 256,
+        do_sample: false,
+        repetition_penalty: 1.1
       });
       const generatedText = result[0]?.generated_text ?? "";
-      const translatedText = generatedText.replace(prompt, "").trim();
+      console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
+      const { translatedLines, echoed } = parseNumberedOutput(generatedText, sourceLines);
+      if (echoed) {
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-echo-output",
+            recoverable: true,
+            cause: new Error(
+              "local ONNX model echoed input instead of translating (low quality output)"
+            )
+          }
+        });
+      }
       return {
         type: "local-onnx:translate-result",
         ok: true,
-        translatedText
+        translatedText: translatedLines.join("\n")
       };
     } catch (err) {
       const error = toReadableError(err);
@@ -48912,6 +48937,75 @@ Text: ${text}`;
         error: error.message
       };
     }
+  }
+  var FEW_SHOT_LINES = {
+    "Traditional Chinese": [
+      ["Hello, world.", "\u4F60\u597D\uFF0C\u4E16\u754C\u3002"],
+      ["How are you?", "\u4F60\u597D\u55CE\uFF1F"]
+    ],
+    "Simplified Chinese": [
+      ["Hello, world.", "\u4F60\u597D\uFF0C\u4E16\u754C\u3002"],
+      ["How are you?", "\u4F60\u597D\u5417\uFF1F"]
+    ],
+    Japanese: [
+      ["Hello, world.", "\u3053\u3093\u306B\u3061\u306F\u3001\u4E16\u754C\u3002"],
+      ["How are you?", "\u304A\u5143\u6C17\u3067\u3059\u304B\uFF1F"]
+    ],
+    Korean: [
+      ["Hello, world.", "\uC548\uB155\uD558\uC138\uC694, \uC138\uACC4."],
+      ["How are you?", "\uC798 \uC9C0\uB0B4\uC138\uC694?"]
+    ],
+    Spanish: [
+      ["Hello, world.", "Hola, mundo."],
+      ["How are you?", "\xBFC\xF3mo est\xE1s?"]
+    ],
+    French: [
+      ["Hello, world.", "Bonjour le monde."],
+      ["How are you?", "Comment allez-vous ?"]
+    ],
+    German: [
+      ["Hello, world.", "Hallo, Welt."],
+      ["How are you?", "Wie geht es dir?"]
+    ],
+    Portuguese: [
+      ["Hello, world.", "Ol\xE1, mundo."],
+      ["How are you?", "Como voc\xEA est\xE1?"]
+    ],
+    Russian: [
+      ["Hello, world.", "\u041F\u0440\u0438\u0432\u0435\u0442, \u043C\u0438\u0440."],
+      ["How are you?", "\u041A\u0430\u043A \u0434\u0435\u043B\u0430?"]
+    ]
+  };
+  function buildPrompt(text, targetLang) {
+    const langName = getLanguageName(targetLang);
+    const numbered = text.split("\n").map((line, i) => `${i + 1}. ${line}`).join("\n");
+    const fewShot = FEW_SHOT_LINES[langName];
+    const fewShotText = fewShot ? `
+Examples:
+${fewShot.map(([src, dst]) => `9. ${src}
+9. ${dst}`).join("\n")}` : "";
+    return `<|im_start|>system
+You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+<|im_end|>
+<|im_start|>user
+${numbered}
+<|im_end|>
+<|im_start|>assistant
+`;
+  }
+  function parseNumberedOutput(generated, sourceLines) {
+    const parsed = /* @__PURE__ */ new Map();
+    for (const line of generated.split("\n")) {
+      const m = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
+      if (m) {
+        const idx = Number(m[1]) - 1;
+        const val = m[2].trim();
+        if (idx >= 0 && val.length > 0) parsed.set(idx, val);
+      }
+    }
+    const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
+    const echoed = sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
+    return { translatedLines, echoed };
   }
   function getLanguageName(langCode) {
     const map = {
@@ -48946,7 +49040,10 @@ Text: ${text}`;
   var _testExports = {
     hasModelInCache,
     checkModelStatus,
-    runInference
+    runInference,
+    clearModelCache,
+    buildPrompt,
+    parseNumberedOutput
   };
 })();
 /*! Bundled license information:

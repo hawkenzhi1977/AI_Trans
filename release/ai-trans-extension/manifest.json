@@ -39,6 +39,10 @@
     {
       "resources": ["src/runtime/yt-timedtext-interceptor.js"],
       "matches": ["https://www.youtube.com/*"]
+    },
+    {
+      "resources": ["src/runtime/ort/*"],
+      "matches": ["https://www.youtube.com/*"]
     }
   ]
 }

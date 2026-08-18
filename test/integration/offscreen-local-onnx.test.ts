@@ -46,8 +46,9 @@ const MODEL_ONNX_URL =
   'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/onnx/model_q4.onnx';
 
 describe('offscreen local-onnx 模型載入彈性化', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
   });
 
@@ -81,8 +82,8 @@ describe('offscreen local-onnx 模型載入彈性化', () => {
   it('runInference：pipeline 未載入但快取存在 → lazy 載入並成功翻譯', async () => {
     installCaches([makeRequest(MODEL_ONNX_URL)]);
     // pipeline() 返回可調用的推理函數；生成文本 = prompt + 翻譯結果。
-    transformersMock.pipeline.mockResolvedValue(async (input: string) => [
-      { generated_text: `${input}你好` },
+    transformersMock.pipeline.mockResolvedValue(async () => [
+      { generated_text: '1. 你好' },
     ]);
 
     const res = await _testExports.runInference('hello world', 'zh-Hant', undefined);
@@ -150,5 +151,122 @@ describe('offscreen local-onnx 模型載入彈性化', () => {
     installEmptyCaches();
     const res = await _testExports.checkModelStatus();
     expect((res as { downloaded: boolean }).downloaded).toBe(false);
+  });
+});
+
+describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    resetLocalOnnxModuleForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it('buildPrompt：ChatML 格式 + 行號標記 + 目標語言 few-shot', () => {
+    const prompt = _testExports.buildPrompt('Hello\nWorld', 'zh-Hant');
+    expect(prompt).toContain('<|im_start|>system');
+    expect(prompt).toContain('Traditional Chinese');
+    expect(prompt).toContain('1. Hello\n2. World');
+    expect(prompt).toContain('Examples:');
+    expect(prompt).toContain('<|im_start|>assistant');
+  });
+
+  it('buildPrompt：未覆蓋語言無 few-shot 但保留行號指令', () => {
+    const prompt = _testExports.buildPrompt('Hi', 'xh');
+    expect(prompt).not.toContain('Examples:');
+    expect(prompt).toContain('1. Hi');
+  });
+
+  it('parseNumberedOutput：行號對齊還原譯文', () => {
+    const { translatedLines, echoed } = _testExports.parseNumberedOutput(
+      '1. 你好\n2. 世界',
+      ['Hello', 'World']
+    );
+    expect(translatedLines).toEqual(['你好', '世界']);
+    expect(echoed).toBe(false);
+  });
+
+  it('parseNumberedOutput：缺行以原文兜底', () => {
+    const { translatedLines } = _testExports.parseNumberedOutput('2. 世界', ['Hello', 'World']);
+    expect(translatedLines).toEqual(['Hello', '世界']);
+  });
+
+  it('parseNumberedOutput：全部回顯原文標記 echo', () => {
+    const { translatedLines, echoed } = _testExports.parseNumberedOutput(
+      '1. Hello\n2. World',
+      ['Hello', 'World']
+    );
+    expect(translatedLines).toEqual(['Hello', 'World']);
+    expect(echoed).toBe(true);
+  });
+
+  it('runInference：mock 返回行號譯文 → 按行序回傳，prompt 含 ChatML/行號', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    let capturedInput = '';
+    transformersMock.pipeline.mockResolvedValue(async (input: string) => {
+      capturedInput = input;
+      return [{ generated_text: '1. 你好\n2. 世界' }];
+    });
+
+    const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    expect((res as { translatedText?: string }).translatedText).toBe('你好\n世界');
+    expect(capturedInput).toContain('<|im_start|>system');
+    expect(capturedInput).toContain('1. Hello\n2. World');
+  });
+
+  it('runInference：模型回顯原文 → 落 echo 診斷（storage.local 寫入）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => [
+      { generated_text: '1. Hello\n2. World' },
+    ]);
+
+    const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    expect(chrome.storage.local.set).toHaveBeenCalled();
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic.message).toContain('echoed input');
+  });
+
+  it('runInference：無回顯（正常翻譯）不寫 echo 診斷', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => [
+      { generated_text: '1. 你好\n2. 世界' },
+    ]);
+
+    const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic).toBeUndefined();
+  });
+
+  it('clearModelCache：刪除 transformers 相關 Cache API 與 IndexedDB 快取', async () => {
+    const deleteCache = vi.fn(async () => true);
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache', 'other-cache']),
+      delete: deleteCache,
+      open: vi.fn(),
+    });
+    vi.stubGlobal('indexedDB', {
+      databases: vi.fn(async () => [{ name: 'transformers-cache' }, { name: 'other-db' }]),
+      deleteDatabase: vi.fn(),
+    });
+
+    const res = await _testExports.clearModelCache();
+
+    expect(res.ok).toBe(true);
+    expect(deleteCache).toHaveBeenCalledWith('transformers-cache');
+    expect(deleteCache).not.toHaveBeenCalledWith('other-cache');
+    // 無失敗診斷寫入。
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic).toBeUndefined();
   });
 });
