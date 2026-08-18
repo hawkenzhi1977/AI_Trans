@@ -403,6 +403,36 @@
 - **開發者響應**: 觀察 `console.warn` 的 `expected N lines, got M (missing K)` 判斷截斷程度；觀察 `duplicate translations detected — N values appear multiple times` 判斷重複程度；若頻繁出現且 `max_tokens` 已設大，可能是模型能力問題而非配置問題
 - **代碼落點**: src/adapters/translation/llm-translation.ts（`translateChunkOnce` 解析後 `map.size < chunk.length` 判斷 + `valueCounts` 重複檢測 + `console.warn` 輸出）
 
+### 4.13 本地 ONNX 翻譯模型未下載（M2-24）
+
+- **診斷碼**: local-onnx-not-downloaded
+- **用戶可見消息**: 最近失敗: 錯誤: Error: local ONNX translation model not downloaded (<timestamp>)
+- **觸發條件**: `LocalONNXTranslationProvider.translate()` 被調用，但模型尚未下載到 IndexedDB
+- **根因**: 用戶未在 Options 頁點擊「下載模型」；模型快取被清除；下載中斷未完成
+- **用戶響應**: 前往 Options 頁「本地兜底模型」分區點擊「下載模型」按鈕
+- **開發者響應**: 確認 `local-onnx:check-status` 消息正確返回 `not-downloaded`；檢查 Offscreen Document 下載邏輯
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts:30-35
+
+### 4.14 本地 ONNX 翻譯推理失敗（M2-24）
+
+- **診斷碼**: local-onnx-translation-failed: <錯誤>
+- **用戶可見消息**: 最近失敗: 錯誤: Error: local-onnx-translation-failed: <錯誤> (<timestamp>)
+- **觸發條件**: Offscreen Document 的 `local-onnx:translate` 消息處理拋錯（模型加載失敗/推理異常/記憶體不足）
+- **根因**: 瀏覽器記憶體不足（ONNX 模型約 350MB）；WebAssembly 執行環境異常；模型檔案損壞
+- **用戶響應**: 關閉其他分頁釋放記憶體；重新下載模型；刷新頁面
+- **開發者響應**: 檢查 Offscreen Document console 錯誤；確認 `@huggingface/transformers` pipeline 初始化是否正常
+- **代碼落點**: src/runtime/offscreen.ts（`local-onnx:translate` 消息處理）
+
+### 4.15 本地 ONNX 翻譯消息通信失敗（M2-24）
+
+- **診斷碼**: local-onnx-communication-failed: <錯誤>
+- **用戶 Visible 消息**: 最近失敗: 錯誤: Error: local-onnx-communication-failed: <錯誤> (<timestamp>)
+- **觸發條件**: content-script 向 Service Worker 發送 `local-onnx:*` 消息失敗（SW 未啟動/Offscreen Document 未創建）
+- **根因**: Service Worker 被掛起後未正確喚醒；Offscreen Document 創建失敗；消息路由異常
+- **用戶響應**: 刷新頁面；重啟瀏覽器
+- **開發者響應**: 檢查 `ensureOffscreenDocument()` 邏輯；確認消息監聽器註冊
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts:25-28（`sendMessage` 失敗處理）
+
 
 ---
 

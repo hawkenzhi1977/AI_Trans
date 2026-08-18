@@ -37,6 +37,7 @@
         <label for="translation-fallback">失敗兜底</label>
         <select id="translation-fallback">
           <option value="mt">MT 兜底</option>
+          <option value="local-onnx">本地 ONNX 小模型（推薦）</option>
           <option value="none">不兜底</option>
         </select>
       </div>
@@ -47,6 +48,36 @@
     <input id="translation-endpoint" type="text" placeholder="https://api.openai.com/v1/chat/completions" />
     <label for="translation-api-key">API Key（本地安全存儲）</label>
     <input id="translation-api-key" type="password" autocomplete="off" placeholder="sk-..." />
+  </fieldset>
+
+  <h2>本地兜底模型（Local ONNX Fallback）</h2>
+  <fieldset id="local-onnx-section">
+    <p class="hint">當雲端 API 失敗或無網路時自動切換至此本地模型進行翻譯。模型下載後會快取在瀏覽器中，無需重複下載。</p>
+    <label for="local-model-name">模型名稱（唯讀）</label>
+    <input id="local-model-name" type="text" value="onnx-community/Qwen2.5-0.5B-Instruct" disabled />
+    <p class="hint">目前為固定兜底模型，暫不支援修改。</p>
+
+    <div style="margin-top: 12px;">
+      <label>模型狀態</label>
+      <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+        <span id="local-model-status-badge" style="padding: 4px 10px; border-radius: 12px; font-size: 12px; background: #eee; color: #666;">檢測中...</span>
+        <span id="local-model-size-info" style="font-size: 12px; color: #888;">約 350 MB</span>
+      </div>
+    </div>
+
+    <div id="local-model-progress-container" style="display: none; margin-top: 12px;">
+      <label>下載進度</label>
+      <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+        <progress id="local-model-progress-bar" value="0" max="100" style="flex: 1; height: 20px;"></progress>
+        <span id="local-model-progress-text" style="font-size: 12px; min-width: 40px;">0%</span>
+      </div>
+      <p id="local-model-progress-detail" class="hint" style="margin-top: 4px;"></p>
+    </div>
+
+    <div style="margin-top: 12px; display: flex; gap: 8px;">
+      <button id="btn-download-model" type="button" style="padding: 6px 14px; font-size: 13px;">下載模型</button>
+      <button id="btn-clear-model" type="button" style="padding: 6px 14px; font-size: 13px;">清除快取</button>
+    </div>
   </fieldset>
 
   <h2>語音識別（ASR）</h2>

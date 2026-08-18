@@ -48487,6 +48487,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   };
 
   // src/domain/models/config.ts
+  var DEFAULT_LOCAL_TRANSLATION_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
   var DEBUG_LOG_OFF = {
     overlay: false,
     llm: false,
@@ -49050,7 +49051,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const primary = this.deps.registry.translation.get(
         config.translation.type === "cloud-llm" ? "llm" : config.translation.type === "local" ? "local-llm" : "mt"
       );
-      const fallback = config.translation.fallbackType === "mt" ? this.deps.registry.translation.get("mt") : void 0;
+      let fallback;
+      if (config.translation.fallbackType === "local-onnx") {
+        fallback = this.deps.registry.translation.get("local-onnx");
+      } else if (config.translation.fallbackType === "mt") {
+        fallback = this.deps.registry.translation.get("mt");
+      }
       if (!primary) {
         this.onEvent({
           type: "engine-degraded",
@@ -50191,6 +50197,80 @@ Output example:
     }
   };
 
+  // src/adapters/translation/local-onnx-translation.ts
+  var LocalONNXTranslationProvider = class {
+    engineId = "local-onnx";
+    location = "local";
+    defaultTargetLang;
+    constructor(config) {
+      void config.modelName;
+      this.defaultTargetLang = config.targetLang ?? "zh-Hant";
+    }
+    /**
+     * 非流式翻譯——透過 chrome.runtime.sendMessage 發送請求給 Service Worker。
+     * Service Worker 轉發給 Offscreen Document 執行 ONNX 推理。
+     */
+    async translate(req) {
+      const combinedText = req.segments.map((s) => s.sourceText).join("\n");
+      const targetLang = req.targetLang ?? this.defaultTargetLang;
+      const request = {
+        topic: "local-onnx:translate",
+        payload: {
+          text: combinedText,
+          targetLang
+        }
+      };
+      try {
+        const response = await chrome.runtime.sendMessage(request);
+        const res = response;
+        if (!res.ok) {
+          const error = new Error(res.error ?? "local-onnx translation failed");
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "translation",
+              code: res.notDownloaded ? "local-onnx-not-downloaded" : "local-onnx-inference-failed",
+              recoverable: true,
+              cause: error
+            }
+          });
+          throw error;
+        }
+        const translatedTexts = (res.translatedText ?? "").split("\n");
+        const segments = req.segments.map((s, i) => ({
+          ...s,
+          translatedText: translatedTexts[i]?.trim() ?? s.sourceText
+        }));
+        return {
+          engineId: this.engineId,
+          degraded: true,
+          // 標記為降級結果（非 primary 引擎）。
+          segments
+        };
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-communication-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
+    }
+    /**
+     * 流式翻譯——本地 ONNX 模型目前不支援 streaming，退化為非流式。
+     * TranslationPipeline 會自動處理此情況（見 translateStream 邏輯）。
+     */
+    async translateStream(req, emit) {
+      const result = await this.translate(req);
+      emit(result);
+    }
+  };
+
   // src/adapters/render/overlay-renderer.ts
   var NO_CUE_LOG_INTERVAL_MS = 5e3;
   var OverlayRenderer = class {
@@ -50880,6 +50960,13 @@ Output example:
       welcome: "\u6B61\u8FCE"
     });
     providers.set("mt", mt);
+    if (tc2.fallbackType === "local-onnx") {
+      const localOnnx = new LocalONNXTranslationProvider({
+        modelName: tc2.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
+        targetLang: config.targetLang
+      });
+      providers.set(localOnnx.engineId, localOnnx);
+    }
     return providers;
   }
   async function createLLM(tc2, apiKeyStore) {

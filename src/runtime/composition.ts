@@ -8,12 +8,14 @@ import {
 import { YouTubePlatformAdapter, FetchCaptionSource } from '../adapters';
 import { LLMTranslationProvider, ensureLlmCacheInvalidationHook } from '../adapters/translation/llm-translation';
 import { MTTranslationProvider } from '../adapters/translation/mt-translation';
+import { LocalONNXTranslationProvider } from '../adapters/translation/local-onnx-translation';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import { TabCaptureAudioSource } from '../adapters/audio/tab-capture-source';
 import { CloudASR } from '../adapters/asr/cloud-asr';
 import { LocalWhisperASR } from '../adapters/asr/local-whisper';
 import type { CaptionCaptureProvider } from '../adapters/platform/youtube/platform-adapter';
 import type { EngineConfig, TranslationConfig } from '../domain/models/config';
+import { DEFAULT_LOCAL_TRANSLATION_MODEL } from '../domain/models/config';
 import type { TranslationProvider } from '../domain/ports/translation-provider';
 import type { AudioSourceProvider } from '../domain/ports/audio-source';
 import type { ASRProvider } from '../domain/ports/asr-provider';
@@ -117,6 +119,15 @@ async function buildTranslationProviders(
     welcome: '歡迎',
   });
   providers.set('mt', mt);
+
+  // 本地 ONNX 翻譯兜底——當 fallbackType 為 'local-onnx' 時組裝。
+  if (tc.fallbackType === 'local-onnx') {
+    const localOnnx = new LocalONNXTranslationProvider({
+      modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
+      targetLang: config.targetLang,
+    });
+    providers.set(localOnnx.engineId, localOnnx);
+  }
 
   return providers;
 }

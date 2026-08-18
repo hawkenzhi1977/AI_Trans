@@ -1,8 +1,9 @@
 // Options 頁面邏輯：加載/保存 EngineConfig，密鑰寫入獨立安全 key（apiKeyRef 指向）。
 // 擴充頁面環境：直接使用 chrome.storage，不經消息總線。
+// 同時負責本地 ONNX 翻譯模型的狀態顯示、下載和快取管理。
 import { ChromeStorageConfigStore } from '../../infrastructure/chrome-config-store';
 import type { EngineConfig, DebugLogCategory } from '../../domain/models/config';
-import { DEFAULT_CONFIG, PROFILE_DEFAULTS, DEBUG_LOG_OFF } from '../../domain/models/config';
+import { DEFAULT_CONFIG, PROFILE_DEFAULTS, DEBUG_LOG_OFF, DEFAULT_LOCAL_TRANSLATION_MODEL } from '../../domain/models/config';
 
 const store = new ChromeStorageConfigStore();
 
@@ -94,7 +95,8 @@ function readForm(): EngineConfig {
       type: translationType,
       model: $<HTMLInputElement>('translation-model').value || undefined,
       endpoint: $<HTMLInputElement>('translation-endpoint').value || undefined,
-      fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'none') || undefined,
+      fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'local-onnx' | 'none') || undefined,
+      localModelName: DEFAULT_LOCAL_TRANSLATION_MODEL,
     },
     asr: {
       type: asrType,
@@ -235,6 +237,9 @@ async function init(): Promise<void> {
     fillForm(DEFAULT_CONFIG);
   });
 
+  // 本地 ONNX 模型相關事件處理。
+  initLocalOnnxModelUI();
+
   // 版本號顯示
   const versionEl = $('version');
   if (versionEl) {
@@ -248,3 +253,167 @@ async function init(): Promise<void> {
 }
 
 void init();
+
+// ============================================================
+// 本地 ONNX 翻譯模型 UI 邏輯
+// ============================================================
+
+/** 本地 ONNX 模型狀態。 */
+type LocalModelStatus = 'checking' | 'not-downloaded' | 'downloading' | 'downloaded' | 'error';
+
+/** 初始化本地 ONNX 模型 UI——狀態檢查、下載、快取清理。 */
+function initLocalOnnxModelUI(): void {
+  const statusBadge = $<HTMLSpanElement>('local-model-status-badge');
+  const progressContainer = $<HTMLDivElement>('local-model-progress-container');
+  const progressBar = $<HTMLProgressElement>('local-model-progress-bar');
+  const progressText = $<HTMLSpanElement>('local-model-progress-text');
+  const progressDetail = $<HTMLParagraphElement>('local-model-progress-detail');
+  const btnDownload = $<HTMLButtonElement>('btn-download-model');
+  const btnClear = $<HTMLButtonElement>('btn-clear-model');
+
+  /** 更新狀態標籤樣式與文字。 */
+  function updateStatusBadge(status: LocalModelStatus, message?: string): void {
+    const styles: Record<LocalModelStatus, { bg: string; color: string; text: string }> = {
+      checking: { bg: '#eee', color: '#666', text: '檢測中...' },
+      'not-downloaded': { bg: '#fff3cd', color: '#856404', text: '未下載' },
+      downloading: { bg: '#cce5ff', color: '#004085', text: '下載中...' },
+      downloaded: { bg: '#d4edda', color: '#155724', text: '已就緒' },
+      error: { bg: '#f8d7da', color: '#721c24', text: '錯誤' },
+    };
+    const style = styles[status];
+    statusBadge.style.background = style.bg;
+    statusBadge.style.color = style.color;
+    statusBadge.textContent = message ?? style.text;
+  }
+
+  /** 顯示/隱藏進度條。 */
+  function setProgressVisible(visible: boolean): void {
+    progressContainer.style.display = visible ? '' : 'none';
+  }
+
+  /** 更新進度條。 */
+  function updateProgress(percent: number, detail?: string): void {
+    progressBar.value = percent;
+    progressText.textContent = `${Math.round(percent)}%`;
+    if (detail) progressDetail.textContent = detail;
+  }
+
+  /** 檢查模型狀態。 */
+  async function checkModelStatus(): Promise<void> {
+    updateStatusBadge('checking');
+    try {
+      const response = await chrome.runtime.sendMessage({
+        topic: 'local-onnx:check-status',
+      });
+      const res = response as { ok: boolean; result?: { downloaded: boolean } };
+      if (res.ok && res.result?.downloaded) {
+        updateStatusBadge('downloaded');
+        btnDownload.disabled = true;
+        btnClear.disabled = false;
+      } else {
+        updateStatusBadge('not-downloaded');
+        btnDownload.disabled = false;
+        btnClear.disabled = true;
+      }
+    } catch (err) {
+      updateStatusBadge('error', '檢測失敗');
+      console.warn('[AI_Trans] check model status failed:', err);
+    }
+  }
+
+  /** 下載模型。 */
+  async function downloadModel(): Promise<void> {
+    updateStatusBadge('downloading');
+    setProgressVisible(true);
+    updateProgress(0, '正在初始化...');
+    btnDownload.disabled = true;
+
+    // §5.6：進度監聽必須在發送請求**之前**添加，否則 await 阻塞導致錯過所有進度消息。
+    const progressListener = (
+      message: unknown,
+      _sender: chrome.runtime.MessageSender,
+      _sendResponse: (response?: unknown) => void
+    ): void => {
+      const msg = message as { type?: string };
+      console.log('[AI_Trans:options] received message:', msg.type, msg);
+      if (msg.type === 'local-onnx:download-progress') {
+        const progressMsg = msg as {
+          type: string;
+          progress: number;
+          loaded: number;
+          total: number;
+        };
+        updateProgress(
+          progressMsg.progress,
+          `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+        );
+      } else if (msg.type === 'local-onnx:download-complete') {
+        const completeMsg = msg as { type: string; ok: boolean; error?: string };
+        chrome.runtime.onMessage.removeListener(progressListener);
+        setProgressVisible(false);
+        if (completeMsg.ok) {
+          updateStatusBadge('downloaded');
+          btnClear.disabled = false;
+          showStatus('模型下載完成');
+        } else {
+          updateStatusBadge('error', '下載失敗');
+          btnDownload.disabled = false;
+          showStatus(`下載失敗: ${completeMsg.error ?? 'unknown error'}`);
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(progressListener);
+
+    try {
+      // 發送下載請求給 Service Worker（轉發給 Offscreen）。
+      // 使用 void 不 await——進度消息透過 onMessage 廣播，最終結果也透過廣播通知。
+      void chrome.runtime.sendMessage({
+        topic: 'local-onnx:download',
+      });
+    } catch (err) {
+      chrome.runtime.onMessage.removeListener(progressListener);
+      setProgressVisible(false);
+      updateStatusBadge('error', '下載失敗');
+      btnDownload.disabled = false;
+      showStatus(`下載失敗: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 清除模型快取。 */
+  async function clearModelCache(): Promise<void> {
+    if (!confirm('確定要清除本地模型快取嗎？這將釋放約 350 MB 的儲存空間。')) return;
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        topic: 'local-onnx:clear-cache',
+      });
+      const res = response as { ok: boolean };
+      if (res.ok) {
+        updateStatusBadge('not-downloaded');
+        btnDownload.disabled = false;
+        btnClear.disabled = true;
+        showStatus('模型快取已清除');
+      } else {
+        showStatus('清除快取失敗');
+      }
+    } catch (err) {
+      showStatus(`清除快取失敗: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 格式化位元組為人類可讀格式。 */
+  function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  }
+
+  // 綁定按鈕事件。
+  btnDownload.addEventListener('click', () => void downloadModel());
+  btnClear.addEventListener('click', () => void clearModelCache());
+
+  // 初始檢查模型狀態。
+  void checkModelStatus();
+}

@@ -28,6 +28,9 @@ const ENTRY_POINTS = [
   // MAIN world 攔截腳本：獨立打包（被 content-script 以 <script src> 注入頁面，
   // 不能與 content-script 共用 bundle，也必須是 IIFE 以在非 module 上下文執行）。
   ['src/runtime/yt-timedtext-interceptor.ts', 'src/runtime/yt-timedtext-interceptor.js', 'iife'],
+  // Offscreen Document（M2-09）：offscreen.html 以普通 <script> 引用（非 module），
+  // 故為 IIFE；打包 transformers.js（M2-18 已驗證可完整打入 IIFE，content-script 即此模式）。
+  ['src/runtime/offscreen.ts', 'src/runtime/offscreen.js', 'iife'],
 ];
 
 mkdirSync(outdir, { recursive: true });

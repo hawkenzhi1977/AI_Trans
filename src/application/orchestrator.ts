@@ -64,7 +64,7 @@ export class Orchestrator {
 
     const config = await this.deps.getConfig();
 
-    // 組裝翻譯管線：主 LLM/本地 + 兜底 MT（依配置）。
+    // 組裝翻譯管線：主 LLM/本地 + 兜底 MT 或 local-onnx（依配置）。
     const primary = this.deps.registry.translation.get(
       config.translation.type === 'cloud-llm'
         ? 'llm'
@@ -72,10 +72,13 @@ export class Orchestrator {
           ? 'local-llm'
           : 'mt'
     );
-    const fallback =
-      config.translation.fallbackType === 'mt'
-        ? this.deps.registry.translation.get('mt')
-        : undefined;
+    // fallback 引擎選擇：local-onnx > mt > undefined。
+    let fallback;
+    if (config.translation.fallbackType === 'local-onnx') {
+      fallback = this.deps.registry.translation.get('local-onnx');
+    } else if (config.translation.fallbackType === 'mt') {
+      fallback = this.deps.registry.translation.get('mt');
+    }
     if (!primary) {
       this.onEvent({
         type: 'engine-degraded',

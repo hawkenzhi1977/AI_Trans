@@ -1,3 +1,7 @@
+/** 本地 ONNX 翻譯兜底模型名稱（唯讀，暫不支援自訂）。 */
+export const DEFAULT_LOCAL_TRANSLATION_MODEL =
+  'onnx-community/Qwen2.5-0.5B-Instruct';
+
 /** 翻譯引擎配置。 */
 export interface TranslationConfig {
   type: 'cloud-llm' | 'local' | 'mt';
@@ -6,7 +10,9 @@ export interface TranslationConfig {
   /** 指向本地安全存儲，不明文散播。 */
   apiKeyRef?: string;
   /** LLM 失敗時兜底引擎。 */
-  fallbackType?: 'mt' | 'none';
+  fallbackType?: 'mt' | 'local-onnx' | 'none';
+  /** 本地 ONNX 兜底模型名稱（唯讀，預設為 Qwen2.5-0.5B）。 */
+  localModelName?: string;
 }
 
 /** ASR 引擎配置。 */

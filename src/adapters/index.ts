@@ -3,4 +3,5 @@ export * from './platform/youtube/platform-adapter';
 export * from './platform/youtube/timedtext';
 export * from './translation/llm-translation';
 export * from './translation/mt-translation';
+export * from './translation/local-onnx-translation';
 export * from './render/overlay-renderer';

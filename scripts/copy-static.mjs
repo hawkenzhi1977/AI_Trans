@@ -1,7 +1,7 @@
 // copy-static.mjs — 構建後拷貝 manifest.json 等到 dist/。
 // 測試模式（TEST_PROFILE=1）：向 content_scripts 追加 localhost mock 站點 match，
 // 使 E2E 能在無真實 YouTube 環境下加載擴充；生產 manifest 保持乾淨。
-import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 mkdirSync('dist', { recursive: true });
 cpSync('manifest.json', 'dist/manifest.json', { force: true });
@@ -16,6 +16,29 @@ for (const html of [
   mkdirSync(dest.slice(0, dest.lastIndexOf('/')), { recursive: true });
   cpSync(html, dest, { force: true });
   console.log(`[build] copied ${html}`);
+}
+
+// M2-24：本地化 ONNX Runtime WASM——transformers.js v3 默認從 jsdelivr CDN 載入 wasm，
+// 網絡不可達會導致模型下載 100% 後 InferenceSession 初始化失敗（"下載失敗"）。
+// 把 onnxruntime-web 的 wasm + worker 腳本拷進擴充，wasmPaths 指向本地。
+// 注意：onnxruntime-web v1.22 初始化 wasm backend 時 dynamic import 的是 **jsep** 變體
+// （ort-wasm-simd-threaded.jsep.mjs/.wasm）——缺 jsep 文件即報 "no available backend found /
+// Failed to fetch dynamically imported module"，因此 jsep 與非 jsep 一併打包。
+const ORT_WASM_FILES = [
+  'ort-wasm-simd-threaded.wasm',
+  'ort-wasm-simd-threaded.mjs',
+  'ort-wasm-simd-threaded.jsep.wasm',
+  'ort-wasm-simd-threaded.jsep.mjs',
+];
+for (const file of ORT_WASM_FILES) {
+  const src = `node_modules/onnxruntime-web/dist/${file}`;
+  const dest = `dist/src/runtime/ort/${file}`;
+  if (!existsSync(src)) {
+    throw new Error(`[build] missing onnxruntime-web wasm asset: ${src}`);
+  }
+  mkdirSync(dest.slice(0, dest.lastIndexOf('/')), { recursive: true });
+  cpSync(src, dest, { force: true });
+  console.log(`[build] copied ${dest} (${file})`);
 }
 
 const TEST_MATCH = 'http://localhost:8721/*';

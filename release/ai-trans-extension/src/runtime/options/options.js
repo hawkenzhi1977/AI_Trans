@@ -1,6 +1,7 @@
 "use strict";
 (() => {
   // src/domain/models/config.ts
+  var DEFAULT_LOCAL_TRANSLATION_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
   var DEBUG_LOG_OFF = {
     overlay: false,
     llm: false,
@@ -157,7 +158,8 @@
         type: translationType,
         model: $("translation-model").value || void 0,
         endpoint: $("translation-endpoint").value || void 0,
-        fallbackType: $("translation-fallback").value || void 0
+        fallbackType: $("translation-fallback").value || void 0,
+        localModelName: DEFAULT_LOCAL_TRANSLATION_MODEL
       },
       asr: {
         type: asrType,
@@ -276,6 +278,7 @@
     $("btn-reset").addEventListener("click", () => {
       fillForm(DEFAULT_CONFIG);
     });
+    initLocalOnnxModelUI();
     const versionEl = $("version");
     if (versionEl) {
       try {
@@ -287,5 +290,127 @@
     }
   }
   void init();
+  function initLocalOnnxModelUI() {
+    const statusBadge = $("local-model-status-badge");
+    const progressContainer = $("local-model-progress-container");
+    const progressBar = $("local-model-progress-bar");
+    const progressText = $("local-model-progress-text");
+    const progressDetail = $("local-model-progress-detail");
+    const btnDownload = $("btn-download-model");
+    const btnClear = $("btn-clear-model");
+    function updateStatusBadge(status, message) {
+      const styles = {
+        checking: { bg: "#eee", color: "#666", text: "\u6AA2\u6E2C\u4E2D..." },
+        "not-downloaded": { bg: "#fff3cd", color: "#856404", text: "\u672A\u4E0B\u8F09" },
+        downloading: { bg: "#cce5ff", color: "#004085", text: "\u4E0B\u8F09\u4E2D..." },
+        downloaded: { bg: "#d4edda", color: "#155724", text: "\u5DF2\u5C31\u7DD2" },
+        error: { bg: "#f8d7da", color: "#721c24", text: "\u932F\u8AA4" }
+      };
+      const style = styles[status];
+      statusBadge.style.background = style.bg;
+      statusBadge.style.color = style.color;
+      statusBadge.textContent = message ?? style.text;
+    }
+    function setProgressVisible(visible) {
+      progressContainer.style.display = visible ? "" : "none";
+    }
+    function updateProgress(percent, detail) {
+      progressBar.value = percent;
+      progressText.textContent = `${Math.round(percent)}%`;
+      if (detail) progressDetail.textContent = detail;
+    }
+    async function checkModelStatus() {
+      updateStatusBadge("checking");
+      try {
+        const response = await chrome.runtime.sendMessage({
+          topic: "local-onnx:check-status"
+        });
+        const res = response;
+        if (res.ok && res.result?.downloaded) {
+          updateStatusBadge("downloaded");
+          btnDownload.disabled = true;
+          btnClear.disabled = false;
+        } else {
+          updateStatusBadge("not-downloaded");
+          btnDownload.disabled = false;
+          btnClear.disabled = true;
+        }
+      } catch (err) {
+        updateStatusBadge("error", "\u6AA2\u6E2C\u5931\u6557");
+        console.warn("[AI_Trans] check model status failed:", err);
+      }
+    }
+    async function downloadModel() {
+      updateStatusBadge("downloading");
+      setProgressVisible(true);
+      updateProgress(0, "\u6B63\u5728\u521D\u59CB\u5316...");
+      btnDownload.disabled = true;
+      const progressListener = (message, _sender, _sendResponse) => {
+        const msg = message;
+        console.log("[AI_Trans:options] received message:", msg.type, msg);
+        if (msg.type === "local-onnx:download-progress") {
+          const progressMsg = msg;
+          updateProgress(
+            progressMsg.progress,
+            `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+          );
+        } else if (msg.type === "local-onnx:download-complete") {
+          const completeMsg = msg;
+          chrome.runtime.onMessage.removeListener(progressListener);
+          setProgressVisible(false);
+          if (completeMsg.ok) {
+            updateStatusBadge("downloaded");
+            btnClear.disabled = false;
+            showStatus("\u6A21\u578B\u4E0B\u8F09\u5B8C\u6210");
+          } else {
+            updateStatusBadge("error", "\u4E0B\u8F09\u5931\u6557");
+            btnDownload.disabled = false;
+            showStatus(`\u4E0B\u8F09\u5931\u6557: ${completeMsg.error ?? "unknown error"}`);
+          }
+        }
+      };
+      chrome.runtime.onMessage.addListener(progressListener);
+      try {
+        void chrome.runtime.sendMessage({
+          topic: "local-onnx:download"
+        });
+      } catch (err) {
+        chrome.runtime.onMessage.removeListener(progressListener);
+        setProgressVisible(false);
+        updateStatusBadge("error", "\u4E0B\u8F09\u5931\u6557");
+        btnDownload.disabled = false;
+        showStatus(`\u4E0B\u8F09\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    async function clearModelCache() {
+      if (!confirm("\u78BA\u5B9A\u8981\u6E05\u9664\u672C\u5730\u6A21\u578B\u5FEB\u53D6\u55CE\uFF1F\u9019\u5C07\u91CB\u653E\u7D04 350 MB \u7684\u5132\u5B58\u7A7A\u9593\u3002")) return;
+      try {
+        const response = await chrome.runtime.sendMessage({
+          topic: "local-onnx:clear-cache"
+        });
+        const res = response;
+        if (res.ok) {
+          updateStatusBadge("not-downloaded");
+          btnDownload.disabled = false;
+          btnClear.disabled = true;
+          showStatus("\u6A21\u578B\u5FEB\u53D6\u5DF2\u6E05\u9664");
+        } else {
+          showStatus("\u6E05\u9664\u5FEB\u53D6\u5931\u6557");
+        }
+      } catch (err) {
+        showStatus(`\u6E05\u9664\u5FEB\u53D6\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    function formatBytes(bytes) {
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+    }
+    btnDownload.addEventListener("click", () => void downloadModel());
+    btnClear.addEventListener("click", () => void clearModelCache());
+    void checkModelStatus();
+  }
 })();
 
