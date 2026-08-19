@@ -220,3 +220,110 @@ describe('Orchestrator 集成：M2 ASR 依賴注入（§5.6 不靜默）', () =>
     expect((degraded as { reason: string }).reason).toContain('warmup exploded');
   });
 });
+
+describe('Orchestrator 集成：M2-24 補充修復十三 翻譯引擎預熱', () => {
+  beforeEach(() => resetChromeMock());
+
+  it('primary 翻譯引擎實現 warmup 時，start() 觸發預熱（非阻塞）', async () => {
+    const platform = new MockYouTubeAdapter({
+      tracks: [staticTrack('en', [nativeSeg(0)])],
+    });
+    const localOnnx = new StubTranslationProvider({
+      engineId: 'local-onnx',
+      prefix: '[onnx]',
+      location: 'local',
+      warmup: true,
+    });
+    const registry = buildTestRegistry({
+      platforms: [platform],
+      translation: new Map<string, TranslationProvider>([
+        ['local-onnx', localOnnx],
+        ['mt', new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' })],
+      ]),
+    });
+    const events: PipelineEvent[] = [];
+    const orch = new Orchestrator(
+      {
+        registry,
+        getConfig: async () => ({
+          ...DEFAULT_CONFIG,
+          translation: { type: 'local-onnx', fallbackType: 'mt' },
+        }),
+        enableAsr: false,
+      },
+      (e) => events.push(e)
+    );
+
+    await orch.start(WATCH_URL);
+    await new Promise((r) => setTimeout(r, 10));
+    // warmup 被調用（且不阻礙策略啟動——segments-ready 仍產出）。
+    expect(localOnnx.warmupCalls).toBeGreaterThan(0);
+    const ready = events.find((e) => e.type === 'segments-ready');
+    expect(ready).toBeDefined();
+  });
+
+  it('primary 翻譯引擎無 warmup（雲端 LLM）時不觸發預熱', async () => {
+    const platform = new MockYouTubeAdapter({
+      tracks: [staticTrack('en', [nativeSeg(0)])],
+    });
+    const llm = new StubTranslationProvider({ engineId: 'llm', prefix: '[llm]' });
+    const registry = buildTestRegistry({
+      platforms: [platform],
+      translation: new Map<string, TranslationProvider>([
+        ['llm', llm],
+        ['mt', new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' })],
+      ]),
+    });
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: false },
+      () => {}
+    );
+
+    await orch.start(WATCH_URL);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(llm.warmupCalls).toBe(0);
+  });
+
+  it('translation warmup 失敗時發 engine-degraded 事件（§5.6 不靜默）', async () => {
+    const platform = new MockYouTubeAdapter({
+      tracks: [staticTrack('en', [nativeSeg(0)])],
+    });
+    const failingOnnx = new StubTranslationProvider({
+      engineId: 'local-onnx',
+      prefix: '[onnx]',
+      location: 'local',
+      warmup: true,
+    });
+    // 覆蓋 warmup 使其拋錯。
+    failingOnnx.warmup = async () => {
+      throw new Error('model load exploded');
+    };
+    const registry = buildTestRegistry({
+      platforms: [platform],
+      translation: new Map<string, TranslationProvider>([
+        ['local-onnx', failingOnnx],
+        ['mt', new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' })],
+      ]),
+    });
+    const events: PipelineEvent[] = [];
+    const orch = new Orchestrator(
+      {
+        registry,
+        getConfig: async () => ({
+          ...DEFAULT_CONFIG,
+          translation: { type: 'local-onnx', fallbackType: 'mt' },
+        }),
+        enableAsr: false,
+      },
+      (e) => events.push(e)
+    );
+
+    await orch.start(WATCH_URL);
+    await new Promise((r) => setTimeout(r, 10));
+    const degraded = events.find(
+      (e) => e.type === 'engine-degraded' && e.port === 'translation'
+    );
+    expect(degraded).toBeDefined();
+    expect((degraded as { reason: string }).reason).toContain('model load exploded');
+  });
+});

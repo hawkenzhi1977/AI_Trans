@@ -297,12 +297,15 @@
     const progressText = $("local-model-progress-text");
     const progressDetail = $("local-model-progress-detail");
     const btnDownload = $("btn-download-model");
+    const btnWarmup = $("btn-warmup-model");
     const btnClear = $("btn-clear-model");
     function updateStatusBadge(status, message) {
       const styles = {
         checking: { bg: "#eee", color: "#666", text: "\u6AA2\u6E2C\u4E2D..." },
         "not-downloaded": { bg: "#fff3cd", color: "#856404", text: "\u672A\u4E0B\u8F09" },
         downloading: { bg: "#cce5ff", color: "#004085", text: "\u4E0B\u8F09\u4E2D..." },
+        preloading: { bg: "#e2e3f9", color: "#3b3d99", text: "\u9810\u52A0\u8F09\u4E2D..." },
+        preloaded: { bg: "#d1ecf1", color: "#0c5460", text: "\u5DF2\u9810\u52A0\u8F09\uFF08\u8A18\u61B6\u9AD4\uFF09" },
         downloaded: { bg: "#d4edda", color: "#155724", text: "\u5DF2\u5C31\u7DD2" },
         error: { bg: "#f8d7da", color: "#721c24", text: "\u932F\u8AA4" }
       };
@@ -329,10 +332,12 @@
         if (res.ok && res.result?.downloaded) {
           updateStatusBadge("downloaded");
           btnDownload.disabled = true;
+          btnWarmup.disabled = false;
           btnClear.disabled = false;
         } else {
           updateStatusBadge("not-downloaded");
           btnDownload.disabled = false;
+          btnWarmup.disabled = true;
           btnClear.disabled = true;
         }
       } catch (err) {
@@ -340,11 +345,35 @@
         console.warn("[AI_Trans] check model status failed:", err);
       }
     }
+    async function warmupModel() {
+      updateStatusBadge("preloading");
+      btnWarmup.disabled = true;
+      btnDownload.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({ topic: "local-onnx:warmup" });
+        const res = response;
+        if (res.ok) {
+          updateStatusBadge("preloaded");
+          showStatus("\u6A21\u578B\u5DF2\u9810\u52A0\u8F09\uFF0C\u7FFB\u8B6F\u9996\u97FF\u61C9\u5C07\u5373\u6642");
+        } else {
+          updateStatusBadge("error", "\u9810\u52A0\u8F09\u5931\u6557");
+          btnDownload.disabled = false;
+          btnWarmup.disabled = false;
+          showStatus(`\u9810\u52A0\u8F09\u5931\u6557: ${res.error ?? "unknown error"}`);
+        }
+      } catch (err) {
+        updateStatusBadge("error", "\u9810\u52A0\u8F09\u5931\u6557");
+        btnDownload.disabled = false;
+        btnWarmup.disabled = false;
+        showStatus(`\u9810\u52A0\u8F09\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     async function downloadModel() {
       updateStatusBadge("downloading");
       setProgressVisible(true);
       updateProgress(0, "\u6B63\u5728\u521D\u59CB\u5316...");
       btnDownload.disabled = true;
+      btnWarmup.disabled = true;
       const progressListener = (message, _sender, _sendResponse) => {
         const msg = message;
         console.log("[AI_Trans:options] received message:", msg.type, msg);
@@ -361,6 +390,7 @@
           if (completeMsg.ok) {
             updateStatusBadge("downloaded");
             btnClear.disabled = false;
+            btnWarmup.disabled = false;
             showStatus("\u6A21\u578B\u4E0B\u8F09\u5B8C\u6210");
           } else {
             updateStatusBadge("error", "\u4E0B\u8F09\u5931\u6557");
@@ -392,6 +422,7 @@
         if (res.ok) {
           updateStatusBadge("not-downloaded");
           btnDownload.disabled = false;
+          btnWarmup.disabled = true;
           btnClear.disabled = true;
           showStatus("\u6A21\u578B\u5FEB\u53D6\u5DF2\u6E05\u9664");
         } else {
@@ -409,6 +440,7 @@
       return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
     }
     btnDownload.addEventListener("click", () => void downloadModel());
+    btnWarmup.addEventListener("click", () => void warmupModel());
     btnClear.addEventListener("click", () => void clearModelCache());
     void checkModelStatus();
   }

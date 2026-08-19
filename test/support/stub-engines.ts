@@ -14,6 +14,8 @@ interface StubTranslationOpts {
   failOnce?: boolean;
   failAlways?: boolean;
   latencyMs?: number;
+  /** 是否實現 warmup（默認 false——僅 local 引擎如 local-onnx 實現）。 */
+  warmup?: boolean;
 }
 
 /** 確定性翻譯 Stub：譯文 = `${prefix}${sourceText}`。 */
@@ -24,7 +26,9 @@ export class StubTranslationProvider implements TranslationProvider {
   private failOnce: boolean;
   private readonly failAlways: boolean;
   private readonly latencyMs: number;
+  private readonly hasWarmup: boolean;
   calls = 0;
+  warmupCalls = 0;
 
   constructor(opts: StubTranslationOpts = {}) {
     this.engineId = opts.engineId ?? 'stub-llm';
@@ -33,6 +37,11 @@ export class StubTranslationProvider implements TranslationProvider {
     this.failOnce = opts.failOnce ?? false;
     this.failAlways = opts.failAlways ?? false;
     this.latencyMs = opts.latencyMs ?? 0;
+    this.hasWarmup = opts.warmup ?? false;
+  }
+
+  async warmup(): Promise<void> {
+    if (this.hasWarmup) this.warmupCalls += 1;
   }
 
   async translate(req: TranslationRequest): Promise<TranslationResult> {

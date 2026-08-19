@@ -48586,6 +48586,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           broadcastToAll(status);
         });
         return true;
+      case "local-onnx:warmup":
+        void warmupModel().then((result) => {
+          sendResponse(result);
+          broadcastToAll(result);
+        });
+        return true;
       case "local-onnx:download":
         void downloadModel().then((result) => {
           sendResponse(result);
@@ -48628,6 +48634,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         switch (type) {
           case "local-onnx:check-status":
             result = await checkModelStatus();
+            broadcastToAll(result);
+            break;
+          case "local-onnx:warmup":
+            result = await warmupModel();
             broadcastToAll(result);
             break;
           case "local-onnx:download":
@@ -48704,6 +48714,38 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       });
     }
     return loadPromise;
+  }
+  async function warmupModel() {
+    if (translationPipeline !== null) {
+      return { type: "local-onnx:warmup-complete", ok: true };
+    }
+    try {
+      if (!await hasModelInCache()) {
+        return {
+          type: "local-onnx:warmup-complete",
+          ok: false,
+          error: "Local ONNX model not downloaded"
+        };
+      }
+      await ensurePipelineLoaded();
+      return { type: "local-onnx:warmup-complete", ok: true };
+    } catch (err) {
+      const error = toReadableError(err);
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-warmup-failed",
+          recoverable: true,
+          cause: error
+        }
+      });
+      return {
+        type: "local-onnx:warmup-complete",
+        ok: false,
+        error: error.message
+      };
+    }
   }
   async function checkModelStatus() {
     try {
@@ -49043,7 +49085,8 @@ ${numbered}
     runInference,
     clearModelCache,
     buildPrompt,
-    parseNumberedOutput
+    parseNumberedOutput,
+    warmupModel
   };
 })();
 /*! Bundled license information:

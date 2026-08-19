@@ -57,6 +57,34 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
+   * 預加載模型到記憶體——發送 `local-onnx:warmup` 給 Offscreen（經 SW 轉發）。
+   * M2-24 補充修復十三：消除首次推理 30-60s 載入延遲（此前首塊 request 被 30s 超時誤殺）。
+   * 模型未下載時拋錯（`local-onnx-warmup-failed` 診斷），調用方據此提示用戶先下載。
+   * §5.6：warmup 失敗必須落診斷，禁止靜默吞掉。
+   */
+  async warmup(): Promise<void> {
+    try {
+      const response = await chrome.runtime.sendMessage({ topic: 'local-onnx:warmup' });
+      const res = response as { ok: boolean; error?: string };
+      if (!res.ok) {
+        throw new Error(res.error ?? 'local-onnx warmup failed');
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-warmup-failed',
+          recoverable: true,
+          cause: error,
+        },
+      });
+      throw error;
+    }
+  }
+
+  /**
    * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。
    * 分塊避免單次輸入過長壓垮小模型（回顯原文根因之一）。
    */

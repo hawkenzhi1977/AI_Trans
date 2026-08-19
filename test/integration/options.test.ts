@@ -42,6 +42,7 @@ const HTML = `
     <p id="local-model-progress-detail"></p>
   </div>
   <button id="btn-download-model">下載模型</button>
+  <button id="btn-warmup-model">預加載模型</button>
   <button id="btn-clear-model">清除快取</button>
   <span id="status"></span>
   <button id="btn-save">保存</button>
@@ -200,5 +201,54 @@ describe('Options — M2 自定義 ASR 模型路徑', () => {
     const stored = await chrome.storage.local.get('engineConfig');
     const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
     expect(saved.translation.type).toBe('local-onnx');
+  });
+});
+
+describe('Options — M2-24 補充修復十三 預加載模型按鈕', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('模型未下載時「預加載模型」按鈕禁用', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    // check-status 返回 downloaded:false（無 transformers-cache）。
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      result: { downloaded: false },
+    });
+    await loadOptions();
+    expect((document.getElementById('btn-warmup-model') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('點擊預加載：發送 local-onnx:warmup，成功後標籤顯示已預加載', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    // 模擬模型已下載（check-status 返回 ok）→ 預加載按鈕可用。
+    const sendMessage = chrome.runtime.sendMessage as ReturnType<typeof vi.fn>;
+    sendMessage
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // check-status
+      .mockResolvedValueOnce({ ok: true }); // warmup
+    await loadOptions();
+    const btnWarmup = document.getElementById('btn-warmup-model') as HTMLButtonElement;
+    expect(btnWarmup.disabled).toBe(false);
+    btnWarmup.click();
+    await new Promise((r) => setTimeout(r, 20));
+    // 已發送 warmup 消息。
+    expect(sendMessage).toHaveBeenCalledWith({ topic: 'local-onnx:warmup' });
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('已預加載');
+    expect(document.getElementById('status')!.textContent).toContain('模型已預加載');
+  });
+
+  it('預加載失敗時標籤顯示錯誤並提示原因（§5.6 不靜默）', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    const sendMessage = chrome.runtime.sendMessage as ReturnType<typeof vi.fn>;
+    sendMessage
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // check-status
+      .mockResolvedValueOnce({ ok: false, error: 'Local ONNX model not downloaded' }); // warmup 失敗
+    await loadOptions();
+    (document.getElementById('btn-warmup-model') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('預加載失敗');
+    expect(document.getElementById('status')!.textContent).toContain('Local ONNX model not downloaded');
   });
 });

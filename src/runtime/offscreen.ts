@@ -10,6 +10,7 @@ type OffscreenRequest =
   | { type: 'startCapture'; streamId: string }
   | { type: 'stopCapture' }
   | { type: 'local-onnx:check-status' }
+  | { type: 'local-onnx:warmup' }
   | { type: 'local-onnx:download' }
   | { type: 'local-onnx:clear-cache' }
   | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string };
@@ -21,6 +22,7 @@ type OffscreenResponse =
   | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
   | { type: 'error'; message: string }
   | { type: 'local-onnx:status'; downloaded: boolean; modelName: string }
+  | { type: 'local-onnx:warmup-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
@@ -156,6 +158,14 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
         broadcastToAll(status);
       });
       return true;
+    case 'local-onnx:warmup':
+      // M2-24 補充修復十三：手動/自動預加載——模型快取存在時載入記憶體，
+      // 消除首次翻譯的 30-60s 載入延遲（此前首塊 request 超時被 SW 拒絕）。
+      void warmupModel().then((result) => {
+        sendResponse(result);
+        broadcastToAll(result);
+      });
+      return true;
     case 'local-onnx:download':
       void downloadModel().then((result) => {
         sendResponse(result);
@@ -223,6 +233,10 @@ function connectToServiceWorker(): void {
       switch (type) {
         case 'local-onnx:check-status':
           result = await checkModelStatus();
+          broadcastToAll(result as OffscreenResponse);
+          break;
+        case 'local-onnx:warmup':
+          result = await warmupModel();
           broadcastToAll(result as OffscreenResponse);
           break;
         case 'local-onnx:download':
@@ -366,6 +380,46 @@ async function ensurePipelineLoaded(
       });
   }
   return loadPromise;
+}
+
+/**
+ * 預加載本地 ONNX 模型到記憶體（M2-24 補充修復十三）。
+ * 與 check-status 的後台預熱不同：本函數**等待載入完成**才返回，
+ * 供 Options「預加載模型」按鈕 / Orchestrator 啟動前 warmup 阻塞確認。
+ * 模型未下載時返回 ok:false（不觸發下載），調用方據此提示用戶先下載。
+ */
+async function warmupModel(): Promise<OffscreenResponse> {
+  if (translationPipeline !== null) {
+    return { type: 'local-onnx:warmup-complete', ok: true } satisfies OffscreenResponse;
+  }
+  try {
+    if (!(await hasModelInCache())) {
+      return {
+        type: 'local-onnx:warmup-complete',
+        ok: false,
+        error: 'Local ONNX model not downloaded',
+      } satisfies OffscreenResponse;
+    }
+    await ensurePipelineLoaded();
+    return { type: 'local-onnx:warmup-complete', ok: true } satisfies OffscreenResponse;
+  } catch (err) {
+    // §5.6：預加載失敗必須落診斷（不靜默）。
+    const error = toReadableError(err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-warmup-failed',
+        recoverable: true,
+        cause: error,
+      },
+    });
+    return {
+      type: 'local-onnx:warmup-complete',
+      ok: false,
+      error: error.message,
+    } satisfies OffscreenResponse;
+  }
 }
 
 /**
@@ -818,4 +872,5 @@ export const _testExports = {
   clearModelCache,
   buildPrompt,
   parseNumberedOutput,
+  warmupModel,
 };

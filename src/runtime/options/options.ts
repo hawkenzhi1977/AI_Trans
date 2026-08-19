@@ -259,9 +259,9 @@ void init();
 // ============================================================
 
 /** 本地 ONNX 模型狀態。 */
-type LocalModelStatus = 'checking' | 'not-downloaded' | 'downloading' | 'downloaded' | 'error';
+type LocalModelStatus = 'checking' | 'not-downloaded' | 'downloading' | 'preloading' | 'preloaded' | 'downloaded' | 'error';
 
-/** 初始化本地 ONNX 模型 UI——狀態檢查、下載、快取清理。 */
+/** 初始化本地 ONNX 模型 UI——狀態檢查、下載、預加載、快取清理。 */
 function initLocalOnnxModelUI(): void {
   const statusBadge = $<HTMLSpanElement>('local-model-status-badge');
   const progressContainer = $<HTMLDivElement>('local-model-progress-container');
@@ -269,6 +269,7 @@ function initLocalOnnxModelUI(): void {
   const progressText = $<HTMLSpanElement>('local-model-progress-text');
   const progressDetail = $<HTMLParagraphElement>('local-model-progress-detail');
   const btnDownload = $<HTMLButtonElement>('btn-download-model');
+  const btnWarmup = $<HTMLButtonElement>('btn-warmup-model');
   const btnClear = $<HTMLButtonElement>('btn-clear-model');
 
   /** 更新狀態標籤樣式與文字。 */
@@ -277,6 +278,8 @@ function initLocalOnnxModelUI(): void {
       checking: { bg: '#eee', color: '#666', text: '檢測中...' },
       'not-downloaded': { bg: '#fff3cd', color: '#856404', text: '未下載' },
       downloading: { bg: '#cce5ff', color: '#004085', text: '下載中...' },
+      preloading: { bg: '#e2e3f9', color: '#3b3d99', text: '預加載中...' },
+      preloaded: { bg: '#d1ecf1', color: '#0c5460', text: '已預加載（記憶體）' },
       downloaded: { bg: '#d4edda', color: '#155724', text: '已就緒' },
       error: { bg: '#f8d7da', color: '#721c24', text: '錯誤' },
     };
@@ -309,15 +312,43 @@ function initLocalOnnxModelUI(): void {
       if (res.ok && res.result?.downloaded) {
         updateStatusBadge('downloaded');
         btnDownload.disabled = true;
+        btnWarmup.disabled = false;
         btnClear.disabled = false;
       } else {
         updateStatusBadge('not-downloaded');
         btnDownload.disabled = false;
+        btnWarmup.disabled = true;
         btnClear.disabled = true;
       }
     } catch (err) {
       updateStatusBadge('error', '檢測失敗');
       console.warn('[AI_Trans] check model status failed:', err);
+    }
+  }
+
+  /** 預加載模型到記憶體（手動觸發式加載，OMLX 風格）。 */
+  async function warmupModel(): Promise<void> {
+    updateStatusBadge('preloading');
+    btnWarmup.disabled = true;
+    btnDownload.disabled = true;
+    try {
+      // §5.6：預加載失敗必須對用戶可見（不靜默吞掉）。
+      const response = await chrome.runtime.sendMessage({ topic: 'local-onnx:warmup' });
+      const res = response as { ok: boolean; error?: string };
+      if (res.ok) {
+        updateStatusBadge('preloaded');
+        showStatus('模型已預加載，翻譯首響應將即時');
+      } else {
+        updateStatusBadge('error', '預加載失敗');
+        btnDownload.disabled = false;
+        btnWarmup.disabled = false;
+        showStatus(`預加載失敗: ${res.error ?? 'unknown error'}`);
+      }
+    } catch (err) {
+      updateStatusBadge('error', '預加載失敗');
+      btnDownload.disabled = false;
+      btnWarmup.disabled = false;
+      showStatus(`預加載失敗: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -327,6 +358,7 @@ function initLocalOnnxModelUI(): void {
     setProgressVisible(true);
     updateProgress(0, '正在初始化...');
     btnDownload.disabled = true;
+    btnWarmup.disabled = true;
 
     // §5.6：進度監聽必須在發送請求**之前**添加，否則 await 阻塞導致錯過所有進度消息。
     const progressListener = (
@@ -354,6 +386,7 @@ function initLocalOnnxModelUI(): void {
         if (completeMsg.ok) {
           updateStatusBadge('downloaded');
           btnClear.disabled = false;
+          btnWarmup.disabled = false;
           showStatus('模型下載完成');
         } else {
           updateStatusBadge('error', '下載失敗');
@@ -391,6 +424,7 @@ function initLocalOnnxModelUI(): void {
       if (res.ok) {
         updateStatusBadge('not-downloaded');
         btnDownload.disabled = false;
+        btnWarmup.disabled = true;
         btnClear.disabled = true;
         showStatus('模型快取已清除');
       } else {
@@ -412,6 +446,7 @@ function initLocalOnnxModelUI(): void {
 
   // 綁定按鈕事件。
   btnDownload.addEventListener('click', () => void downloadModel());
+  btnWarmup.addEventListener('click', () => void warmupModel());
   btnClear.addEventListener('click', () => void clearModelCache());
 
   // 初始檢查模型狀態。

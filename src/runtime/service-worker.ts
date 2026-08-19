@@ -76,11 +76,12 @@ async function sendToOffscreen<T>(message: unknown): Promise<T> {
     // 發送消息。
     offscreenPort!.postMessage({ ...msg, messageId });
 
-    // 超時處理（30 秒）。
+    // 超時處理（120 秒）。首次請求可能觸發模型載入（350MB 從 Cache API 載入記憶體需 30-60s），
+    // 30s 會誤殺首次推理（M2-24 補充修復十三：翻譯卡死 71s 根因）。後續推理遠快於此。
     setTimeout(() => {
       offscreenPort?.onMessage.removeListener(responseListener);
       reject(new Error('Offscreen Document response timeout'));
-    }, 30000);
+    }, 120000);
   });
 }
 

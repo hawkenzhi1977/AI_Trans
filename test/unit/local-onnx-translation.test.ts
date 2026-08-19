@@ -215,4 +215,40 @@ describe('LocalONNXTranslationProvider', () => {
 
     expect(result.degraded).toBe(true);
   });
+
+  it('warmup 成功時發送 local-onnx:warmup 消息且不拋錯', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({ ok: true });
+
+    await expect(provider.warmup()).resolves.toBeUndefined();
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({ topic: 'local-onnx:warmup' });
+  });
+
+  it('warmup 失敗（模型未下載）時拋錯並記錄診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({
+      ok: false,
+      error: 'Local ONNX model not downloaded',
+    });
+
+    await expect(provider.warmup()).rejects.toThrow('Local ONNX model not downloaded');
+  });
+
+  it('warmup 通信失敗（SW 不可達）時拋錯並記錄診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    vi.mocked(chrome.runtime.sendMessage).mockRejectedValue(
+      new Error('Extension context invalidated')
+    );
+
+    await expect(provider.warmup()).rejects.toThrow('Extension context invalidated');
+  });
 });

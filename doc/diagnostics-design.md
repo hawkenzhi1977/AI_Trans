@@ -235,6 +235,17 @@
 - **開發者響應**: 用調試輔助分流——`__aiTransTimedtextEmptyResponses===0` → 攔截器未捕獲到任何 timedtext 請求（isTimedText 未匹配/播放器未請求）；`EmptyResponses>0` 且 `Attempts` 正常 → pot 重試已由重驅動逼出，檢查下游（parseTimedText / bridge / 翻譯管線）。
 - **代碼落點**: src/runtime/yt-timedtext-interceptor.ts（`schedulePotRedrive`/`redrivePlayerCaptions`/`resetPotRedrive`/`scheduleSuppressNative`/`scheduleSuppressDeadline`/`emitCapture` 空響應分支）
 
+### 2.18 local-onnx 翻譯首響應卡死 + 模型預加載（M2-24 補充修復十三）
+
+- **現象**: 字幕捕獲成功（`segments: 431`）後 overlay 持續 `draw() no active cue for currentTime: <大值> cues: 0`（~71 秒），錯誤列表全為 `local-onnx operation failed: Offscreen Document response timeout`（每次 30s），最終才 `translation failed, falling back to original subtitles`。
+- **根因**: Offscreen 首次收到翻譯請求時模型未載入記憶體（`translationPipeline === null`），`runInference` lazy 載入 350MB 模型需 30-60s；SW `sendToOffscreen` 的 response 超時僅 30s → 首塊 request 被誤殺；provider 分 87 chunks（431/5）逐個 sendMessage，每個都在模型載入窗口內 30s 超時 → 整體卡 71+ 秒。
+- **修復後行為**: ①SW 超時提升至 120s（安全網）；②新增 `local-onnx:warmup` 消息 + `warmupModel()`——Orchestrator 啟動時非阻塞預熱 primary、Options「預加載模型」按鈕手動觸發，模型在首次翻譯前已載入記憶體（30-60s 提前發生），後續翻譯首塊立即響應。
+- **診斷碼**: `local-onnx-warmup-failed`（warmup/預加載失敗——模型載入出錯、快取損壞等）
+- **觸發條件**: `warmupModel()` 內 `ensurePipelineLoaded()` 拋錯，或 `LocalONNXTranslationProvider.warmup()` 收到 `ok:false`/通信失敗
+- **用戶響應**: Options「本地兜底模型」分區查看「預加載失敗」提示與原因；模型未下載時先點「下載模型」再預加載。
+- **開發者響應**: `local-onnx-warmup-failed` 診斷 message 含 ORT/transformers 錯誤細節（`toReadableError` 保留 code/stack）；對照 Options 狀態——「未下載」→ 提示先下載；「已預加載（記憶體）」→ 模型已就緒。
+- **代碼落點**: src/runtime/offscreen.ts（`warmupModel`/`local-onnx:warmup` 兩入口）、src/adapters/translation/local-onnx-translation.ts（`warmup()`）、src/application/orchestrator.ts（啟動預熱 + degraded 事件）、src/runtime/service-worker.ts（超時 120s）
+
 
 ---
 
@@ -443,6 +454,16 @@
 - **用戶響應**: 刷新頁面；重啟瀏覽器
 - **開發者響應**: 檢查 `ensureOffscreenDocument()` 邏輯；確認消息監聽器註冊
 - **代碼落點**: src/adapters/translation/local-onnx-translation.ts:25-28（`sendMessage` 失敗處理）
+
+### 4.16 本地 ONNX 模型預加載失敗（M2-24 補充修復十三）
+
+- **診斷碼**: local-onnx-warmup-failed: <錯誤>
+- **用戶可見消息**: Options「本地兜底模型」分區顯示「預加載失敗: <錯誤>」；Orchestrator 啟動時 warmup 失敗發 `engine-degraded`（port: 'translation'，reason: 'Translation warmup failed: <錯誤>'），popup「最近失敗」可查
+- **觸發條件**: `warmupModel()`（offscreen）內 `ensurePipelineLoaded()` 拋錯，或 `LocalONNXTranslationProvider.warmup()` 收到 `ok:false`（如模型未下載）/通信失敗
+- **根因**: 模型快取損壞/載入記憶體失敗（ORT wasm trap、記憶體不足）；模型未下載時誤觸預加載
+- **用戶響應**: 模型未下載時先點「下載模型」再「預加載模型」；載入失敗可「清除快取」後重新下載
+- **開發者響應**: 錯誤 message 經 `toReadableError` 保留 code/stack（數字型 ORT 錯誤碼可讀化）；對照 Options 狀態「未下載/已預加載（記憶體）/預加載失敗」
+- **代碼落點**: src/runtime/offscreen.ts（`warmupModel`）+ src/adapters/translation/local-onnx-translation.ts（`warmup()`）+ src/application/orchestrator.ts（啟動預熱 catch）
 
 
 ---

@@ -270,3 +270,61 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     expect(stored.lastDiagnostic).toBeUndefined();
   });
 });
+
+describe('offscreen local-onnx warmup 預加載（補充修復十三）', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    resetLocalOnnxModuleForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it('warmupModel：pipeline 未載入但快取存在 → 載入完成並返回 ok', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+
+    const res = await _testExports.warmupModel();
+
+    expect(res.type).toBe('local-onnx:warmup-complete');
+    expect(res.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(1);
+  });
+
+  it('warmupModel：pipeline 已載入 → 直接返回 ok 不重複載入', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+    // 先透過 runInference 觸發載入。
+    await _testExports.runInference('hi', 'zh-Hant', undefined);
+
+    const res = await _testExports.warmupModel();
+
+    expect(res.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(1);
+  });
+
+  it('warmupModel：無快取 → 返回 ok:false 且不觸發載入（提示先下載）', async () => {
+    installEmptyCaches();
+    const res = await _testExports.warmupModel();
+    expect(res.ok).toBe(false);
+    expect((res as { error?: string }).error).toContain('not downloaded');
+    expect(transformersMock.pipeline).not.toHaveBeenCalled();
+  });
+
+  it('warmupModel：載入失敗 → 返回 ok:false 且落診斷（§5.6 不靜默）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockRejectedValue(new Error('wasm init failed'));
+
+    const res = await _testExports.warmupModel();
+
+    expect(res.ok).toBe(false);
+    expect((res as { error?: string }).error).toContain('wasm init failed');
+    // 診斷 message = "Error: wasm init failed"（formatCause）；console.warn 麵包屑含代碼名。
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic?.message).toContain('wasm init failed');
+  });
+});

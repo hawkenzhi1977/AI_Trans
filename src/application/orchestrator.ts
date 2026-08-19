@@ -98,6 +98,19 @@ export class Orchestrator {
       onEvent: this.onEvent,
     });
 
+    // M2-24 補充修復十三：預熱翻譯引擎——local-onnx 模型載入記憶體需 30-60s，
+    // 若不預熱，首次翻譯首塊 request 會超時被拒（此前「字幕卡 71s」根因）。
+    // 非阻塞（void）：warmup 失敗不阻止策略啟動，由 degraded 事件告知用戶。
+    if (primary.warmup) {
+      void primary.warmup().catch((err) => {
+        this.onEvent({
+          type: 'engine-degraded',
+          port: 'translation',
+          reason: `Translation warmup failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      });
+    }
+
     // 組裝 ASR 上下文（M2 起啟用；M1 用 no-op 保證端口可空實現）。
     const asrProvider: ASRProvider = this.deps.enableAsr
       ? (this.deps.registry.asr.values().next().value ?? NoopASR.instance)

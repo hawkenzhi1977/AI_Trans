@@ -115,7 +115,7 @@ async function sendToOffscreen(message) {
     setTimeout(() => {
       offscreenPort?.onMessage.removeListener(responseListener);
       reject(new Error("Offscreen Document response timeout"));
-    }, 3e4);
+    }, 12e4);
   });
 }
 chrome.runtime.onConnect.addListener((port) => {

@@ -49072,6 +49072,15 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         streaming: config.performanceProfile === "streaming",
         onEvent: this.onEvent
       });
+      if (primary.warmup) {
+        void primary.warmup().catch((err) => {
+          this.onEvent({
+            type: "engine-degraded",
+            port: "translation",
+            reason: `Translation warmup failed: ${err instanceof Error ? err.message : String(err)}`
+          });
+        });
+      }
       const asrProvider = this.deps.enableAsr ? this.deps.registry.asr.values().next().value ?? NoopASR.instance : NoopASR.instance;
       const realtimeStrategy = this.deps.registry.strategies.find(
         (s) => s instanceof RealtimeASRStrategy
@@ -50209,6 +50218,33 @@ Output example:
       void config.modelName;
       this.defaultTargetLang = config.targetLang ?? "zh-Hant";
       this.isPrimary = config.isPrimary ?? false;
+    }
+    /**
+     * 預加載模型到記憶體——發送 `local-onnx:warmup` 給 Offscreen（經 SW 轉發）。
+     * M2-24 補充修復十三：消除首次推理 30-60s 載入延遲（此前首塊 request 被 30s 超時誤殺）。
+     * 模型未下載時拋錯（`local-onnx-warmup-failed` 診斷），調用方據此提示用戶先下載。
+     * §5.6：warmup 失敗必須落診斷，禁止靜默吞掉。
+     */
+    async warmup() {
+      try {
+        const response = await chrome.runtime.sendMessage({ topic: "local-onnx:warmup" });
+        const res = response;
+        if (!res.ok) {
+          throw new Error(res.error ?? "local-onnx warmup failed");
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-warmup-failed",
+            recoverable: true,
+            cause: error
+          }
+        });
+        throw error;
+      }
     }
     /**
      * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。

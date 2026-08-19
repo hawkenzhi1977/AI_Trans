@@ -12,4 +12,6 @@ export interface TranslationProvider {
     req: TranslationRequest,
     emit: (r: TranslationResult) => void
   ): Promise<void>;
+  /** 預加載引擎/模型到記憶體（消除首次推理延遲）。可選——雲端 LLM 通常無需預熱。 */
+  warmup?(): Promise<void>;
 }
