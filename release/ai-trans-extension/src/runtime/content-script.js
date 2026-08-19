@@ -48484,6 +48484,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     stopAll() {
       for (const s of this.strategies) s.stop();
     }
+    /** 傳播 seek 事件到各策略（僅原生字幕策略需要重新優先化翻譯隊列）。 */
+    onSeek(currentTimeMs) {
+      for (const s of this.strategies) {
+        s.onSeek?.(currentTimeMs);
+      }
+    }
   };
 
   // src/domain/models/config.ts
@@ -48552,15 +48558,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         return result;
       } catch (primaryErr) {
         diagLog("pipeline", "primary engine FAILED:", String(primaryErr));
-        if (this.opts.fallback) {
-          diagLog("pipeline", "falling back to:", this.opts.fallback.engineId);
+        const fallback = this.opts.fallback;
+        if (fallback && fallback.engineId !== this.opts.primary.engineId) {
+          diagLog("pipeline", "falling back to:", fallback.engineId);
           this.emit({
             type: "engine-degraded",
             port: "translation",
             reason: `primary failed: ${String(primaryErr)}`
           });
           this.emitError(primaryErr);
-          const result = await this.opts.fallback.translate(request);
+          const result = await fallback.translate(request);
           diagLog("pipeline", "fallback engine succeeded");
           return {
             ...result,
@@ -48571,6 +48578,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               translatedText: s.translatedText ?? s.sourceText
             }))
           };
+        }
+        if (fallback && fallback.engineId === this.opts.primary.engineId) {
+          diagLog("pipeline", "skipping fallback: same engine as primary (", this.opts.primary.engineId, ")");
+          this.emitError(primaryErr);
         }
         throw primaryErr;
       }
@@ -48589,14 +48600,34 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       try {
         await this.opts.primary.translateStream(request, emit);
       } catch (primaryErr) {
+        if (primaryErr instanceof DOMException && primaryErr.name === "AbortError") {
+          throw primaryErr;
+        }
         this.emit({
           type: "engine-degraded",
           port: "translation",
           reason: `primary stream failed: ${String(primaryErr)}`
         });
         this.emitError(primaryErr);
-        const result = await this.translate(request);
-        emit(result);
+        const fallback = this.opts.fallback;
+        if (fallback && fallback.engineId !== this.opts.primary.engineId) {
+          diagLog("pipeline", "translateStream failed, falling back to different engine:", fallback.engineId);
+          const result = await fallback.translate(request);
+          emit({
+            ...result,
+            engineId: result.engineId,
+            degraded: true,
+            segments: result.segments.map((s) => ({
+              ...s,
+              translatedText: s.translatedText ?? s.sourceText
+            }))
+          });
+        } else {
+          if (fallback && fallback.engineId === this.opts.primary.engineId) {
+            diagLog("pipeline", "skipping fallback: same engine as primary (", this.opts.primary.engineId, ")");
+          }
+          throw primaryErr;
+        }
       }
     }
     emit(e) {
@@ -49018,6 +49049,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       throw new Error("ASR not enabled");
     }
   };
+  var SEEK_THRESHOLD_MS = 1e4;
+  var SEEK_DEBOUNCE_MS = 200;
   var Orchestrator = class {
     constructor(deps, onEvent) {
       this.deps = deps;
@@ -49035,6 +49068,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       duration: 0,
       buffered: []
     };
+    lastSeekDetectionTime = 0;
+    seekDebounceTimer = null;
     /** 在給定頁面啟動翻譯字幕流程。 */
     async start(url) {
       this.stop();
@@ -49105,7 +49140,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         }
       }
       const unsubscribe = platform.observePlayback((state) => {
+        const prevTime = this.lastPlayback.currentTime;
         this.lastPlayback = state;
+        if (prevTime > 0 && Math.abs(state.currentTime - prevTime) > SEEK_THRESHOLD_MS) {
+          this.lastSeekDetectionTime = state.currentTime;
+          if (this.seekDebounceTimer !== null) clearTimeout(this.seekDebounceTimer);
+          this.seekDebounceTimer = setTimeout(() => {
+            this.seekDebounceTimer = null;
+            this.chain?.onSeek(this.lastSeekDetectionTime);
+          }, SEEK_DEBOUNCE_MS);
+        }
       });
       this.cleanups.push(unsubscribe);
       const ctx = {
@@ -49128,6 +49172,11 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       this.currentPlatformId = null;
       for (const cleanup of this.cleanups) cleanup();
       this.cleanups.length = 0;
+      if (this.seekDebounceTimer !== null) {
+        clearTimeout(this.seekDebounceTimer);
+        this.seekDebounceTimer = null;
+      }
+      this.lastSeekDetectionTime = 0;
     }
     get platformId() {
       return this.currentPlatformId;
@@ -49196,9 +49245,17 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   };
 
   // src/application/strategies/native-caption-strategy.ts
+  var WINDOW_START_OFFSET_MS = 2e3;
+  var WINDOW_END_OFFSET_MS = 12e4;
   var NativeCaptionStrategy = class {
     origin = "native";
     stopped = false;
+    allSegments = [];
+    translatedIds = /* @__PURE__ */ new Set();
+    accumulatedSegments = [];
+    abortController = null;
+    hasSeek = false;
+    seekTime = 0;
     /**
      * 判斷是否有原生字幕軌可用。
      * 注意：listCaptionTracks 失敗/為空**不拋錯、返回 false**，交由鏈降級——
@@ -49232,48 +49289,24 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         return;
       }
       diagLog("strategy", "track.fetch() starting");
-      const segments = await track.fetch();
-      diagLog("strategy", "track.fetch() returned", segments.length, "segments");
+      this.allSegments = await track.fetch();
+      diagLog("strategy", "track.fetch() returned", this.allSegments.length, "segments");
       if (this.stopped) return;
+      this.translatedIds.clear();
+      this.accumulatedSegments = [];
       try {
-        diagLog("strategy", "translation starting, targetLang:", ctx.config.targetLang);
-        if (ctx.translation.translateStream) {
-          let firstEmit = true;
-          diagLog("strategy", "using translateStream (chunked progressive)");
-          await ctx.translation.translateStream(
-            { segments, targetLang: ctx.config.targetLang },
-            (result2) => {
-              if (this.stopped) return;
-              if (firstEmit) {
-                firstEmit = false;
-                diagLog("strategy", "emit segments-ready,", result2.segments.length, "segments");
-                emit({ type: "segments-ready", segments: result2.segments });
-              } else {
-                diagLog("strategy", "emit segments-updated,", result2.segments.length, "segments");
-                emit({ type: "segments-updated", segments: result2.segments });
-              }
-            }
-          );
-          if (this.stopped) return;
-          return;
-        }
-        const result = await ctx.translation.translate({
-          segments,
-          targetLang: ctx.config.targetLang
-        });
-        diagLog("strategy", "translation succeeded,", result.segments.length, "translated segments");
-        if (this.stopped) return;
-        diagLog("strategy", "emitting segments-ready");
-        emit({ type: "segments-ready", segments: result.segments });
+        await this.translateWithPriority(ctx, emit);
       } catch (err) {
-        diagLog("strategy", "translation FAILED:", err instanceof Error ? err.message : String(err));
+        if (err instanceof DOMException && err.name === "AbortError") return;
         if (this.stopped) return;
+        diagLog("strategy", "translation FAILED:", err instanceof Error ? err.message : String(err));
         emit({
           type: "engine-degraded",
           port: "translation",
           reason: `translation failed, falling back to original subtitles: ${err instanceof Error ? err.message : String(err)}`
         });
-        const fallbackSegments = segments.map((s) => ({
+        const untranslated = this.allSegments.filter((s) => !this.translatedIds.has(s.id));
+        const fallbackSegments = untranslated.map((s) => ({
           ...s,
           translatedText: s.sourceText,
           targetLang: s.sourceLang
@@ -49281,8 +49314,149 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         emit({ type: "segments-ready", segments: fallbackSegments });
       }
     }
+    /**
+     * 動態優先級翻譯循環：
+     * 1. 按 currentTime+2s 為起點排序未翻譯 segments（滑動窗口優先）
+     * 2. 流式翻譯，每 chunk 完成即 emit 累計結果
+     * 3. seek 時中斷當前翻譯，重新優先化後繼續
+     */
+    async translateWithPriority(ctx, emit) {
+      let firstEmit = this.accumulatedSegments.length === 0;
+      while (!this.stopped) {
+        if (this.hasSeek) {
+          this.hasSeek = false;
+          diagLog("strategy", "seek detected at", this.seekTime, "ms, re-prioritizing");
+        }
+        const currentTime = this.seekTime || ctx.playback().currentTime;
+        this.seekTime = 0;
+        const prioritized = this.getPrioritizedSegments(currentTime);
+        if (prioritized.length === 0) {
+          diagLog("strategy", "all segments translated, total:", this.translatedIds.size);
+          break;
+        }
+        diagLog(
+          "strategy",
+          "translation round starting, currentTime:",
+          currentTime,
+          "untranslated:",
+          prioritized.length,
+          "translated:",
+          this.translatedIds.size,
+          "first priority start:",
+          prioritized[0]?.start
+        );
+        this.abortController = new AbortController();
+        try {
+          if (ctx.translation.translateStream) {
+            await ctx.translation.translateStream(
+              { segments: prioritized, targetLang: ctx.config.targetLang, signal: this.abortController.signal },
+              (result) => {
+                if (this.stopped) return;
+                for (const seg of result.segments) {
+                  if (!this.translatedIds.has(seg.id)) {
+                    this.translatedIds.add(seg.id);
+                  }
+                }
+                this.mergeAccumulated(result.segments);
+                const sortedSegments = [...this.accumulatedSegments].sort((a, b) => a.start - b.start);
+                const coverageStart = sortedSegments[0]?.start ?? 0;
+                const coverageEnd = sortedSegments[sortedSegments.length - 1]?.end ?? 0;
+                const currentPlaybackTime = ctx.playback().currentTime;
+                const gap = currentPlaybackTime - coverageEnd;
+                if (firstEmit) {
+                  firstEmit = false;
+                  diagLog(
+                    "strategy",
+                    "emit segments-ready at currentTime:",
+                    currentPlaybackTime,
+                    ", coverage:",
+                    coverageStart,
+                    "-",
+                    coverageEnd,
+                    "ms, gap:",
+                    gap,
+                    "ms",
+                    gap > 0 ? "BEHIND" : "AHEAD"
+                  );
+                  emit({ type: "segments-ready", segments: sortedSegments });
+                } else {
+                  diagLog(
+                    "strategy",
+                    "emit segments-updated at currentTime:",
+                    currentPlaybackTime,
+                    ", coverage:",
+                    coverageStart,
+                    "-",
+                    coverageEnd,
+                    "ms, gap:",
+                    gap,
+                    "ms",
+                    gap > 0 ? "BEHIND" : "AHEAD"
+                  );
+                  emit({ type: "segments-updated", segments: sortedSegments });
+                }
+              }
+            );
+          } else {
+            const result = await ctx.translation.translate({
+              segments: prioritized,
+              targetLang: ctx.config.targetLang
+            });
+            for (const seg of result.segments) {
+              this.translatedIds.add(seg.id);
+            }
+            this.mergeAccumulated(result.segments);
+            const sortedSegments = [...this.accumulatedSegments].sort((a, b) => a.start - b.start);
+            if (firstEmit) {
+              firstEmit = false;
+              emit({ type: "segments-ready", segments: sortedSegments });
+            } else {
+              emit({ type: "segments-updated", segments: sortedSegments });
+            }
+          }
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            diagLog("strategy", "translation aborted, will re-prioritize");
+            continue;
+          }
+          throw err;
+        }
+        this.abortController = null;
+      }
+    }
+    /**
+     * 獲取按優先級排序的未翻譯 segments。
+     * 滑動窗口 [currentTime+2s, currentTime+120s] 內的 segments 優先，
+     * 窗口外的按時間順序排在後面。
+     */
+    getPrioritizedSegments(currentTime) {
+      const untranslated = this.allSegments.filter((s) => !this.translatedIds.has(s.id));
+      if (untranslated.length === 0) return [];
+      const windowStart = currentTime + WINDOW_START_OFFSET_MS;
+      const windowEnd = currentTime + WINDOW_END_OFFSET_MS;
+      const inWindow = untranslated.filter((s) => s.start >= windowStart && s.start <= windowEnd);
+      const outWindow = untranslated.filter((s) => s.start < windowStart || s.start > windowEnd);
+      inWindow.sort((a, b) => a.start - b.start);
+      outWindow.sort((a, b) => a.start - b.start);
+      return [...inWindow, ...outWindow];
+    }
+    /** 合併新翻譯的 segments 到累計結果（更新已存在的，添加新的）。 */
+    mergeAccumulated(newSegments) {
+      const existingMap = new Map(this.accumulatedSegments.map((s) => [s.id, s]));
+      for (const seg of newSegments) {
+        existingMap.set(seg.id, seg);
+      }
+      this.accumulatedSegments = Array.from(existingMap.values());
+    }
+    /** Seek 時由 Orchestrator 調用：中斷當前翻譯，記錄新位置。 */
+    onSeek(currentTimeMs) {
+      this.hasSeek = true;
+      this.seekTime = currentTimeMs;
+      this.abortController?.abort();
+    }
     stop() {
       this.stopped = true;
+      this.abortController?.abort();
     }
   };
 
@@ -49867,7 +50041,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         "pause",
         "ratechange",
         "loadedmetadata",
-        "progress"
+        "progress",
+        "seeked"
       ];
       for (const ev of events) video.addEventListener(ev, handler);
       handler();
@@ -50269,6 +50444,7 @@ Output example:
   };
 
   // src/adapters/translation/local-onnx-translation.ts
+  var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
   var LocalONNXTranslationProvider = class _LocalONNXTranslationProvider {
     engineId = "local-onnx";
     location = "local";
@@ -50276,10 +50452,26 @@ Output example:
     static CHUNK_SIZE = 5;
     defaultTargetLang;
     isPrimary;
+    /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
+    port = null;
+    messageIdCounter = 0;
     constructor(config) {
       void config.modelName;
       this.defaultTargetLang = config.targetLang ?? "zh-Hant";
       this.isPrimary = config.isPrimary ?? false;
+    }
+    /**
+     * 建立與 Service Worker 的 port 長連接。
+     * 使用 port 而非 sendMessage，避免推理時間過長導致消息通道關閉。
+     */
+    ensurePort() {
+      if (this.port) return this.port;
+      this.port = chrome.runtime.connect({ name: "content-onnx" });
+      this.port.onDisconnect.addListener(() => {
+        diagLog("local-onnx", "port disconnected, will reconnect on next request");
+        this.port = null;
+      });
+      return this.port;
     }
     /**
      * 預加載模型到記憶體——發送 `local-onnx:warmup` 給 Offscreen（經 SW 轉發）。
@@ -50351,27 +50543,48 @@ Output example:
       return { segments, echoed: res.echoed === true };
     }
     /**
-     * 發送單次翻譯請求並校驗結果。
-     * §5.6：模型未下載/推理失敗/sendMessage 通信失敗都必須落診斷。
+     * 發送單次翻譯請求並校驗結果——使用 port 長連接。
+     * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
      */
     async requestTranslate(request) {
       try {
-        const response = await chrome.runtime.sendMessage(request);
-        const res = response;
-        if (!res.ok) {
-          const error = new Error(res.error ?? "local-onnx translation failed");
+        const port = this.ensurePort();
+        const messageId = `msg-${++this.messageIdCounter}-${Date.now()}`;
+        const response = await new Promise((resolve, reject) => {
+          const listener = (msg) => {
+            const res = msg;
+            if (res.messageId === messageId) {
+              port.onMessage.removeListener(listener);
+              if (res.error) {
+                reject(new Error(res.error));
+              } else if (res.result) {
+                resolve(res.result);
+              } else {
+                reject(new Error("Empty response from offscreen"));
+              }
+            }
+          };
+          port.onMessage.addListener(listener);
+          port.postMessage({ ...request, messageId });
+          setTimeout(() => {
+            port.onMessage.removeListener(listener);
+            reject(new Error("Offscreen Document response timeout"));
+          }, 12e4);
+        });
+        if (!response.ok) {
+          const error = new Error(response.error ?? "local-onnx translation failed");
           recordDiagnostic({
             type: "pipeline-error",
             error: {
               port: "translation",
-              code: res.notDownloaded ? "local-onnx-not-downloaded" : "local-onnx-inference-failed",
+              code: response.notDownloaded ? "local-onnx-not-downloaded" : "local-onnx-inference-failed",
               recoverable: true,
               cause: error
             }
           });
           throw error;
         }
-        return res;
+        return response;
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         recordDiagnostic({
@@ -50391,24 +50604,55 @@ Output example:
      * 修復：此前本地 ONNX 非真流式（`await this.translate(req)` 全量跑完才 emit 一次），
      * 431 段 = 87 次串行推理需數分鐘，NativeCaptionStrategy 首次 emit 才發 segments-ready，
      * 導致字幕長時間空白。現在首塊數秒內 emit，後續塊累計替換（與 LLM 流式同語義）。
+     * 
+     * 支持 AbortSignal：seek 時策略中斷翻譯，每個 chunk 前檢查 signal.aborted，
+     * 已中止則拋 AbortError（不觸發 fallback，由策略層靜默處理）。
+     * 
+     * Fix D: 最大翻譯時限保護——連續翻譯超過 10 分鐘主動中斷，避免 Offscreen 長時間運行不穩定。
      */
     async translateStream(req, emit) {
       const targetLang = req.targetLang ?? this.defaultTargetLang;
       const accumulated = [];
       let echoedChunks = 0;
       const totalChunks = Math.ceil(req.segments.length / _LocalONNXTranslationProvider.CHUNK_SIZE);
+      const streamStartedAt = performance.now();
       for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
+        if (req.signal?.aborted) {
+          diagLog("local-onnx", "translation aborted by signal after", accumulated.length, "segments");
+          throw new DOMException("Translation aborted", "AbortError");
+        }
+        const elapsedMs = performance.now() - streamStartedAt;
+        if (elapsedMs > MAX_SESSION_DURATION_MS) {
+          diagLog("local-onnx", "translation session exceeded max duration", MAX_SESSION_DURATION_MS, "ms after", accumulated.length, "segments, aborting to prevent Offscreen instability");
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "translation",
+              code: "local-onnx-session-timeout",
+              recoverable: true,
+              cause: new Error(
+                `local-onnx translation session exceeded ${MAX_SESSION_DURATION_MS / 1e3}s (translated ${accumulated.length} segments), aborting to prevent Offscreen instability`
+              )
+            }
+          });
+          throw new Error("local-onnx session timeout (10min limit)");
+        }
         const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
         const chunkIndex = Math.floor(i / _LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+        const chunkStartedAt = performance.now();
         const chunkResult = await this.translateChunk(chunk, targetLang);
+        const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
         accumulated.push(...chunkResult.segments);
         if (chunkResult.echoed) echoedChunks += 1;
+        const totalElapsedMs = Math.round(performance.now() - streamStartedAt);
+        const segmentsPerSec = (accumulated.length / (totalElapsedMs / 1e3)).toFixed(2);
         diagLog(
           "local-onnx",
-          `chunk ${chunkIndex}/${totalChunks} done, cumulative`,
+          `chunk ${chunkIndex}/${totalChunks} done in ${chunkLatencyMs}ms, cumulative`,
           accumulated.length,
           "segments, echoed:",
-          chunkResult.echoed
+          chunkResult.echoed,
+          `| total: ${totalElapsedMs}ms, speed: ${segmentsPerSec} seg/s`
         );
         emit({
           engineId: this.engineId,
@@ -50532,6 +50776,10 @@ Output example:
           diagLog("overlay", "draw() no active cue for currentTime:", currentTime, "cues:", this.cues.length);
           if (this.cues.length > 0) {
             diagLog("overlay", "first cue range:", this.cues[0].start, "-", this.cues[0].end);
+            const minStart = Math.min(...this.cues.map((c) => c.start));
+            const maxEnd = Math.max(...this.cues.map((c) => c.end));
+            const gap = currentTime - maxEnd;
+            diagLog("overlay", "full coverage:", minStart, "-", maxEnd, "ms, gap vs currentTime:", gap, "ms", gap > 0 ? "(behind)" : "(ahead)");
           }
           this.lastNoCueLogTime = now;
         }
@@ -51762,6 +52010,11 @@ Output example:
           start: s.start,
           end: s.end
         }));
+        if (this.cues.length > 0) {
+          const maxEnd = Math.max(...this.cues.map((c) => c.end));
+          const gap = this.currentTime - maxEnd;
+          diagLog("content", "playback-cue gap:", gap, "ms (currentTime:", this.currentTime, "maxEnd:", maxEnd, ")", gap > 0 ? "BEHIND" : "AHEAD");
+        }
         this.lateCaptureRetry.disarm();
         diagLog("content", "cues updated, count:", this.cues.length, "calling scheduleDraw");
         this.scheduleDraw();

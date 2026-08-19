@@ -764,16 +764,27 @@ async function runInference(
       max_new_tokens: 256,
       do_sample: false,
       repetition_penalty: 1.1,
+      return_full_text: false,
     });
 
     // 解析生成結果——按行號還原譯文。
     const generatedText = result[0]?.generated_text ?? '';
     // 麵包屑：保留原始生成文本前 500 字符，供診斷模型行為（§5.6 留痕）。
     console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
+    // D4：記錄 generated_text 長度與尾部（return_full_text=false 後應僅含生成內容）。
+    console.log('[AI_Trans:local-onnx] generated_text.length:', generatedText.length, 'tail:', JSON.stringify(generatedText.slice(-500)));
 
-    const { translatedLines, echoed, parsedCount } = parseNumberedOutput(generatedText, sourceLines);
+    const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
 
+    // D6：當檢測到 echo 時，輸出詳細診斷信息（始終輸出，不依賴 debug flag）
     if (echoed) {
+      console.log('[AI_Trans:local-onnx] ECHO DETECTED!');
+      console.log('[AI_Trans:local-onnx] similarCount:', similarCount, '/', sourceLines.length);
+      console.log('[AI_Trans:local-onnx] parsedCount:', parsedCount);
+      console.log('[AI_Trans:local-onnx] sourceLines (first 3):', JSON.stringify(sourceLines.slice(0, 3)));
+      console.log('[AI_Trans:local-onnx] translatedLines (first 3):', JSON.stringify(translatedLines.slice(0, 3)));
+      console.log('[AI_Trans:local-onnx] generated_text (full):', JSON.stringify(generatedText));
+      
       // §5.6：模型回顯原文屬低質量輸出——落診斷，popup「最近失敗」可查。
       // M2-24 補充修復十六：cause 訊息內嵌 raw 生成文本片段 + 解析統計 + 推理耗時，
       // 讓 popup「最近失敗」能直接分辨「模型真回顯英文」vs「解析誤判」（無行號/無空格）。
@@ -785,7 +796,7 @@ async function runInference(
           code: 'local-onnx-echo-output',
           recoverable: true,
           cause: new Error(
-            `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+            `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
               generatedText.slice(0, 200)
             )}`
           ),
@@ -900,7 +911,7 @@ ${numbered}
 function parseNumberedOutput(
   generated: string,
   sourceLines: string[]
-): { translatedLines: string[]; echoed: boolean; parsedCount: number } {
+): { translatedLines: string[]; echoed: boolean; parsedCount: number; similarCount: number } {
   const parsed = new Map<number, string>();
   for (const line of generated.split('\n')) {
     const m = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
@@ -910,10 +921,54 @@ function parseNumberedOutput(
       if (idx >= 0 && val.length > 0) parsed.set(idx, val);
     }
   }
+  
+  // F6: 回退解析器——如果沒有編號行但輸出包含中文，直接使用原始輸出
+  if (parsed.size === 0) {
+    const hasChinese = /[\u4e00-\u9fff]/.test(generated);
+    if (hasChinese) {
+      // 使用原始輸出作為翻譯（按行分割）
+      const rawLines = generated.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      // 映射到源行（如果行數不足則回退到原文）
+      const translatedLines = sourceLines.map((src, i) => rawLines[i] || src);
+      console.log('[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation');
+      return { translatedLines, echoed: false, parsedCount: 0, similarCount: 0 };
+    }
+  }
+  
   const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
-  const echoed =
-    sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
-  return { translatedLines, echoed, parsedCount: parsed.size };
+  
+  // F4 + F7: 改進 echo 偵測邏輯
+  // 檢查模型是否回顯原文（parsed 的行與 sourceLines 相同）
+  let similarCount = 0;
+  if (parsed.size > 0) {
+    // 當有編號行時，檢查這些行是否與原文相同
+    for (let i = 0; i < sourceLines.length; i++) {
+      const translated = parsed.get(i)?.trim();
+      const source = sourceLines[i];
+      if (!translated) continue; // 沒有解析到，跳過
+      
+      // 檢查是否相同或相似
+      if (translated === source) {
+        similarCount++;
+      } else {
+        // 檢查是否相似：長度差異 < 30% 且包含相同單詞 > 50%
+        const lengthDiff = Math.abs(translated.length - source.length);
+        const lengthThreshold = source.length * 0.3;
+        if (lengthDiff < lengthThreshold) {
+          const translatedWords = translated.toLowerCase().split(/\s+/);
+          const sourceWords = source.toLowerCase().split(/\s+/);
+          const overlappingWords = translatedWords.filter(w => sourceWords.includes(w)).length;
+          if (overlappingWords > sourceWords.length * 0.5) {
+            similarCount++;
+          }
+        }
+      }
+    }
+  }
+  
+  // 如果超過 80% 的已解析行都相似，認為是 echo
+  const echoed = parsed.size > 0 && similarCount > parsed.size * 0.8;
+  return { translatedLines, echoed, parsedCount: parsed.size, similarCount };
 }
 
 /** 語言代碼映射為語言名稱（用於 Prompt）。 */

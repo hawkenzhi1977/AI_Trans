@@ -29,4 +29,6 @@ export interface CaptionStrategy {
   /** 產出字幕流；通過 emit 推送（支持增量與 provisional 修正）。 */
   run(ctx: StrategyContext, emit: (e: PipelineEvent) => void): Promise<void>;
   stop(): void;
+  /** 用戶 seek 時通知策略重新優先化（可選——僅原生字幕策略需要）。 */
+  onSeek?(currentTimeMs: number): void;
 }

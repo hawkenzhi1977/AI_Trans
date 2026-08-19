@@ -8,6 +8,8 @@ export interface TranslationRequest {
   context?: string[];
   /** 是否需要流式返回（低延遲）。 */
   streaming?: boolean;
+  /** 取消信號——seek 時中斷正在進行的翻譯（避免浪費已落後位置的 chunks）。 */
+  signal?: AbortSignal;
 }
 
 export interface TranslationResult {

@@ -248,18 +248,29 @@
     }, 2e3);
   }
   async function init() {
+    console.log("[AI_Trans:options] Options page loading...");
     let config;
     try {
       config = await store.get();
     } catch (err) {
-      showStatus(`\u8B80\u53D6\u914D\u7F6E\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      const errorMsg = `\u8B80\u53D6\u914D\u7F6E\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
+      console.error("[AI_Trans:options]", errorMsg, err);
+      showStatus(errorMsg);
       config = DEFAULT_CONFIG;
     }
-    fillForm(config);
+    try {
+      fillForm(config);
+    } catch (err) {
+      const errorMsg = `\u586B\u5145\u8868\u55AE\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
+      console.error("[AI_Trans:options]", errorMsg, err);
+      showStatus(errorMsg);
+    }
     try {
       await loadKeysIntoForm();
     } catch (err) {
-      showStatus(`\u8B80\u53D6\u5BC6\u9470\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      const errorMsg = `\u8B80\u53D6\u5BC6\u9470\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
+      console.error("[AI_Trans:options]", errorMsg, err);
+      showStatus(errorMsg);
     }
     $("performance-profile").addEventListener("change", () => {
       const prof = PROFILE_DEFAULTS[$("performance-profile").value];
@@ -290,8 +301,15 @@
         versionEl.textContent = "v0.0.0";
       }
     }
+    console.log("[AI_Trans:options] Options page loaded successfully");
   }
-  void init();
+  void init().catch((err) => {
+    console.error("[AI_Trans:options] Options page failed to load:", err);
+    const body = document.body;
+    if (body) {
+      body.innerHTML = `<div style="color: red; padding: 20px; font-family: monospace;">Options page error: ${err instanceof Error ? err.message : String(err)}<br><br>Stack: ${err instanceof Error ? err.stack : "N/A"}</div>`;
+    }
+  });
   function initLocalOnnxModelUI() {
     const statusBadge = $("local-model-status-badge");
     const progressContainer = $("local-model-progress-container");

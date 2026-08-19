@@ -1,6 +1,8 @@
-// 本地 ONNX 翻譯適配器——使用 Transformers.js + ONNX Runtime Web 在 Offscreen Document 推理。
-// 當雲端 LLM 失敗時作為 fallback 引擎，實現完全離線的本地翻譯兜底。
-// 模型：onnx-community/Qwen2.5-0.5B-Instruct (INT4 ONNX，約 350MB)。
+/**
+ * 本地 ONNX 翻譯適配器——使用 Transformers.js + ONNX Runtime Web 在 Offscreen Document 推理。
+ * 當雲端 LLM 失敗時作為 fallback 引擎，實現完全離線的本地翻譯兜底。
+ * 模型：onnx-community/Qwen2.5-0.5B-Instruct (INT4 ONNX，約 350MB)。
+ */
 import type { TranslationProvider } from '../../domain/ports/translation-provider';
 import type { TranslationRequest, TranslationResult } from '../../domain/models/translation';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
@@ -38,6 +40,9 @@ export interface LocalOnnxTranslationConfig {
   isPrimary?: boolean;
 }
 
+/** 單次翻譯會話的最大時限（毫秒）：超過此時間主動中斷，避免 Offscreen 長時間運行不穩定。 */
+const MAX_SESSION_DURATION_MS = 10 * 60 * 1000; // 10 分鐘
+
 /**
  * 本地 ONNX 翻譯 Provider——透過 Offscreen Document 執行推理。
  * 可作為主翻譯引擎（type='local-onnx'）或雲端 LLM 失敗時的離線兜底。
@@ -51,12 +56,32 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
   private readonly defaultTargetLang: string;
   private readonly isPrimary: boolean;
+  
+  /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
+  private port: chrome.runtime.Port | null = null;
+  private messageIdCounter = 0;
 
   constructor(config: LocalOnnxTranslationConfig) {
     // modelName 保留供未來擴充（如多模型切換），目前仅用於配置顯示。
     void config.modelName;
     this.defaultTargetLang = config.targetLang ?? 'zh-Hant';
     this.isPrimary = config.isPrimary ?? false;
+  }
+
+  /**
+   * 建立與 Service Worker 的 port 長連接。
+   * 使用 port 而非 sendMessage，避免推理時間過長導致消息通道關閉。
+   */
+  private ensurePort(): chrome.runtime.Port {
+    if (this.port) return this.port;
+    
+    this.port = chrome.runtime.connect({ name: 'content-onnx' });
+    this.port.onDisconnect.addListener(() => {
+      diagLog('local-onnx', 'port disconnected, will reconnect on next request');
+      this.port = null;
+    });
+    
+    return this.port;
   }
 
   /**
@@ -67,6 +92,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
    */
   async warmup(): Promise<void> {
     try {
+      // warmup 使用 sendMessage（短時間操作，不需要 port）
       const response = await chrome.runtime.sendMessage({ topic: 'local-onnx:warmup' });
       const res = response as { ok: boolean; error?: string };
       if (!res.ok) {
@@ -140,32 +166,58 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 發送單次翻譯請求並校驗結果。
-   * §5.6：模型未下載/推理失敗/sendMessage 通信失敗都必須落診斷。
+   * 發送單次翻譯請求並校驗結果——使用 port 長連接。
+   * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
    */
   private async requestTranslate(
     request: LocalOnnxTranslateRequest
   ): Promise<LocalOnnxTranslateResponse> {
     try {
-      const response = await chrome.runtime.sendMessage(request);
-      const res = response as LocalOnnxTranslateResponse;
+      const port = this.ensurePort();
+      const messageId = `msg-${++this.messageIdCounter}-${Date.now()}`;
 
-      if (!res.ok) {
-        const error = new Error(res.error ?? 'local-onnx translation failed');
+      // 通過 port 發送請求並等待響應
+      const response = await new Promise<LocalOnnxTranslateResponse>((resolve, reject) => {
+        const listener = (msg: unknown) => {
+          const res = msg as { messageId?: string; result?: LocalOnnxTranslateResponse; error?: string };
+          if (res.messageId === messageId) {
+            port.onMessage.removeListener(listener);
+            if (res.error) {
+              reject(new Error(res.error));
+            } else if (res.result) {
+              resolve(res.result);
+            } else {
+              reject(new Error('Empty response from offscreen'));
+            }
+          }
+        };
+
+        port.onMessage.addListener(listener);
+        port.postMessage({ ...request, messageId });
+
+        // 超時處理（120 秒）
+        setTimeout(() => {
+          port.onMessage.removeListener(listener);
+          reject(new Error('Offscreen Document response timeout'));
+        }, 120000);
+      });
+
+      if (!response.ok) {
+        const error = new Error(response.error ?? 'local-onnx translation failed');
         recordDiagnostic({
           type: 'pipeline-error',
           error: {
             port: 'translation',
-            code: res.notDownloaded ? 'local-onnx-not-downloaded' : 'local-onnx-inference-failed',
+            code: response.notDownloaded ? 'local-onnx-not-downloaded' : 'local-onnx-inference-failed',
             recoverable: true,
             cause: error,
           },
         });
         throw error;
       }
-      return res;
+      return response;
     } catch (err) {
-      // §5.6：chrome.runtime.sendMessage 失敗（如 SW 崩潰、Offscreen 未建立）必須落診斷。
+      // §5.6：通信失敗必須落診斷。
       const error = err instanceof Error ? err : new Error(String(err));
       recordDiagnostic({
         type: 'pipeline-error',
@@ -185,6 +237,11 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
    * 修復：此前本地 ONNX 非真流式（`await this.translate(req)` 全量跑完才 emit 一次），
    * 431 段 = 87 次串行推理需數分鐘，NativeCaptionStrategy 首次 emit 才發 segments-ready，
    * 導致字幕長時間空白。現在首塊數秒內 emit，後續塊累計替換（與 LLM 流式同語義）。
+   * 
+   * 支持 AbortSignal：seek 時策略中斷翻譯，每個 chunk 前檢查 signal.aborted，
+   * 已中止則拋 AbortError（不觸發 fallback，由策略層靜默處理）。
+   * 
+   * Fix D: 最大翻譯時限保護——連續翻譯超過 10 分鐘主動中斷，避免 Offscreen 長時間運行不穩定。
    */
   async translateStream(
     req: TranslationRequest,
@@ -194,20 +251,51 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     const accumulated: SubtitleSegment[] = [];
     let echoedChunks = 0;
     const totalChunks = Math.ceil(req.segments.length / LocalONNXTranslationProvider.CHUNK_SIZE);
+    const streamStartedAt = performance.now();
 
     for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
+      // 每個 chunk 前檢查 abort signal——seek 中斷時停止翻譯，避免浪費已落後位置的 chunks。
+      if (req.signal?.aborted) {
+        diagLog('local-onnx', 'translation aborted by signal after', accumulated.length, 'segments');
+        throw new DOMException('Translation aborted', 'AbortError');
+      }
+
+      // Fix D: 檢查最大翻譯時限——超過 10 分鐘主動中斷，避免 Offscreen 長時間運行不穩定
+      const elapsedMs = performance.now() - streamStartedAt;
+      if (elapsedMs > MAX_SESSION_DURATION_MS) {
+        diagLog('local-onnx', 'translation session exceeded max duration', MAX_SESSION_DURATION_MS, 'ms after', accumulated.length, 'segments, aborting to prevent Offscreen instability');
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'translation',
+            code: 'local-onnx-session-timeout',
+            recoverable: true,
+            cause: new Error(
+              `local-onnx translation session exceeded ${MAX_SESSION_DURATION_MS / 1000}s (translated ${accumulated.length} segments), aborting to prevent Offscreen instability`
+            ),
+          },
+        });
+        throw new Error('local-onnx session timeout (10min limit)');
+      }
+
       const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
       const chunkIndex = Math.floor(i / LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+      const chunkStartedAt = performance.now();
       const chunkResult = await this.translateChunk(chunk, targetLang);
+      const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
       accumulated.push(...chunkResult.segments);
       if (chunkResult.echoed) echoedChunks += 1;
 
+      // D5：記錄 chunk 計時與翻譯速度。
+      const totalElapsedMs = Math.round(performance.now() - streamStartedAt);
+      const segmentsPerSec = (accumulated.length / (totalElapsedMs / 1000)).toFixed(2);
       diagLog(
         'local-onnx',
-        `chunk ${chunkIndex}/${totalChunks} done, cumulative`,
+        `chunk ${chunkIndex}/${totalChunks} done in ${chunkLatencyMs}ms, cumulative`,
         accumulated.length,
         'segments, echoed:',
-        chunkResult.echoed
+        chunkResult.echoed,
+        `| total: ${totalElapsedMs}ms, speed: ${segmentsPerSec} seg/s`
       );
 
       emit({

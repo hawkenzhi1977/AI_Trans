@@ -31,6 +31,11 @@ export interface OrchestratorDeps {
  * 總調度——選擇平台與策略鏈，組裝管線，推送渲染事件。
  * M1 範圍：平台適配 + 原生字幕策略 + 翻譯管線 + 渲染。
  */
+/** Seek 偵測閾值（毫秒）：currentTime 跳躍超過此值視為用戶 seek。 */
+const SEEK_THRESHOLD_MS = 10_000;
+/** Seek debounce（毫秒）：避免連續拖動進度條時頻繁重算優先級。 */
+const SEEK_DEBOUNCE_MS = 200;
+
 export class Orchestrator {
   private chain: CaptionStrategyChain | null = null;
   private currentPlatformId: string | null = null;
@@ -42,6 +47,8 @@ export class Orchestrator {
     duration: 0,
     buffered: [],
   };
+  private lastSeekDetectionTime = 0;
+  private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly deps: OrchestratorDeps,
@@ -141,8 +148,19 @@ export class Orchestrator {
     }
 
     // 監聽播放狀態，供策略與渲染使用。
+    // Seek 偵測：currentTime 突變 >10s 時通知策略重新優先化翻譯隊列。
     const unsubscribe = platform.observePlayback((state) => {
+      const prevTime = this.lastPlayback.currentTime;
       this.lastPlayback = state;
+      // 跳過初始回調（prevTime=0）與微小跳躍（正常 timeupdate 誤差）。
+      if (prevTime > 0 && Math.abs(state.currentTime - prevTime) > SEEK_THRESHOLD_MS) {
+        this.lastSeekDetectionTime = state.currentTime;
+        if (this.seekDebounceTimer !== null) clearTimeout(this.seekDebounceTimer);
+        this.seekDebounceTimer = setTimeout(() => {
+          this.seekDebounceTimer = null;
+          this.chain?.onSeek(this.lastSeekDetectionTime);
+        }, SEEK_DEBOUNCE_MS);
+      }
     });
     this.cleanups.push(unsubscribe);
 
@@ -168,6 +186,12 @@ export class Orchestrator {
     this.currentPlatformId = null;
     for (const cleanup of this.cleanups) cleanup();
     this.cleanups.length = 0;
+    // 清理 seek debounce 計時器（§5.4：註冊必配解除）。
+    if (this.seekDebounceTimer !== null) {
+      clearTimeout(this.seekDebounceTimer);
+      this.seekDebounceTimer = null;
+    }
+    this.lastSeekDetectionTime = 0;
   }
 
   get platformId(): string | null {

@@ -550,6 +550,7 @@ export class YouTubePlatformAdapter implements PlatformAdapter {
       'ratechange',
       'loadedmetadata',
       'progress',
+      'seeked',
     ];
     for (const ev of events) video.addEventListener(ev, handler);
     handler();

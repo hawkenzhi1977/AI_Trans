@@ -904,6 +904,8 @@ jobs:
 | TC-M2-24 | M2-24 補充修復十四 晚捕獲事件驅動重試（onCapture 訂閱 + LateCaptureRetry + 重跑 Orchestrator） | 單元（已實裝）+ 集成（已實裝） |
 | TC-M2-25 | M2-24 補充修復十五 清快取後重新下載模型（世代失效 + 進度防護 + dispose） | 集成（已實裝） |
 | TC-M2-26 | M2-24 補充修復十六 local-onnx 流式漸進 + echo 診斷儀器（逐塊 emit + parsedCount + echoed + 聚合診斷） | 單元（已實裝）+ 集成（已實裝） |
+| TC-M1-57 | M1-57 Seek 響應與動態優先級翻譯（onSeek 中斷 + 滑動窗口優先級 + AbortSignal 透傳 + AbortError 不觸發 fallback + 已翻譯保留 + seek 偵測 debounce） | 單元（已實裝）+ 集成（已實裝） |
+| TC-M1-58 | M1-58 翻譯管線冗餘重試修復（相同引擎 fallback 跳過 + translateStream 失敗不重試 translate + Offscreen 10 分鐘時限保護） | 單元（已實裝） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

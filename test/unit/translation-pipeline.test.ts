@@ -128,4 +128,110 @@ describe('TranslationPipeline', () => {
     const result = await pipeline.translate({ segments: [seg(0)], targetLang: 'zh-Hant' });
     expect(result.segments[0].targetLang).toBe('zh-Hant');
   });
+
+  it('translateStream 的 primary.stream 拋 AbortError 時不觸發 fallback，直接向上拋出', async () => {
+    const abortingStream: import('../../src/domain/ports/translation-provider').TranslationProvider = {
+      engineId: 'llm',
+      location: 'cloud',
+      translate: async () => { throw new Error('should not reach'); },
+      translateStream: async () => {
+        throw new DOMException('Translation aborted', 'AbortError');
+      },
+    };
+    const mt = new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' });
+    const events: unknown[] = [];
+    const pipeline = new TranslationPipeline({
+      primary: abortingStream,
+      fallback: mt,
+      targetLang: 'zh-Hant',
+      streaming: true,
+      onEvent: (e) => events.push(e),
+    });
+
+    const emitted: unknown[] = [];
+    await expect(pipeline.translateStream(req(), (r) => emitted.push(r))).rejects.toThrow('Translation aborted');
+    // AbortError 不觸發 fallback
+    expect(mt.calls).toBe(0);
+    // 不發降級事件
+    expect(events.some((e) => (e as { type: string }).type === 'engine-degraded')).toBe(false);
+  });
+
+  it('Fix A: primary 與 fallback 為相同引擎時跳過 fallback 直接拋錯', async () => {
+    // 模擬 config.translation.type === 'local-onnx' 且 fallbackType === 'local-onnx'
+    const primary = new StubTranslationProvider({ engineId: 'local-onnx', failAlways: true });
+    const fallback = new StubTranslationProvider({ engineId: 'local-onnx', prefix: '[onnx-fallback]' });
+    const events: unknown[] = [];
+    const pipeline = new TranslationPipeline({
+      primary,
+      fallback,
+      targetLang: 'zh-Hant',
+      onEvent: (e) => events.push(e),
+    });
+
+    await expect(pipeline.translate(req())).rejects.toThrow('injected failure');
+    // fallback 不應被調用（相同引擎）
+    expect(fallback.calls).toBe(0);
+    // 跳過相同引擎時不發 engine-degraded（沒有實際降級發生）
+    // 但會發 pipeline-error
+    expect(events.some((e) => (e as { type: string }).type === 'pipeline-error')).toBe(true);
+  });
+
+  it('Fix B: translateStream 失敗時只嘗試不同引擎的 fallback，不重試 primary.translate()', async () => {
+    let primaryTranslateCalls = 0;
+    const failingStream: import('../../src/domain/ports/translation-provider').TranslationProvider = {
+      engineId: 'local-onnx',
+      location: 'local',
+      translate: async () => {
+        primaryTranslateCalls++;
+        throw new Error('primary translate should not be called');
+      },
+      translateStream: async () => {
+        throw new Error('stream failed after partial translation');
+      },
+    };
+    const mt = new StubTranslationProvider({ engineId: 'mt', prefix: '[mt]' });
+    const events: unknown[] = [];
+    const pipeline = new TranslationPipeline({
+      primary: failingStream,
+      fallback: mt,
+      targetLang: 'zh-Hant',
+      streaming: true,
+      onEvent: (e) => events.push(e),
+    });
+
+    const emitted: unknown[] = [];
+    await pipeline.translateStream(req(), (r) => emitted.push(r));
+
+    // primary.translate() 不應被調用（Fix B）
+    expect(primaryTranslateCalls).toBe(0);
+    // fallback（不同引擎）應被調用
+    expect(mt.calls).toBe(1);
+    expect(emitted).toHaveLength(1);
+    expect((emitted[0] as { engineId: string }).engineId).toBe('mt');
+  });
+
+  it('Fix B: translateStream 失敗且 fallback 為相同引擎時直接拋錯', async () => {
+    const failingStream: import('../../src/domain/ports/translation-provider').TranslationProvider = {
+      engineId: 'local-onnx',
+      location: 'local',
+      translate: async () => { throw new Error('should not reach'); },
+      translateStream: async () => {
+        throw new Error('stream failed');
+      },
+    };
+    const sameEngineFallback = new StubTranslationProvider({ engineId: 'local-onnx', prefix: '[same]' });
+    const events: unknown[] = [];
+    const pipeline = new TranslationPipeline({
+      primary: failingStream,
+      fallback: sameEngineFallback,
+      targetLang: 'zh-Hant',
+      streaming: true,
+      onEvent: (e) => events.push(e),
+    });
+
+    const emitted: unknown[] = [];
+    await expect(pipeline.translateStream(req(), (r) => emitted.push(r))).rejects.toThrow('stream failed');
+    // 相同引擎的 fallback 不應被調用
+    expect(sameEngineFallback.calls).toBe(0);
+  });
 });

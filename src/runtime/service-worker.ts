@@ -96,6 +96,29 @@ chrome.runtime.onConnect.addListener((port) => {
       offscreenPort = null;
     });
   }
+  
+  // 監聽來自 Content Script 的 port 連接（用於 local-onnx 翻譯請求）
+  if (port.name === 'content-onnx') {
+    port.onMessage.addListener(async (message) => {
+      const msg = message as { topic?: string; messageId?: string; payload?: unknown };
+      const messageId = msg.messageId;
+      
+      // 只處理 local-onnx 翻譯請求
+      if (msg.topic !== 'local-onnx:translate') return;
+      
+      try {
+        // 轉發給 Offscreen Document
+        const result = await sendToOffscreen<unknown>(msg);
+        port.postMessage({ messageId, result });
+      } catch (err) {
+        port.postMessage({ messageId, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    
+    port.onDisconnect.addListener(() => {
+      // Content Script 斷開連接，正常情況（頁面關閉/刷新）
+    });
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

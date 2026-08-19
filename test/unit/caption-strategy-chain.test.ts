@@ -16,6 +16,7 @@ class FakeStrategy implements CaptionStrategy {
   readonly origin: CaptionOrigin;
   ran = false;
   stopped = false;
+  seekTime: number | null = null;
   constructor(private readonly opts: FakeOpts) {
     this.origin = opts.origin;
   }
@@ -32,6 +33,9 @@ class FakeStrategy implements CaptionStrategy {
   }
   stop(): void {
     this.stopped = true;
+  }
+  onSeek(currentTimeMs: number): void {
+    this.seekTime = currentTimeMs;
   }
 }
 
@@ -151,5 +155,15 @@ describe('CaptionStrategyChain', () => {
     expect(err).toBeDefined();
     const msg = ((err as Extract<PipelineEvent, { type: 'pipeline-error' }>).error.cause as Error).message;
     expect(msg).toContain('all caption strategies not applicable');
+  });
+
+  it('onSeek 傳播到所有策略', () => {
+    const s1 = new FakeStrategy({ origin: 'native', applicable: true });
+    const s2 = new FakeStrategy({ origin: 'realtime-asr', applicable: true });
+    const chain = new CaptionStrategyChain([s1, s2]);
+
+    chain.onSeek(30000);
+    expect(s1.seekTime).toBe(30000);
+    expect(s2.seekTime).toBe(30000);
   });
 });

@@ -224,13 +224,14 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     expect(parsedCount).toBe(2);
   });
 
-  it('parseNumberedOutput：無行號輸出解析不到（parsedCount=0）→ 全部回落原文標記 echo（診斷可分辨解析誤判）', () => {
+  it('parseNumberedOutput：無行號輸出但包含中文 → 使用中文作為翻譯（F6 回退解析器）', () => {
     const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '你好\n世界',
       ['Hello', 'World']
     );
-    expect(translatedLines).toEqual(['Hello', 'World']);
-    expect(echoed).toBe(true);
+    // F6: 當沒有編號但輸出包含中文時，使用中文作為翻譯
+    expect(translatedLines).toEqual(['你好', '世界']);
+    expect(echoed).toBe(false);
     expect(parsedCount).toBe(0);
   });
 

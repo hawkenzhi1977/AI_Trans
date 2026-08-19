@@ -97,4 +97,11 @@ export class CaptionStrategyChain {
   stopAll(): void {
     for (const s of this.strategies) s.stop();
   }
+
+  /** 傳播 seek 事件到各策略（僅原生字幕策略需要重新優先化翻譯隊列）。 */
+  onSeek(currentTimeMs: number): void {
+    for (const s of this.strategies) {
+      s.onSeek?.(currentTimeMs);
+    }
+  }
 }

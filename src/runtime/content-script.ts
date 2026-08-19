@@ -443,6 +443,12 @@ class SubtitleController {
         start: s.start,
         end: s.end,
       }));
+      // D3：記錄 playback vs coverage gap（正值 = 翻譯落後播放位置，負值 = 翻譯超前）。
+      if (this.cues.length > 0) {
+        const maxEnd = Math.max(...this.cues.map(c => c.end));
+        const gap = this.currentTime - maxEnd;
+        diagLog('content', 'playback-cue gap:', gap, 'ms (currentTime:', this.currentTime, 'maxEnd:', maxEnd, ')', gap > 0 ? 'BEHIND' : 'AHEAD');
+      }
       // M2-24 補充修復十四：字幕成功接管後解除晚捕獲等待（不再需要重試）。
       this.lateCaptureRetry.disarm();
       diagLog('content', 'cues updated, count:', this.cues.length, 'calling scheduleDraw');

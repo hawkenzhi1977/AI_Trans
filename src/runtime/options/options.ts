@@ -196,20 +196,36 @@ function showStatus(msg: string): void {
 }
 
 async function init(): Promise<void> {
+  // D8：Options 頁面初始化診斷（始終輸出，不依賴 debug flag）
+  console.log('[AI_Trans:options] Options page loading...');
+  
   // §5.6：storage 讀取失敗不能使 Options 頁無聲不可用（void init 的 rejection 會靜默消失）。
   let config: EngineConfig;
   try {
     config = await store.get();
   } catch (err) {
-    showStatus(`讀取配置失敗: ${err instanceof Error ? err.message : String(err)}`);
+    const errorMsg = `讀取配置失敗: ${err instanceof Error ? err.message : String(err)}`;
+    console.error('[AI_Trans:options]', errorMsg, err);
+    showStatus(errorMsg);
     config = DEFAULT_CONFIG;
   }
-  fillForm(config);
+  
+  try {
+    fillForm(config);
+  } catch (err) {
+    // F5：捕獲 fillForm 錯誤並顯示
+    const errorMsg = `填充表單失敗: ${err instanceof Error ? err.message : String(err)}`;
+    console.error('[AI_Trans:options]', errorMsg, err);
+    showStatus(errorMsg);
+  }
+  
   try {
     await loadKeysIntoForm();
   } catch (err) {
     // 密鑰讀取失敗：頁面仍可用（保存會覆蓋），但必須可見，避免用戶以為 key 已填。
-    showStatus(`讀取密鑰失敗: ${err instanceof Error ? err.message : String(err)}`);
+    const errorMsg = `讀取密鑰失敗: ${err instanceof Error ? err.message : String(err)}`;
+    console.error('[AI_Trans:options]', errorMsg, err);
+    showStatus(errorMsg);
   }
 
   // 性能檔位變更時自動提示（不強制改值，避免覆蓋用戶微調）。
@@ -251,9 +267,19 @@ async function init(): Promise<void> {
       versionEl.textContent = 'v0.0.0';
     }
   }
+  
+  // D8：初始化成功診斷
+  console.log('[AI_Trans:options] Options page loaded successfully');
 }
 
-void init();
+// F5：捕獲 init 的未處理錯誤並顯示
+void init().catch((err) => {
+  console.error('[AI_Trans:options] Options page failed to load:', err);
+  const body = document.body;
+  if (body) {
+    body.innerHTML = `<div style="color: red; padding: 20px; font-family: monospace;">Options page error: ${err instanceof Error ? err.message : String(err)}<br><br>Stack: ${err instanceof Error ? err.stack : 'N/A'}</div>`;
+  }
+});
 
 // ============================================================
 // 本地 ONNX 翻譯模型 UI 邏輯

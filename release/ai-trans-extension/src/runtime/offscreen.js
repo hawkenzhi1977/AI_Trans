@@ -48980,12 +48980,20 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const result = await pipelineFn(prompt, {
         max_new_tokens: 256,
         do_sample: false,
-        repetition_penalty: 1.1
+        repetition_penalty: 1.1,
+        return_full_text: false
       });
       const generatedText = result[0]?.generated_text ?? "";
       console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
-      const { translatedLines, echoed, parsedCount } = parseNumberedOutput(generatedText, sourceLines);
+      console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
+      const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
       if (echoed) {
+        console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
+        console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
+        console.log("[AI_Trans:local-onnx] parsedCount:", parsedCount);
+        console.log("[AI_Trans:local-onnx] sourceLines (first 3):", JSON.stringify(sourceLines.slice(0, 3)));
+        console.log("[AI_Trans:local-onnx] translatedLines (first 3):", JSON.stringify(translatedLines.slice(0, 3)));
+        console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
         const elapsedMs = Math.round(performance.now() - inferStartedAt);
         recordDiagnostic({
           type: "pipeline-error",
@@ -48994,7 +49002,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             code: "local-onnx-echo-output",
             recoverable: true,
             cause: new Error(
-              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
                 generatedText.slice(0, 200)
               )}`
             )
@@ -49090,9 +49098,40 @@ ${numbered}
         if (idx >= 0 && val.length > 0) parsed.set(idx, val);
       }
     }
+    if (parsed.size === 0) {
+      const hasChinese = /[\u4e00-\u9fff]/.test(generated);
+      if (hasChinese) {
+        const rawLines = generated.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+        const translatedLines2 = sourceLines.map((src, i) => rawLines[i] || src);
+        console.log("[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation");
+        return { translatedLines: translatedLines2, echoed: false, parsedCount: 0, similarCount: 0 };
+      }
+    }
     const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
-    const echoed = sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
-    return { translatedLines, echoed, parsedCount: parsed.size };
+    let similarCount = 0;
+    if (parsed.size > 0) {
+      for (let i = 0; i < sourceLines.length; i++) {
+        const translated = parsed.get(i)?.trim();
+        const source = sourceLines[i];
+        if (!translated) continue;
+        if (translated === source) {
+          similarCount++;
+        } else {
+          const lengthDiff = Math.abs(translated.length - source.length);
+          const lengthThreshold = source.length * 0.3;
+          if (lengthDiff < lengthThreshold) {
+            const translatedWords = translated.toLowerCase().split(/\s+/);
+            const sourceWords = source.toLowerCase().split(/\s+/);
+            const overlappingWords = translatedWords.filter((w) => sourceWords.includes(w)).length;
+            if (overlappingWords > sourceWords.length * 0.5) {
+              similarCount++;
+            }
+          }
+        }
+      }
+    }
+    const echoed = parsed.size > 0 && similarCount > parsed.size * 0.8;
+    return { translatedLines, echoed, parsedCount: parsed.size, similarCount };
   }
   function getLanguageName(langCode) {
     const map = {

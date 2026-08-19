@@ -446,6 +446,8 @@ export interface CaptionStrategy {
   /** 產出字幕流；通過回調推送（支持增量與 provisional 修正） */
   run(ctx: StrategyContext, emit: (e: PipelineEvent) => void): Promise<void>;
   stop(): void;
+  /** Seek 響應（可選）：用戶拖動進度條時中斷當前翻譯並按新位置重新優先化 */
+  onSeek?(currentTimeMs: number): void;
 }
 
 export interface StrategyContext {
@@ -458,6 +460,8 @@ export interface StrategyContext {
 ```
 
 **插拔說明**：三級策略即三個實現，串成鏈。`isApplicable` 為假則降級到下一策略。新增/調整字幕來源 = 增刪一個策略節點，管線與渲染無感。
+
+> **Seek 響應與動態優先級翻譯（M1-57）**：`Orchestrator` 的 `observePlayback` 回調偵測 `currentTime` 突變 >10s（`SEEK_THRESHOLD_MS`），200ms debounce 後調用 `chain.onSeek(currentTime)`；`CaptionStrategyChain.onSeek()` 遍歷所有策略調用可選 `onSeek()`。`NativeCaptionStrategy` 實作：`onSeek()` 設置 `hasSeek` 標記 + `AbortController.abort()` 中斷當前翻譯；`translateWithPriority()` 循環每輪按 `getPrioritizedSegments(currentTime)` 排序——滑動窗口 `[currentTime+2s, currentTime+120s]` 內優先、窗口外按時間序填充；`translatedIds: Set<string>` 追蹤已翻譯 segments 避免重複；`mergeAccumulated()` 支持 provider 累計 emit 語義（更新已存在 + 添加新的）。`TranslationRequest.signal?: AbortSignal` 透傳至 `LocalONNXTranslationProvider.translateStream`（每 chunk 前檢查 `signal.aborted`，中止拋 `DOMException('AbortError')`）；`TranslationPipeline.translateStream` 偵測 `AbortError` 直接向上拋出（不觸發 fallback）。
 
 ### 7.3 AudioSourceProvider（隔離二級高風險）
 
@@ -511,6 +515,8 @@ export interface TranslationProvider {
 ```
 
 **插拔說明**：LLM 與 MT 均實現此接口。混合策略在 `TranslationPipeline` 中組合：主用 LLM，失敗/超時降級 MT（見第 10 章）。
+
+> **翻譯管線冗餘重試修復（M1-58）**：`TranslationPipeline` 的 fallback 邏輯存在兩個冗餘重試問題：**(1) 相同引擎 fallback**——當 `config.translation.type === 'local-onnx'` 且 `fallbackType === 'local-onnx'` 時，primary 和 fallback 是同一個引擎（`local-onnx`），primary 失敗後 pipeline 嘗試 fallback 實際上是重複嘗試同一引擎，浪費 120s × 2 = 240s。修復：`translate()` 和 `translateStream()` 的 catch 分支檢查 `fallback.engineId !== primary.engineId`，相同引擎直接拋錯不嘗試，記錄 `skipping fallback: same engine as primary` 日誌。**(2) translateStream 失敗後重試 translate()**——`translateStream` 在 chunk 55/71（275 段已成功）時超時，pipeline 的 catch 調用 `translate()` 從頭重試**全部 354 段**，浪費已成功翻譯的部分。修復：`translateStream` 失敗時只嘗試不同引擎的 fallback，不重試 primary 的 `translate()`（避免從頭重試已成功翻譯的部分）。**(3) Offscreen 長時間翻譯保護**——`LocalONNXTranslationProvider.translateStream` 新增 `MAX_SESSION_DURATION_MS = 10 * 60 * 1000`（10 分鐘）時限檢查，每 chunk 前檢查 `elapsedMs > MAX_SESSION_DURATION_MS`，超過時限主動中斷並發 `local-onnx-session-timeout` 診斷（`recordDiagnostic`），避免 Offscreen 長時間運行不穩定（真實環境 15 分鐘連續翻譯後 Offscreen 超時的根因）。
 
 > **LLM 翻譯直接 fetch 架構（M1-48，service worker 代理移除）**：初版 `LLMTranslationProvider` 經 `chrome.runtime.sendMessage` / port 走 service worker 代理翻譯，真實環境極慢（fetch 完成僅 19-25ms，但消息投遞延遲 138s+）。根因：MV3 service worker 被掛起後，`sendMessage`/`port.postMessage` 響應被延遲到 SW 喚醒（Chrome 對 SW 有 30s–5min 不等掛起策略），`alarms` keepalive + port 長連接均無法根治（SW 仍會被強制掛起）。**修復：content script 直接 fetch**——manifest 的 `host_permissions`（`http://127.0.0.1/*`、`http://localhost/*`）讓 ISOLATED world 的 content script 直接 fetch localhost 無需 CORS 預檢，且不受 SW 掛起影響。`LLMTranslationProvider` 改為 `globalThis.fetch` 直接調用；移除 service-worker `translation:fetch` 消息處理（~45 行）、`alarms` keepalive、`onConnect` port proxy（~60 行）與 manifest `alarms` 權限，SW 精簡為僅 `config:get`/`config:set` 配置管理。**架構教訓**：(1) MV3 SW 不適合做實時消息代理——SW 掛起不可控，任何依賴 SW 即時響應的設計都會在掛起後崩潰；(2) host_permissions 可讓 content script 繞過 CORS；(3) 架構選擇優先考慮「不依賴可掛起組件」。測試模式從 `fetchFn` 注入改為 `vi.stubGlobal('fetch', mockFetch)`。實測 `LLM: fetch completed in 23 ms`（原 138s+）。
 
@@ -853,7 +859,7 @@ export interface PerfSample {
 
 | 里程碑 | 落地的適配器/模塊 | 先定義後實現的接口 |
 |---|---|---|
-| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容）；LLM 直接 fetch + SW 精簡（M1-48）；字幕背景樣式增強（F-09/M1-49）；日誌降壓 + interceptor arraybuffer 支援（M1-50）；`debug-log.ts` 調試日誌門控（F-12/M1-51）；LLM 分塊翻譯 + `translateStream` 漸進交付 + LRU 快取 + 瞬態失敗重試（F-13/M1-52） | 全部端口先定義 |
+| M1 原生字幕 | `YouTubePlatformAdapter`、`NativeCaptionStrategy`、`LLMTranslation`/`MTTranslation`、`OverlayRenderer`、`ChromeStorageConfig`；`normalizeEndpoint`（端點規範化）、`stripReasoning`（reasoning 剝離）、LLM 超時降級、`storage.onChanged` 熱重啟（F-10 本地 LLM 兼容）；LLM 直接 fetch + SW 精簡（M1-48）；字幕背景樣式增強（F-09/M1-49）；日誌降壓 + interceptor arraybuffer 支援（M1-50）；`debug-log.ts` 調試日誌門控（F-12/M1-51）；LLM 分塊翻譯 + `translateStream` 漸進交付 + LRU 快取 + 瞬態失敗重試（F-13/M1-52）；Seek 響應 + 動態優先級翻譯 + AbortSignal 透傳（M1-57）；翻譯管線冗餘重試修復（相同引擎 fallback 跳過 + translateStream 失敗不重試 translate + Offscreen 10 分鐘時限保護）（M1-58） | 全部端口先定義 |
 | M2 實時 ASR | `TabCaptureAudioSource`、`LocalWhisperASR`/`CloudASR`、`RealtimeASRStrategy`、VAD（`EnergyVAD`）、`perf/metrics`、Offscreen Document（`src/runtime/offscreen.ts`）、tabCapture 授權流程；ASR 依賴注入修復 + 自定義模型路徑（M2-16）；CSP 違規修復（M2-17）；ASR warmup 模塊解析（esbuild 打包 transformers 進 IIFE）+ 字幕攔截器 DOM 解析（`getCaptionTracksFromPlayerResponse` 首要來源）（M2-18） | ASR 流式接口啟用；Offscreen port 長連接通信；transformers.js 本地推理（IIFE 打包，非 external）；Deepgram/OpenAI 雲端雙實現；provisional 字幕修正；字幕軌 DOM 解析兜底 |
 | M3 預緩衝 | `BufferedAudioSource`、`LookAheadASRStrategy` | 復用 M2 管線，僅換音頻源 |
 | M4 優化 | 動態引擎選擇、性能檔位、樣式與多語言加固 | — |

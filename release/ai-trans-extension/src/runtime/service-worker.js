@@ -126,6 +126,21 @@ chrome.runtime.onConnect.addListener((port) => {
       offscreenPort = null;
     });
   }
+  if (port.name === "content-onnx") {
+    port.onMessage.addListener(async (message) => {
+      const msg = message;
+      const messageId = msg.messageId;
+      if (msg.topic !== "local-onnx:translate") return;
+      try {
+        const result = await sendToOffscreen(msg);
+        port.postMessage({ messageId, result });
+      } catch (err) {
+        port.postMessage({ messageId, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+    });
+  }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const msg = message;

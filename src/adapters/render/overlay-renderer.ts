@@ -115,6 +115,11 @@ export class OverlayRenderer implements SubtitleRenderer {
         diagLog('overlay', 'draw() no active cue for currentTime:', currentTime, 'cues:', this.cues.length);
         if (this.cues.length > 0) {
           diagLog('overlay', 'first cue range:', this.cues[0].start, '-', this.cues[0].end);
+          // D1：記錄完整覆蓋範圍（min start - max end）與 gap vs currentTime。
+          const minStart = Math.min(...this.cues.map(c => c.start));
+          const maxEnd = Math.max(...this.cues.map(c => c.end));
+          const gap = currentTime - maxEnd;
+          diagLog('overlay', 'full coverage:', minStart, '-', maxEnd, 'ms, gap vs currentTime:', gap, 'ms', gap > 0 ? '(behind)' : '(ahead)');
         }
         this.lastNoCueLogTime = now;
       }
