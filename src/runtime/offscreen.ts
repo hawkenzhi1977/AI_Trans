@@ -298,6 +298,16 @@ let translationPipeline: unknown = null;
 /** 共享載入 Promise——防止並發重複載入（§5.5 async 組裝）。 */
 let loadPromise: Promise<unknown> | null = null;
 
+/** 當前共享載入是否帶進度回調（防護 B：無回調的預熱載入不得被需要進度的下載複用）。 */
+let loadPromiseHasProgress = false;
+
+/**
+ * 快取世代計數器（補充修復十五）——每次 clearModelCache 遞增。
+ * 使載入期間快取被清除的「陳舊載入」結果失效（dispose 且不落地 translationPipeline），
+ * 避免「清快取後重新下載」複用到仍在飛的舊載入而直接報錯、無實際下載。
+ */
+let cacheGeneration = 0;
+
 /** 模型名稱（唯讀，預設為 Qwen2.5-0.5B）。 */
 const LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
 
@@ -362,22 +372,77 @@ async function loadPipeline(
 }
 
 /**
+ * 標記「載入期間快取被清除」的錯誤——陳舊載入被作廢，供調用方區分並落專屬診斷。
+ */
+class ModelCacheClearedError extends Error {
+  constructor() {
+    super('local-onnx: model cache cleared during load');
+    this.name = 'ModelCacheClearedError';
+  }
+}
+
+/**
+ * 釋放 pipeline 佔用的 wasm/ORT 記憶體（transformers.js Pipeline.dispose → model.dispose）。
+ * 舊 session 不釋放會使反覆清/載後 wasm 堆膨脹，最終觸發 OOM 型 wasm trap。
+ */
+async function disposePipeline(pipeline: unknown): Promise<void> {
+  const candidate = pipeline as { dispose?: () => unknown | Promise<unknown> };
+  if (typeof candidate?.dispose === 'function') {
+    await candidate.dispose();
+  }
+}
+
+/**
  * 確保 pipeline 已載入——已載入直接返回；否則觸發載入（並發安全）。
- * 用於 runInference 的 lazy 恢復與 check-status 預熱。
+ * 用於 runInference 的 lazy 恢復、check-status 預熱與 downloadModel。
+ *
+ * 補充修復十五（世代失效 + 進度防護）：
+ * ① 世代失效——載入期間若快取被清除（cacheGeneration 遞增），載入結果立即 dispose
+ *    且不落地 translationPipeline，並拋 ModelCacheClearedError，杜絕「清快取後
+ *    重新下載複用陳舊載入」導致的 wasm trap（如 [non-Error number] 1025635888）。
+ * ② 進度防護——已存在「無進度回調」的載入（如 check-status 預熱）時，若本次調用
+ *    需要進度回調，等待其結束後以帶進度的新鮮載入承接，避免下載無進度可看。
  */
 async function ensurePipelineLoaded(
   progressCallback?: (p: TransformersProgress) => void
 ): Promise<unknown> {
   if (translationPipeline !== null) return translationPipeline;
+
+  const gen = cacheGeneration;
+
+  // 進度防護：既有載入無進度回調，但本次需要 → 等它結束再以帶進度的載入承接。
+  if (loadPromise && !loadPromiseHasProgress && progressCallback) {
+    try {
+      await loadPromise;
+    } catch {
+      // 陳舊載入失敗不阻塞本次；失敗診斷由發起方（預熱）記錄，此處靜默等待結束。
+    }
+    if (translationPipeline !== null) return translationPipeline;
+    if (gen !== cacheGeneration) {
+      throw new ModelCacheClearedError();
+    }
+  }
+
   if (!loadPromise) {
-    loadPromise = loadPipeline(progressCallback)
-      .then((p) => {
+    loadPromiseHasProgress = Boolean(progressCallback);
+    const promise = loadPipeline(progressCallback)
+      .then(async (p) => {
+        // 載入期間快取被清除 → 作廢：dispose 釋放 wasm 記憶體、不落地，並拋專屬錯誤。
+        if (gen !== cacheGeneration) {
+          await disposePipeline(p);
+          throw new ModelCacheClearedError();
+        }
         translationPipeline = p;
         return p;
       })
       .finally(() => {
-        loadPromise = null;
+        // §5.4：只有仍指向本次載入才清除，避免誤清後續的新鮮載入。
+        if (loadPromise === promise) {
+          loadPromise = null;
+          loadPromiseHasProgress = false;
+        }
       });
+    loadPromise = promise;
   }
   return loadPromise;
 }
@@ -552,12 +617,17 @@ async function downloadModel(): Promise<OffscreenResponse> {
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：下載失敗必須落診斷。
+    // 補充修復十五：載入期間快取被清除導致陳舊載入作廢 → 落專屬診斷碼，讓用戶/開發者
+    // 區分「快取被清除需要重試」與一般下載失敗，而非「下載沒實際開始」的困惑。
     const error = toReadableError(err);
     recordDiagnostic({
       type: 'pipeline-error',
       error: {
         port: 'translation',
-        code: 'local-onnx-download-failed',
+        code:
+          err instanceof ModelCacheClearedError
+            ? 'local-onnx-download-stale-load'
+            : 'local-onnx-download-failed',
         recoverable: true,
         cause: error,
       },
@@ -571,12 +641,23 @@ async function downloadModel(): Promise<OffscreenResponse> {
 }
 
 /**
- * 清除模型快取——刪除 IndexedDB 中的 transformers-cache。
+ * 清除模型快取——刪除 Cache API / IndexedDB 中的 transformers-cache。
+ * 補充修復十五：同時重置共享載入狀態（loadPromise/世代），使在飛的陳舊載入失效，
+ * 並 dispose 舊 pipeline 釋放 wasm 記憶體——避免「清快取後重新下載」複用陳舊載入。
  */
 async function clearModelCache(): Promise<OffscreenResponse> {
   try {
-    // 清除 pipeline 實例。
+    // 世代遞增：令所有 in-flight 載入結果作廢（ensurePipelineLoaded 內 dispose + 不落地）。
+    cacheGeneration += 1;
+
+    // dispose 舊 pipeline（釋放 ORT wasm session 記憶體），再重置共享狀態。
+    if (translationPipeline !== null) {
+      await disposePipeline(translationPipeline);
+    }
+    // 清除 pipeline 實例與共享載入狀態。
     translationPipeline = null;
+    loadPromise = null;
+    loadPromiseHasProgress = false;
 
     // 刪除 IndexedDB 中的 transformers-cache database。
     const dbs = await indexedDB.databases();
@@ -862,6 +943,8 @@ function getLanguageName(langCode: string): string {
 export function resetLocalOnnxModuleForTest(): void {
   translationPipeline = null;
   loadPromise = null;
+  loadPromiseHasProgress = false;
+  cacheGeneration = 0;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -870,6 +953,8 @@ export const _testExports = {
   checkModelStatus,
   runInference,
   clearModelCache,
+  downloadModel,
+  ensurePipelineLoaded,
   buildPrompt,
   parseNumberedOutput,
   warmupModel,

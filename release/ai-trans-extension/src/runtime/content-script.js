@@ -49133,6 +49133,67 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   };
 
+  // src/application/late-capture-retry.ts
+  var DEFAULT_MAX_RETRIES = 3;
+  var DEFAULT_COOLDOWN_MS = 5e3;
+  var LateCaptureRetry = class {
+    awaiting = false;
+    retryVideoId = null;
+    retries = 0;
+    armedAt = 0;
+    lastRetryAt = 0;
+    maxRetries;
+    cooldownMs;
+    nowFn;
+    constructor(opts = {}) {
+      this.maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
+      this.cooldownMs = opts.cooldownMs ?? DEFAULT_COOLDOWN_MS;
+      this.nowFn = opts.now ?? Date.now;
+    }
+    /** 是否正等待晚捕獲重試。 */
+    get isAwaiting() {
+      return this.awaiting;
+    }
+    /** 已執行的重試次數。 */
+    get retryCount() {
+      return this.retries;
+    }
+    /** 從置位到當前時間的延遲（毫秒；未置位返回 0）。 */
+    get latencyMs() {
+      return this.awaiting ? this.nowFn() - this.armedAt : 0;
+    }
+    /** 管線全鏈失敗（no-caption-strategy）時置位，開始等待晚捕獲。 */
+    arm(videoId) {
+      this.awaiting = true;
+      this.retryVideoId = videoId || null;
+      this.armedAt = this.nowFn();
+    }
+    /** 字幕成功接管（segments-ready）或停止/換視頻時解除，重置計數。 */
+    disarm() {
+      this.awaiting = false;
+      this.retryVideoId = null;
+      this.retries = 0;
+      this.armedAt = 0;
+      this.lastRetryAt = 0;
+    }
+    /**
+     * 捕獲到達時調用：判定是否應觸發重試。
+     * @returns 本次重試序號（1-based）；不應重試返回 null（未置位 / 視頻不匹配 / 達上限 / 在冷卻內）。
+     */
+    onCapture(capture) {
+      if (!this.awaiting) return null;
+      if (this.retryVideoId && capture.videoId && capture.videoId !== this.retryVideoId) {
+        return null;
+      }
+      if (this.retries >= this.maxRetries) return null;
+      const now = this.nowFn();
+      if (this.retries > 0 && now - this.lastRetryAt < this.cooldownMs) return null;
+      this.retries += 1;
+      this.lastRetryAt = now;
+      return this.retries;
+    }
+  };
+
   // src/application/strategies/native-caption-strategy.ts
   var NativeCaptionStrategy = class {
     origin = "native";
@@ -51103,6 +51164,10 @@ Output example:
     waiters = /* @__PURE__ */ new Set();
     /** M2-22 第四層：等待軌道信息的 Promise 解析器隊列。 */
     trackWaiters = /* @__PURE__ */ new Set();
+    /** M2-24 補充修復十四：新捕獲訂閱者（晚捕獲重試等場景用）。 */
+    captureSubscribers = /* @__PURE__ */ new Set();
+    /** 已通知過訂閱者的捕獲時間戳：攔截器每 1.5s 重播同一捕獲，需過濾重複。 */
+    lastNotifiedCapturedAt = null;
     constructor() {
       this.onMessageBound = this.onMessage.bind(this);
     }
@@ -51169,11 +51234,24 @@ Output example:
     getLatest() {
       return this.latest;
     }
+    /**
+     * M2-24 補充修復十四：訂閱「新捕獲」事件。
+     * 僅在真正**新的**捕獲到達時觸發（攔截器 1.5s 重播同一捕獲不重複觸發），
+     * 用於晚捕獲重試（管線已降級後捕獲才到的場景）。
+     * 返回 unsubscribe；stop/dispose 後消息不再接收，訂閱自然失效（R4）。
+     */
+    onCapture(cb) {
+      this.captureSubscribers.add(cb);
+      return () => {
+        this.captureSubscribers.delete(cb);
+      };
+    }
     /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
     clearLatest() {
       const previousVideoId = this.latest?.videoId ?? "(none)";
       diagLog("bridge", "clearLatest() called, previous videoId:", previousVideoId);
       this.latest = null;
+      this.lastNotifiedCapturedAt = null;
     }
     /**
      * M2-22 第三層：獲取 MAIN world 發現的軌道信息。
@@ -51233,6 +51311,8 @@ Output example:
     dispose() {
       this.stop();
       this.latest = null;
+      this.lastNotifiedCapturedAt = null;
+      this.captureSubscribers.clear();
       for (const w of this.waiters) w();
       this.waiters.clear();
       for (const w of this.trackWaiters) w();
@@ -51267,6 +51347,16 @@ Output example:
         const payload = data.payload;
         if (!payload || typeof payload.url !== "string" || typeof payload.responseText !== "string") return;
         this.latest = payload;
+        if (payload.capturedAt !== this.lastNotifiedCapturedAt) {
+          this.lastNotifiedCapturedAt = payload.capturedAt;
+          const subscribers = Array.from(this.captureSubscribers);
+          for (const cb of subscribers) {
+            try {
+              cb(payload);
+            } catch {
+            }
+          }
+        }
         this.notifyWaiters();
       } else if (data.type === TRACK_INFO_EVENT) {
         const payload = data.payload;
@@ -51302,6 +51392,8 @@ Output example:
     }
   }
   var MOUNT_WAIT_TIMEOUT_MS = 15e3;
+  var MAX_LATE_CAPTURE_RETRIES = 3;
+  var LATE_CAPTURE_RETRY_COOLDOWN_MS = 5e3;
   var store = new ChromeStorageConfigStore();
   var SubtitleController = class _SubtitleController {
     constructor(config, url) {
@@ -51366,6 +51458,13 @@ Output example:
     unsubscribePlayback = null;
     unsubscribeConfig = null;
     unsubscribeAsrAuth = null;
+    // M2-24 補充修復十四：bridge 新捕獲訂閱句柄（R4：stop/dispose 必須解除）。
+    unsubscribeCapture = null;
+    // M2-24 補充修復十四：晚捕獲重試狀態機（no-caption-strategy 降級後等待捕獲到達重試）。
+    lateCaptureRetry = new LateCaptureRetry({
+      maxRetries: MAX_LATE_CAPTURE_RETRIES,
+      cooldownMs: LATE_CAPTURE_RETRY_COOLDOWN_MS
+    });
     pendingMountObserver = null;
     mountWaitTimer = null;
     // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
@@ -51392,6 +51491,9 @@ Output example:
       this.applyDebugFlags();
       this.bridge.inject();
       this.bridge.start();
+      this.unsubscribeCapture = this.bridge.onCapture((capture) => {
+        this.onBridgeCapture(capture);
+      });
       document.dispatchEvent(
         new CustomEvent("ai-trans:set-target-lang", {
           detail: { targetLang: this.config.targetLang }
@@ -51494,6 +51596,9 @@ Output example:
       }
       this.unsubscribePlayback?.();
       this.unsubscribePlayback = null;
+      this.unsubscribeCapture?.();
+      this.unsubscribeCapture = null;
+      this.lateCaptureRetry.disarm();
       this.bridge.stop();
       this.orchestrator?.stop();
       this.orchestrator = null;
@@ -51605,12 +51710,52 @@ Output example:
           start: s.start,
           end: s.end
         }));
+        this.lateCaptureRetry.disarm();
         diagLog("content", "cues updated, count:", this.cues.length, "calling scheduleDraw");
         this.scheduleDraw();
         return;
       }
+      if (e.type === "pipeline-error" && e.error.code === "no-caption-strategy") {
+        const videoId = extractVideoId(this.currentUrl());
+        this.lateCaptureRetry.arm(videoId || null);
+        diagLog("content", "no-caption-strategy: arming late-capture retry for videoId:", videoId);
+      }
       diagLog("content", "onEvent received", e.type, e.type === "engine-degraded" ? e.reason : "");
       void recordDiagnostic(e);
+    }
+    /**
+     * M2-24 補充修復十四：bridge 捕獲到**新** timedtext 響應。
+     * 管線因 native 捕獲晚到而降級（no-caption-strategy）時，捕獲最終到達即為重試信號：
+     * 同一視頻 + 未達上限 + 未在冷卻內 → 輕量重跑 Orchestrator（重新跑策略鏈），
+     * native 的 fetchTracks→tryReuseCapture 會立刻命中該晚捕獲（bridge 保留 latest）。
+     * 守衛：videoId 比對、重試上限、冷卻、segments-ready 解除（見 onEvent/stop）。
+     */
+    onBridgeCapture(capture) {
+      const attempt = this.lateCaptureRetry.onCapture(capture);
+      if (attempt === null) return;
+      Reflect.set(globalThis, "__aiTransLateCaptureRetries", attempt);
+      Reflect.set(globalThis, "__aiTransCaptureLatencyMs", this.lateCaptureRetry.latencyMs);
+      diagLog("content", "onBridgeCapture: late capture arrived, retrying native strategy (attempt", attempt, "/", MAX_LATE_CAPTURE_RETRIES, ")");
+      void this.retryAfterLateCapture().catch((err) => {
+        diagLog("content", "retryAfterLateCapture failed:", err instanceof Error ? err.message : String(err));
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "platform",
+            code: "native-capture-late-retry",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
+      });
+    }
+    /** M2-24 補充修復十四：輕量重跑策略鏈（晚捕獲重試）。不重掛 overlay、不重讀配置。 */
+    async retryAfterLateCapture() {
+      if (!this.orchestrator) return;
+      const url = this.currentUrl();
+      diagLog("content", "retryAfterLateCapture: re-running strategy chain for", url);
+      await this.orchestrator.start(url);
+      diagLog("content", "retryAfterLateCapture: completed");
     }
     /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */
     async ensureMounted() {

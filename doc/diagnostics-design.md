@@ -246,6 +246,17 @@
 - **開發者響應**: `local-onnx-warmup-failed` 診斷 message 含 ORT/transformers 錯誤細節（`toReadableError` 保留 code/stack）；對照 Options 狀態——「未下載」→ 提示先下載；「已預加載（記憶體）」→ 模型已就緒。
 - **代碼落點**: src/runtime/offscreen.ts（`warmupModel`/`local-onnx:warmup` 兩入口）、src/adapters/translation/local-onnx-translation.ts（`warmup()`）、src/application/orchestrator.ts（啟動預熱 + degraded 事件）、src/runtime/service-worker.ts（超時 120s）
 
+### 2.19 清快取後重新下載模型永遠失敗（M2-24 補充修復十五）
+
+- **現象**: 用戶在 Options 點「清除快取」後再點「下載模型」——下載進度恆 0、最終報「下載失敗」；Offscreen console 見 `[non-Error number] 1025635888`（`0x3D21F630`，wasm C++ 裸指針異常，非 Error 物件，`_OrtCreateSession` 在 wasm 初始化失敗模組上拋）。
+- **根因**: `clearModelCache()` 原只刪快取、未重置共享載入狀態——`checkModelStatus()` 後台預熱建立的「無進度回調」`loadPromise` 在清快取後仍在飛、持有已刪快取句柄；`downloadModel(progressCallback)` → `ensurePipelineLoaded(progressCallback)` 見 `loadPromise` 存在**直接複用並丟棄新 callback** → 陳舊載入從已刪快取讀截斷位元組 → ORT session 建立失敗 → wasm 初始化失敗且 **Offscreen 生命週期不可恢復**，之後每次下載重複失敗。
+- **修復後行為**: `clearModelCache()` 遞增 `cacheGeneration` + `disposePipeline()` + 重置共享載入狀態；載入完成世代比對（`gen !== cacheGeneration` → dispose + 不落地 + 拋 `ModelCacheClearedError`）；`loadPromiseHasProgress` 進度防護（無回調預熱載入不得被帶進度下載複用）；`downloadModel` 對 `ModelCacheClearedError` 落專屬診斷碼。
+- **診斷碼**: `local-onnx-download-stale-load`（下載期間快取被清除、載入作廢——需重新點「下載模型」）
+- **觸發條件**: `downloadModel()` catch 中 `err instanceof ModelCacheClearedError`
+- **用戶響應**: Options「本地兜底模型」顯示「下載失敗：…快取被清除…」時直接再點一次「下載模型」即可（本次會以新鮮載入真正下載並回報進度）。
+- **開發者響應**: 區分 `local-onnx-download-stale-load`（被清快取打斷，重試即可）vs `local-onnx-download-failed`（真實下載/載入失敗，需查 ORT/網絡）；診斷 message 含 `toReadableError` 轉出的錯誤細節。
+- **代碼落點**: src/runtime/offscreen.ts（`cacheGeneration`/`loadPromiseHasProgress`/`disposePipeline`/`ModelCacheClearedError`/`ensurePipelineLoaded` 世代+進度防護/`clearModelCache` 重置/`downloadModel` 診斷碼區分）
+
 
 ---
 
@@ -280,6 +291,16 @@
 - **用戶響應**: 確認視頻有字幕;等待 M2/M3 實現
 - **開發者響應**: 檢查診斷累加器;確認各策略的 isApplicable 邏輯
 - **代碼落點**: src/application/caption-strategy-chain.ts:76-92
+
+### 3.4 晚捕獲重試失敗
+
+- **診斷碼**: native-capture-late-retry
+- **用戶可見消息**: 最近失敗: 錯誤: Error: native capture arrived after no-caption fallback — retry failed (<timestamp>)
+- **觸發條件**: `pipeline-error(no-caption-strategy)` 置位後 bridge 捕獲晚到，`retryAfterLateCapture()` 重跑 Orchestrator 仍失敗
+- **根因**: pot 重驅動鏈（無 pot 掛起 → 2s 排程 → 播放器帶 pot 重發 → 響應）超過 15s `waitForCapture` 窗口；捕獲最終成功但重跑策略鏈再次失敗（如捕獲被清、翻譯再錯）
+- **用戶響應**: 等待重試（自動至多 3 次、5s 冷卻）；仍失敗則刷新頁面
+- **開發者響應**: 檢查 `__aiTransLateCaptureRetries` / `__aiTransCaptureLatencyMs` 調試全局（真實環境可用 console 讀取）；對照 bridge 捕獲麵包屑（`emitCapture: success` 時間）與 no-caption 置位時間，確認捕獲是否在窗口後才到達
+- **代碼落點**: src/runtime/content-script.ts（`retryAfterLateCapture()`）
 
 ---
 
@@ -464,6 +485,16 @@
 - **用戶響應**: 模型未下載時先點「下載模型」再「預加載模型」；載入失敗可「清除快取」後重新下載
 - **開發者響應**: 錯誤 message 經 `toReadableError` 保留 code/stack（數字型 ORT 錯誤碼可讀化）；對照 Options 狀態「未下載/已預加載（記憶體）/預加載失敗」
 - **代碼落點**: src/runtime/offscreen.ts（`warmupModel`）+ src/adapters/translation/local-onnx-translation.ts（`warmup()`）+ src/application/orchestrator.ts（啟動預熱 catch）
+
+### 4.17 本地 ONNX 下載期間快取被清除（M2-24 補充修復十五）
+
+- **診斷碼**: local-onnx-download-stale-load: <錯誤>
+- **用戶可見消息**: Options「本地兜底模型」顯示「下載失敗: local-onnx: model cache cleared during load」；popup「最近失敗」可查
+- **觸發條件**: 下載/載入期間用戶點「清除快取」→ `cacheGeneration` 遞增 → 該載入完成時世代比對失敗 → `ModelCacheClearedError` → `downloadModel` catch 落此碼
+- **根因**: `clearModelCache()` 後在飛的陳舊載入（含 check-status 後台預熱）作廢；舊實現複用其結果會從已刪快取讀截斷位元組 → ORT session 建立失敗 → wasm 初始化失敗且 Offscreen 生命週期不可恢復
+- **用戶響應**: 此碼為「快取被清除、載入作廢」的良性可重試信號——直接再點一次「下載模型」即會以新鮮載入真正下載並回報進度
+- **開發者響應**: 與 `local-onnx-download-failed`（真實下載/載入失敗）區分——前者是清快取競態、重試即可；後者需查 ORT/網絡/記憶體
+- **代碼落點**: src/runtime/offscreen.ts（`downloadModel` catch 分支 `err instanceof ModelCacheClearedError`）
 
 
 ---

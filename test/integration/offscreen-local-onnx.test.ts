@@ -42,6 +42,19 @@ function installEmptyCaches(): void {
   });
 }
 
+/** 注入快取刪除所需環境（clearModelCache 的 IndexedDB + caches.delete）。 */
+function installCacheDeletionEnv(): void {
+  vi.stubGlobal('indexedDB', {
+    databases: vi.fn(async () => [{ name: 'transformers-cache' }, { name: 'other-db' }]),
+    deleteDatabase: vi.fn(),
+  });
+  vi.stubGlobal('caches', {
+    keys: vi.fn(async () => ['transformers-cache', 'other-cache']),
+    delete: vi.fn(async () => true),
+    open: vi.fn(),
+  });
+}
+
 const MODEL_ONNX_URL =
   'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/onnx/model_q4.onnx';
 
@@ -326,5 +339,118 @@ describe('offscreen local-onnx warmup 預加載（補充修復十三）', () => 
     // 診斷 message = "Error: wasm init failed"（formatCause）；console.warn 麵包屑含代碼名。
     const stored = await chrome.storage.local.get('lastDiagnostic');
     expect(stored.lastDiagnostic?.message).toContain('wasm init failed');
+  });
+});
+
+describe('offscreen local-onnx 快取清除與重新下載彈性（補充修復十五）', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(async () => {
+    // flush 進行中的預熱/載入 promise，避免跨測試污染。
+    await new Promise((r) => setTimeout(r, 10));
+    resetLocalOnnxModuleForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it('clearModelCache 後 downloadModel 啟動新鮮載入並帶進度回調（不複用陳舊 loadPromise）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+
+    // ① check-status 觸發背景預熱 → 建立無進度回調的 loadPromise。
+    await _testExports.checkModelStatus();
+    // ② 清除快取 → 重置 loadPromise / 世代遞增（舊代碼漏此步）。
+    installCacheDeletionEnv();
+    await _testExports.clearModelCache();
+    // ③ 下載 → 必須以新的 pipeline() 載入並帶進度回調。
+    const res = await _testExports.downloadModel();
+
+    expect(res.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(2);
+    const secondCallOptions = transformersMock.pipeline.mock.calls[1][2] as {
+      progress_callback?: unknown;
+    };
+    expect(typeof secondCallOptions.progress_callback).toBe('function');
+  });
+
+  it('清快取時在飛的陳舊載入完成後被 dispose 且不落地 translationPipeline（世代失效）', async () => {
+    installCacheDeletionEnv();
+    let resolveStale!: (v: unknown) => void;
+    transformersMock.pipeline
+      .mockImplementationOnce(() => new Promise((res) => (resolveStale = res)))
+      .mockResolvedValue(async () => []);
+
+    // ① 啟動無進度回調的載入（等價 check-status 預熱）→ loadPromise 在飛。
+    const staleLoad = _testExports.ensurePipelineLoaded();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolveStale).toBeTypeOf('function');
+
+    // ② 清除快取 → 世代遞增。
+    await _testExports.clearModelCache();
+    // ③ 陳舊載入此刻才完成 → 結果必須被 dispose，且該載入以 ModelCacheClearedError 拒絕。
+    const staleDispose = vi.fn(async () => {});
+    resolveStale({ dispose: staleDispose });
+    await expect(staleLoad).rejects.toThrow('model cache cleared during load');
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(staleDispose).toHaveBeenCalledTimes(1);
+    // 陳舊載入不落地 → 後續下載仍以新鮮載入承接。
+    const res = await _testExports.downloadModel();
+    expect(res.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it('clearModelCache dispose 已載入的 pipeline（釋放 wasm 記憶體）', async () => {
+    installCacheDeletionEnv();
+    const disposeSpy = vi.fn(async () => {});
+    transformersMock.pipeline.mockResolvedValue({ dispose: disposeSpy });
+
+    await _testExports.downloadModel();
+    expect(disposeSpy).not.toHaveBeenCalled();
+
+    await _testExports.clearModelCache();
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('連續兩輪「清快取 + 重新下載」均成功（世代計數不殘留）', async () => {
+    installCacheDeletionEnv();
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+
+    const res1 = await _testExports.downloadModel();
+    await _testExports.clearModelCache();
+    const res2 = await _testExports.downloadModel();
+    await _testExports.clearModelCache();
+    const res3 = await _testExports.downloadModel();
+
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+    expect(res3.ok).toBe(true);
+    // 三輪下載各自獨立載入。
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(3);
+    // 無失敗診斷（§5.6）。
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic).toBeUndefined();
+  });
+
+  it('預熱失敗不拖垮後續下載（進度防護：新鮮載入承接而非複用失敗的陳舊 promise）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    // 第一次 pipeline()（預熱）失敗；第二次（下載）成功。
+    transformersMock.pipeline
+      .mockRejectedValueOnce(new Error('warmup failed'))
+      .mockResolvedValueOnce(async () => []);
+
+    await _testExports.checkModelStatus();
+    await new Promise((r) => setTimeout(r, 10));
+
+    const res = await _testExports.downloadModel();
+    expect(res.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(2);
+    const secondCallOptions = transformersMock.pipeline.mock.calls[1][2] as {
+      progress_callback?: unknown;
+    };
+    expect(typeof secondCallOptions.progress_callback).toBe('function');
   });
 });

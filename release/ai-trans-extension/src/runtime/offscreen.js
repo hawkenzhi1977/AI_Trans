@@ -48679,6 +48679,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   var translationPipeline = null;
   var loadPromise = null;
+  var loadPromiseHasProgress = false;
+  var cacheGeneration = 0;
   var LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
   function toReadableError(err) {
     if (err instanceof Error) {
@@ -48703,15 +48705,47 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       ...progressCallback ? { progress_callback: progressCallback } : {}
     });
   }
+  var ModelCacheClearedError = class extends Error {
+    constructor() {
+      super("local-onnx: model cache cleared during load");
+      this.name = "ModelCacheClearedError";
+    }
+  };
+  async function disposePipeline(pipeline) {
+    const candidate = pipeline;
+    if (typeof candidate?.dispose === "function") {
+      await candidate.dispose();
+    }
+  }
   async function ensurePipelineLoaded(progressCallback) {
     if (translationPipeline !== null) return translationPipeline;
+    const gen = cacheGeneration;
+    if (loadPromise && !loadPromiseHasProgress && progressCallback) {
+      try {
+        await loadPromise;
+      } catch {
+      }
+      if (translationPipeline !== null) return translationPipeline;
+      if (gen !== cacheGeneration) {
+        throw new ModelCacheClearedError();
+      }
+    }
     if (!loadPromise) {
-      loadPromise = loadPipeline(progressCallback).then((p) => {
+      loadPromiseHasProgress = Boolean(progressCallback);
+      const promise = loadPipeline(progressCallback).then(async (p) => {
+        if (gen !== cacheGeneration) {
+          await disposePipeline(p);
+          throw new ModelCacheClearedError();
+        }
         translationPipeline = p;
         return p;
       }).finally(() => {
-        loadPromise = null;
+        if (loadPromise === promise) {
+          loadPromise = null;
+          loadPromiseHasProgress = false;
+        }
       });
+      loadPromise = promise;
     }
     return loadPromise;
   }
@@ -48850,7 +48884,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         type: "pipeline-error",
         error: {
           port: "translation",
-          code: "local-onnx-download-failed",
+          code: err instanceof ModelCacheClearedError ? "local-onnx-download-stale-load" : "local-onnx-download-failed",
           recoverable: true,
           cause: error
         }
@@ -48864,7 +48898,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   async function clearModelCache() {
     try {
+      cacheGeneration += 1;
+      if (translationPipeline !== null) {
+        await disposePipeline(translationPipeline);
+      }
       translationPipeline = null;
+      loadPromise = null;
+      loadPromiseHasProgress = false;
       const dbs = await indexedDB.databases();
       for (const db of dbs) {
         if (db.name === "transformers-cache" || db.name === "transformers") {
@@ -49078,12 +49118,16 @@ ${numbered}
   function resetLocalOnnxModuleForTest() {
     translationPipeline = null;
     loadPromise = null;
+    loadPromiseHasProgress = false;
+    cacheGeneration = 0;
   }
   var _testExports = {
     hasModelInCache,
     checkModelStatus,
     runInference,
     clearModelCache,
+    downloadModel,
+    ensurePipelineLoaded,
     buildPrompt,
     parseNumberedOutput,
     warmupModel
