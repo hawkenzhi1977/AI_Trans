@@ -48976,6 +48976,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const sourceLines = text.split("\n");
       const prompt = buildPrompt(text, targetLang);
       const pipelineFn = translationPipeline;
+      const inferStartedAt = performance.now();
       const result = await pipelineFn(prompt, {
         max_new_tokens: 256,
         do_sample: false,
@@ -48983,8 +48984,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       });
       const generatedText = result[0]?.generated_text ?? "";
       console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
-      const { translatedLines, echoed } = parseNumberedOutput(generatedText, sourceLines);
+      const { translatedLines, echoed, parsedCount } = parseNumberedOutput(generatedText, sourceLines);
       if (echoed) {
+        const elapsedMs = Math.round(performance.now() - inferStartedAt);
         recordDiagnostic({
           type: "pipeline-error",
           error: {
@@ -48992,7 +48994,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             code: "local-onnx-echo-output",
             recoverable: true,
             cause: new Error(
-              "local ONNX model echoed input instead of translating (low quality output)"
+              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+                generatedText.slice(0, 200)
+              )}`
             )
           }
         });
@@ -49000,7 +49004,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       return {
         type: "local-onnx:translate-result",
         ok: true,
-        translatedText: translatedLines.join("\n")
+        translatedText: translatedLines.join("\n"),
+        echoed
       };
     } catch (err) {
       const error = toReadableError(err);
@@ -49087,7 +49092,7 @@ ${numbered}
     }
     const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
     const echoed = sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
-    return { translatedLines, echoed };
+    return { translatedLines, echoed, parsedCount: parsed.size };
   }
   function getLanguageName(langCode) {
     const map = {

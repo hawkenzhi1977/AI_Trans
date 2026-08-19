@@ -5,6 +5,7 @@ import type { TranslationProvider } from '../../domain/ports/translation-provide
 import type { TranslationRequest, TranslationResult } from '../../domain/models/translation';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
+import { diagLog } from '../../infrastructure/debug-log';
 
 /** Service Worker 轉發的本地 ONNX 翻譯請求消息。 */
 interface LocalOnnxTranslateRequest {
@@ -23,6 +24,8 @@ interface LocalOnnxTranslateResponse {
   error?: string;
   /** 模型是否尚未下載（用於區分未下載與推理失敗）。 */
   notDownloaded?: boolean;
+  /** 該 chunk 是否被判定為回顯原文（低質量輸出，Offscreen 端判定，供診斷統計）。 */
+  echoed?: boolean;
 }
 
 /** 本地 ONNX 翻譯適配器配置。 */
@@ -94,28 +97,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
     for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
       const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
-      // 合併該 chunk 的 sourceText 為單一請求（減少推理次數）。
-      const combinedText = chunk.map((s) => s.sourceText).join('\n');
-
-      const request: LocalOnnxTranslateRequest = {
-        topic: 'local-onnx:translate',
-        payload: {
-          text: combinedText,
-          targetLang,
-        },
-      };
-
-      const res = await this.requestTranslate(request);
-
-      // 解析翻譯結果——將單一結果拆分回各 segment（行號對齊由 Offscreen 端保證）。
-      const translatedTexts = (res.translatedText ?? '').split('\n');
-      for (const [j, seg] of chunk.entries()) {
-        translatedSegments.push({
-          ...seg,
-          // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
-          translatedText: translatedTexts[j]?.trim() || seg.sourceText,
-        });
-      }
+      const chunkResult = await this.translateChunk(chunk, targetLang);
+      translatedSegments.push(...chunkResult.segments);
     }
 
     return {
@@ -123,6 +106,37 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
       degraded: !this.isPrimary, // primary 成功不標降級；作 fallback 時仍標記。
       segments: translatedSegments,
     };
+  }
+
+  /**
+   * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
+   * 將 Offscreen 返回的單一結果拆分回各 segment（行號對齊由 Offscreen 端保證），
+   * 並攜帶 Offscreen 判定的 echo 標記（供流式路徑統計低質量輸出）。
+   */
+  private async translateChunk(
+    chunk: SubtitleSegment[],
+    targetLang: string
+  ): Promise<{ segments: SubtitleSegment[]; echoed: boolean }> {
+    const combinedText = chunk.map((s) => s.sourceText).join('\n');
+
+    const request: LocalOnnxTranslateRequest = {
+      topic: 'local-onnx:translate',
+      payload: {
+        text: combinedText,
+        targetLang,
+      },
+    };
+
+    const res = await this.requestTranslate(request);
+
+    // 解析翻譯結果——將單一結果拆分回各 segment。
+    const translatedTexts = (res.translatedText ?? '').split('\n');
+    const segments = chunk.map((seg, j) => ({
+      ...seg,
+      // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
+      translatedText: translatedTexts[j]?.trim() || seg.sourceText,
+    }));
+    return { segments, echoed: res.echoed === true };
   }
 
   /**
@@ -167,15 +181,61 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 流式翻譯——本地 ONNX 模型目前不支援 streaming，退化為非流式。
-   * TranslationPipeline 會自動處理此情況（見 translateStream 邏輯）。
+   * 流式翻譯——逐 chunk 推理完成即 emit **累計全量**譯文（M2-24 補充修復十六）。
+   * 修復：此前本地 ONNX 非真流式（`await this.translate(req)` 全量跑完才 emit 一次），
+   * 431 段 = 87 次串行推理需數分鐘，NativeCaptionStrategy 首次 emit 才發 segments-ready，
+   * 導致字幕長時間空白。現在首塊數秒內 emit，後續塊累計替換（與 LLM 流式同語義）。
    */
   async translateStream(
     req: TranslationRequest,
     emit: (r: TranslationResult) => void
   ): Promise<void> {
-    // 本地 ONNX 不支援流式，直接調用非流式並 emit。
-    const result = await this.translate(req);
-    emit(result);
+    const targetLang = req.targetLang ?? this.defaultTargetLang;
+    const accumulated: SubtitleSegment[] = [];
+    let echoedChunks = 0;
+    const totalChunks = Math.ceil(req.segments.length / LocalONNXTranslationProvider.CHUNK_SIZE);
+
+    for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
+      const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
+      const chunkIndex = Math.floor(i / LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+      const chunkResult = await this.translateChunk(chunk, targetLang);
+      accumulated.push(...chunkResult.segments);
+      if (chunkResult.echoed) echoedChunks += 1;
+
+      diagLog(
+        'local-onnx',
+        `chunk ${chunkIndex}/${totalChunks} done, cumulative`,
+        accumulated.length,
+        'segments, echoed:',
+        chunkResult.echoed
+      );
+
+      emit({
+        engineId: this.engineId,
+        degraded: !this.isPrimary, // primary 成功不標降級；作 fallback 時仍標記。
+        segments: [...accumulated],
+      });
+    }
+
+    this.recordEchoSummary(echoedChunks, totalChunks);
+  }
+
+  /**
+   * 結束時若有 chunk 被判定為回顯原文 → 記聚合診斷（§5.6 留痕，popup「最近失敗」可見）。
+   * 純診斷行為，不做任何降級/回退。
+   */
+  private recordEchoSummary(echoedChunks: number, totalChunks: number): void {
+    if (echoedChunks === 0) return;
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-echo-chunks',
+        recoverable: true,
+        cause: new Error(
+          `local ONNX model echoed input in ${echoedChunks}/${totalChunks} chunks (low quality output)`
+        ),
+      },
+    });
   }
 }

@@ -26,7 +26,7 @@ type OffscreenResponse =
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
-  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean };
+  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean };
 
 let mediaStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
@@ -759,6 +759,7 @@ async function runInference(
       options?: Record<string, unknown>
     ) => Promise<Array<{ generated_text: string }>>;
 
+    const inferStartedAt = performance.now();
     const result = await pipelineFn(prompt, {
       max_new_tokens: 256,
       do_sample: false,
@@ -770,10 +771,13 @@ async function runInference(
     // 麵包屑：保留原始生成文本前 500 字符，供診斷模型行為（§5.6 留痕）。
     console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
 
-    const { translatedLines, echoed } = parseNumberedOutput(generatedText, sourceLines);
+    const { translatedLines, echoed, parsedCount } = parseNumberedOutput(generatedText, sourceLines);
 
     if (echoed) {
       // §5.6：模型回顯原文屬低質量輸出——落診斷，popup「最近失敗」可查。
+      // M2-24 補充修復十六：cause 訊息內嵌 raw 生成文本片段 + 解析統計 + 推理耗時，
+      // 讓 popup「最近失敗」能直接分辨「模型真回顯英文」vs「解析誤判」（無行號/無空格）。
+      const elapsedMs = Math.round(performance.now() - inferStartedAt);
       recordDiagnostic({
         type: 'pipeline-error',
         error: {
@@ -781,7 +785,9 @@ async function runInference(
           code: 'local-onnx-echo-output',
           recoverable: true,
           cause: new Error(
-            'local ONNX model echoed input instead of translating (low quality output)'
+            `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+              generatedText.slice(0, 200)
+            )}`
           ),
         },
       });
@@ -791,6 +797,7 @@ async function runInference(
       type: 'local-onnx:translate-result',
       ok: true,
       translatedText: translatedLines.join('\n'),
+      echoed,
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
@@ -887,11 +894,13 @@ ${numbered}
 /**
  * 解析模型的「行號 → 譯文」輸出，按輸入行序還原譯文數組。
  * 缺行/無效行以原文兜底；全部回顯原文時標記低質量（echo），供調用方留診斷。
+ * 返回 parsedCount（實際解析到譯文的行數），讓 echo 診斷能分辨「模型回顯」vs
+ * 「模型輸出了譯文但未帶行號/行號格式不符導致解析不到」（§5.6 不誤判）。
  */
 function parseNumberedOutput(
   generated: string,
   sourceLines: string[]
-): { translatedLines: string[]; echoed: boolean } {
+): { translatedLines: string[]; echoed: boolean; parsedCount: number } {
   const parsed = new Map<number, string>();
   for (const line of generated.split('\n')) {
     const m = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
@@ -904,7 +913,7 @@ function parseNumberedOutput(
   const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
   const echoed =
     sourceLines.length > 0 && translatedLines.every((t, i) => t === sourceLines[i]);
-  return { translatedLines, echoed };
+  return { translatedLines, echoed, parsedCount: parsed.size };
 }
 
 /** 語言代碼映射為語言名稱（用於 Prompt）。 */

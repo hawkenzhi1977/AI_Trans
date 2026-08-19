@@ -7,7 +7,8 @@ var DEBUG_LOG_OFF = {
   strategy: false,
   content: false,
   bridge: false,
-  interceptor: false
+  interceptor: false,
+  "local-onnx": false
 };
 var DEFAULT_CONFIG = {
   translation: { type: "cloud-llm", fallbackType: "mt" },

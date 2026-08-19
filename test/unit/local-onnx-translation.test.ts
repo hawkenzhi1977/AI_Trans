@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { LocalONNXTranslationProvider } from '../../src/adapters/translation/local-onnx-translation';
+import { recordDiagnostic } from '../../src/infrastructure/diagnostics';
 import type { TranslationRequest } from '../../src/domain/models/translation';
 import type { SubtitleSegment } from '../../src/domain/models/subtitle';
+
+// 聚合 echo 診斷斷言需要攔截 recordDiagnostic（不真正寫 storage）。
+vi.mock('../../src/infrastructure/diagnostics', () => ({
+  recordDiagnostic: vi.fn(),
+}));
 
 function seg(i: number): SubtitleSegment {
   return {
@@ -27,6 +33,7 @@ describe('LocalONNXTranslationProvider', () => {
         sendMessage: vi.fn(),
       },
     });
+    vi.mocked(recordDiagnostic).mockClear();
   });
 
   afterEach(() => {
@@ -99,22 +106,92 @@ describe('LocalONNXTranslationProvider', () => {
     await expect(provider.translate(req())).rejects.toThrow('Extension context invalidated');
   });
 
-  it('translateStream 退化為非流式 translate 並 emit 結果', async () => {
+  it('translateStream：>5 行時逐 chunk emit 累計全量（首塊 5 段，次塊 6 段）', async () => {
     const provider = new LocalONNXTranslationProvider({
       modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
     });
 
-    vi.mocked(chrome.runtime.sendMessage).mockResolvedValue({
-      ok: true,
-      translatedText: '翻譯結果 0\n翻譯結果 1',
+    const segments = Array.from({ length: 6 }, (_, i) => seg(i));
+    vi.mocked(chrome.runtime.sendMessage).mockImplementation(async (msg) => {
+      const reqMsg = msg as { payload?: { text?: string } };
+      const text = reqMsg.payload?.text ?? '';
+      return {
+        ok: true,
+        translatedText: text
+          .split('\n')
+          .map((l) => `T:${l}`)
+          .join('\n'),
+      };
+    });
+
+    const emitted: Array<{ segments: SubtitleSegment[]; degraded: boolean }> = [];
+    await provider.translateStream({ segments, targetLang: 'zh-Hant' }, (r) =>
+      emitted.push(r as { segments: SubtitleSegment[]; degraded: boolean })
+    );
+
+    // 6 行 → 2 次請求，每次完成即 emit 累計全量。
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(2);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[0]?.segments).toHaveLength(5);
+    expect(emitted[1]?.segments).toHaveLength(6);
+    expect(emitted[0]?.segments[4]?.translatedText).toBe('T:line-4');
+    expect(emitted[1]?.segments[5]?.translatedText).toBe('T:line-5');
+  });
+
+  it('translateStream：首塊完成即 emit（不等待全部 chunk），無 echo 時不記聚合診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    const segments = Array.from({ length: 6 }, (_, i) => seg(i));
+    // 首塊 1 次 sendMessage 即 resolve——證明不必等全部 87 chunk。
+    vi.mocked(chrome.runtime.sendMessage).mockImplementation(async (msg) => {
+      const reqMsg = msg as { payload?: { text?: string } };
+      const text = reqMsg.payload?.text ?? '';
+      return {
+        ok: true,
+        translatedText: text
+          .split('\n')
+          .map((l) => `T:${l}`)
+          .join('\n'),
+      };
     });
 
     const emitted: unknown[] = [];
-    await provider.translateStream(req(), (r) => emitted.push(r));
+    await provider.translateStream({ segments, targetLang: 'zh-Hant' }, (r) => emitted.push(r));
 
-    expect(emitted).toHaveLength(1);
-    expect((emitted[0] as { engineId: string }).engineId).toBe('local-onnx');
-    expect((emitted[0] as { degraded: boolean }).degraded).toBe(true);
+    expect(emitted).toHaveLength(2);
+    expect((emitted[0] as { segments: SubtitleSegment[] }).segments.length).toBeGreaterThan(0);
+    expect(vi.mocked(recordDiagnostic)).not.toHaveBeenCalled();
+  });
+
+  it('translateStream：多數 chunk echo → 記聚合 local-onnx-echo-chunks 診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    const segments = Array.from({ length: 6 }, (_, i) => seg(i));
+    vi.mocked(chrome.runtime.sendMessage).mockImplementation(async (msg) => {
+      const reqMsg = msg as { payload?: { text?: string } };
+      const text = reqMsg.payload?.text ?? '';
+      return {
+        ok: true,
+        // 回顯原文（echoed=true）——響應字段透傳給 provider 統計。
+        echoed: true,
+        translatedText: text.split('\n').map((l) => l).join('\n'),
+      };
+    });
+
+    const emitted: unknown[] = [];
+    await provider.translateStream({ segments, targetLang: 'zh-Hant' }, (r) => emitted.push(r));
+
+    expect(emitted).toHaveLength(2);
+    expect(vi.mocked(recordDiagnostic)).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(recordDiagnostic).mock.calls[0]?.[0];
+    expect(call.type).toBe('pipeline-error');
+    const err = (call as { error: { code: string; cause: Error } }).error;
+    expect(err.code).toBe('local-onnx-echo-chunks');
+    expect(err.cause.message).toContain('echoed input in 2/2 chunks');
   });
 
   it('翻譯結果行數不足時使用 sourceText 填充', async () => {

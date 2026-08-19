@@ -50,6 +50,7 @@ const DEBUG_CATEGORY_IDS: Array<[DebugLogCategory, string]> = [
   ['content', 'dbg-content'],
   ['bridge', 'dbg-bridge'],
   ['interceptor', 'dbg-interceptor'],
+  ['local-onnx', 'dbg-local-onnx'],
 ];
 
 /** 讀取調試日誌 checkbox 狀態。 */

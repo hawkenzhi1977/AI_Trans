@@ -2,6 +2,8 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
+> 最後更新：2026-08-19（**M2-24 補充修復十六**：新增 §2.20「local-onnx 字幕完全空白 + echo 不可辨」場景、§4.18「local-onnx-echo-output 診斷升級（內嵌 raw 片段 + parsed x/N + 耗時）」、§4.19「local-onnx-echo-chunks 聚合診斷」；先前：**M2-24 補充修復十五（§2.19 + §4.17）**）
+
 ---
 
 ## 1. Content Script 啟動流程
@@ -257,6 +259,17 @@
 - **開發者響應**: 區分 `local-onnx-download-stale-load`（被清快取打斷，重試即可）vs `local-onnx-download-failed`（真實下載/載入失敗，需查 ORT/網絡）；診斷 message 含 `toReadableError` 轉出的錯誤細節。
 - **代碼落點**: src/runtime/offscreen.ts（`cacheGeneration`/`loadPromiseHasProgress`/`disposePipeline`/`ModelCacheClearedError`/`ensurePipelineLoaded` 世代+進度防護/`clearModelCache` 重置/`downloadModel` 診斷碼區分）
 
+### 2.20 local-onnx 字幕完全空白 + echo 不可辨（M2-24 補充修復十六）
+
+- **現象**: 捕獲鏈全通（`segments: 431`、`translation starting`、`using translateStream`）但 overlay 持續 `cues: 0`（觀察 ~96 秒）；插件錯誤僅 2 條——ORT 緩衝警告（無害）與 `[AI_Trans] translation degraded: Error: local ONNX model echoed input instead of translating (low quality output)`。
+- **根因（兩層）**: ①**`translateStream` 非真流式**——`LocalONNXTranslationProvider.translateStream()` 原為 `await this.translate(req)` 全量 87 chunk 串行推理後才 emit 一次；`NativeCaptionStrategy` 僅首次 emit 發 `segments-ready` → 數分鐘無渲染（這比「慢」更糟，是「完全空白」而非「延遲」）。②**echo 不可辨**——`parseNumberedOutput` 正則 `^\s*(\d+)[.)]?\s+` 要求「數字+點+空格」，模型輸出無行號或 `N.譯文`（無空格）時全回落原文 → 誤判 `echoed=true`；且 echo 診斷 cause 不含 raw `generated_text`，無法分辨「真回顯」vs「解析誤判」。
+- **修復後行為**: ①`translateStream` 逐 chunk emit 累計全量（首塊數秒 `segments-ready`、後續 `segments-updated`）；②`parseNumberedOutput` 返回 `parsedCount`；echo 診斷 cause 內嵌 raw `generated_text` 前 200 字符 + `parsed x/N` + 推理耗時；`local-onnx:translate-result` 響應新增 `echoed?: boolean`；provider 結束時若有回顯記聚合診斷。**零降級行為改變**。
+- **診斷碼**: `local-onnx-echo-output`（cause 升級：`local ONNX echoed input (parsed x/N lines, took Nms); raw output: "..."`）；新增 `local-onnx-echo-chunks`（`echoed in X/Y chunks` 聚合）
+- **觸發條件**: Offscreen `runInference` 判定全回顯（`parsedCount` 高但譯文==原文）或全部解析不到（`parsedCount=0` 回落原文）→ `local-onnx-echo-output`；provider 整段翻譯結束且 `echoedChunks > 0` → `local-onnx-echo-chunks`
+- **用戶響應**: popup「最近失敗」直接讀到 `raw output:` 後的模型實際輸出——若為中文（`parsedCount` 低）即解析誤判（字幕仍應顯示譯文）；若為英文原文（`parsedCount` 高）即模型回顯、需換模型/prompt。
+- **開發者響應**: 開啟 Options「調試日誌 → local-onnx」查看逐 chunk 麵包屑（`chunk i/N done, cumulative N segments, echoed: bool`）與 Offscreen console `generated_text` 前 500 字符；對照 `parsedCount` 判斷 echo 真偽。
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`translateChunk`/`translateStream` 逐塊 emit/`recordEchoSummary`/響應 `echoed` 字段）、src/runtime/offscreen.ts（`parseNumberedOutput` `parsedCount`/echo 診斷 cause 升級）、src/domain/models/config.ts + src/runtime/options/*（`local-onnx` 調試分類）
+
 
 ---
 
@@ -495,6 +508,26 @@
 - **用戶響應**: 此碼為「快取被清除、載入作廢」的良性可重試信號——直接再點一次「下載模型」即會以新鮮載入真正下載並回報進度
 - **開發者響應**: 與 `local-onnx-download-failed`（真實下載/載入失敗）區分——前者是清快取競態、重試即可；後者需查 ORT/網絡/記憶體
 - **代碼落點**: src/runtime/offscreen.ts（`downloadModel` catch 分支 `err instanceof ModelCacheClearedError`）
+
+### 4.18 本地 ONNX 輸出回顯原文（M2-24 補充修復十六，診斷升級）
+
+- **診斷碼**: local-onnx-echo-output: local ONNX echoed input (parsed x/N lines, took Nms); raw output: "<前 200 字符>"
+- **用戶可見消息**: popup「最近失敗」——「錯誤: Error: local ONNX echoed input (parsed 2/2 lines, took 1234ms); raw output: \"1. Hello\\n2. World\"」——含模型實際輸出，可直接分辨真回顯 vs 解析誤判
+- **觸發條件**: Offscreen `runInference` 中 `parseNumberedOutput` 判定全回顯（譯文全部等於原文）——包括「真回顯」（`parsedCount` 高但譯文==原文）與「解析誤判」（`parsedCount=0` 全部回落原文）
+- **根因**: ①0.5B 小模型對無行號指令遵循度低、生成預算耗在回顯；②`parseNumberedOutput` 正則要求「數字+點+空格」，`N.譯文`（無空格）或純譯文輸出解析不到 → 誤判 echo
+- **用戶響應**: 看 `raw output:` 後內容——若含中文譯文（`parsedCount` 低）→ 解析誤判（譯文其實成功）；若為英文原文（`parsedCount` 高）→ 模型能力不足，需換模型/prompt
+- **開發者響應**: 開啟 Options「調試日誌 → local-onnx」看逐 chunk 麵包屑（`chunk i/N done, cumulative N segments, echoed: bool`）；對照 Offscreen console `generated_text` 前 500 字符與 `parsedCount` 判斷 echo 真偽後，再決定是否放寬解析規則
+- **代碼落點**: src/runtime/offscreen.ts（`runInference` echo 分支 + `parseNumberedOutput` `parsedCount`）
+
+### 4.19 本地 ONNX 多 chunk 回顯聚合（M2-24 補充修復十六）
+
+- **診斷碼**: local-onnx-echo-chunks: local ONNX model echoed input in X/Y chunks (low quality output)
+- **用戶可見消息**: popup「最近失敗」——「錯誤: Error: local ONNX model echoed input in 3/5 chunks (low quality output)」——一眼看出整段翻譯的回顯比例
+- **觸發條件**: `LocalONNXTranslationProvider.translateStream()`/`translate()` 結束且 `echoedChunks > 0`（由響應 `echoed` 字段統計）
+- **根因**: 部分 chunk 模型回顯原文（單次 prompt 過長/小模型能力不足）；響應 `echoed` 字段透傳 Offscreen 判定結果供統計
+- **用戶響應**: 若絕大多數 chunk 回顯 → 該模型對當前語言對不適用，換主引擎或改善 prompt；少數回顯可忽略（該 chunk 已回退原文顯示）
+- **開發者響應**: 結合逐 chunk 麵包屑定位回顯 chunk 的輸入特徵（長度/語言）；對照 `parsedCount` 排除解析誤判
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`recordEchoSummary` + `translateStream` 統計）
 
 
 ---

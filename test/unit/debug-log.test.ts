@@ -59,7 +59,7 @@ describe('debug-log — 分類門控（M1-51）', () => {
     expect(getDebugFlags()).toEqual(DEBUG_LOG_OFF);
   });
 
-  it('八個分類全部覆蓋（overlay/llm/capture/pipeline/strategy/content/bridge/interceptor）', () => {
+  it('九個分類全部覆蓋（overlay/llm/capture/pipeline/strategy/content/bridge/interceptor/local-onnx）', () => {
     const all: DebugLogConfig = { ...DEBUG_LOG_OFF };
     for (const k of Object.keys(DEBUG_LOG_OFF) as Array<keyof DebugLogConfig>) all[k] = true;
     setDebugFlags(all);
@@ -67,7 +67,7 @@ describe('debug-log — 分類門控（M1-51）', () => {
     for (const cat of categories) diagLog(cat, 'x');
     expect(logSpy).toHaveBeenCalledTimes(categories.length);
     expect(Object.keys(DEBUG_LOG_OFF).sort()).toEqual(
-      ['bridge', 'capture', 'content', 'interceptor', 'llm', 'overlay', 'pipeline', 'strategy']
+      ['bridge', 'capture', 'content', 'interceptor', 'llm', 'local-onnx', 'overlay', 'pipeline', 'strategy']
     );
   });
 });

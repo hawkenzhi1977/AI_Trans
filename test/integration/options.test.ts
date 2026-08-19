@@ -32,6 +32,7 @@ const HTML = `
   <input type="checkbox" id="dbg-content" />
   <input type="checkbox" id="dbg-bridge" />
   <input type="checkbox" id="dbg-interceptor" />
+  <input type="checkbox" id="dbg-local-onnx" />
   <input id="translation-api-key" />
   <input id="asr-api-key" />
   <input id="local-model-name" disabled />
@@ -65,6 +66,7 @@ const SAVED_CONFIG: EngineConfig = {
     content: false,
     bridge: false,
     interceptor: false,
+    'local-onnx': false,
   },
 };
 

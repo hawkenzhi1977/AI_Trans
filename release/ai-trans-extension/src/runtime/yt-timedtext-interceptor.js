@@ -9,7 +9,8 @@
     strategy: false,
     content: false,
     bridge: false,
-    interceptor: false
+    interceptor: false,
+    "local-onnx": false
   };
 
   // src/infrastructure/debug-log.ts

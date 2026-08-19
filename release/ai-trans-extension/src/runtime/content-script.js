@@ -48496,7 +48496,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     strategy: false,
     content: false,
     bridge: false,
-    interceptor: false
+    interceptor: false,
+    "local-onnx": false
   };
   var DEFAULT_CONFIG = {
     translation: { type: "cloud-llm", fallbackType: "mt" },
@@ -50316,23 +50317,8 @@ Output example:
       const translatedSegments = [];
       for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
         const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
-        const combinedText = chunk.map((s) => s.sourceText).join("\n");
-        const request = {
-          topic: "local-onnx:translate",
-          payload: {
-            text: combinedText,
-            targetLang
-          }
-        };
-        const res = await this.requestTranslate(request);
-        const translatedTexts = (res.translatedText ?? "").split("\n");
-        for (const [j, seg] of chunk.entries()) {
-          translatedSegments.push({
-            ...seg,
-            // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
-            translatedText: translatedTexts[j]?.trim() || seg.sourceText
-          });
-        }
+        const chunkResult = await this.translateChunk(chunk, targetLang);
+        translatedSegments.push(...chunkResult.segments);
       }
       return {
         engineId: this.engineId,
@@ -50340,6 +50326,29 @@ Output example:
         // primary 成功不標降級；作 fallback 時仍標記。
         segments: translatedSegments
       };
+    }
+    /**
+     * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
+     * 將 Offscreen 返回的單一結果拆分回各 segment（行號對齊由 Offscreen 端保證），
+     * 並攜帶 Offscreen 判定的 echo 標記（供流式路徑統計低質量輸出）。
+     */
+    async translateChunk(chunk, targetLang) {
+      const combinedText = chunk.map((s) => s.sourceText).join("\n");
+      const request = {
+        topic: "local-onnx:translate",
+        payload: {
+          text: combinedText,
+          targetLang
+        }
+      };
+      const res = await this.requestTranslate(request);
+      const translatedTexts = (res.translatedText ?? "").split("\n");
+      const segments = chunk.map((seg, j) => ({
+        ...seg,
+        // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
+        translatedText: translatedTexts[j]?.trim() || seg.sourceText
+      }));
+      return { segments, echoed: res.echoed === true };
     }
     /**
      * 發送單次翻譯請求並校驗結果。
@@ -50378,12 +50387,55 @@ Output example:
       }
     }
     /**
-     * 流式翻譯——本地 ONNX 模型目前不支援 streaming，退化為非流式。
-     * TranslationPipeline 會自動處理此情況（見 translateStream 邏輯）。
+     * 流式翻譯——逐 chunk 推理完成即 emit **累計全量**譯文（M2-24 補充修復十六）。
+     * 修復：此前本地 ONNX 非真流式（`await this.translate(req)` 全量跑完才 emit 一次），
+     * 431 段 = 87 次串行推理需數分鐘，NativeCaptionStrategy 首次 emit 才發 segments-ready，
+     * 導致字幕長時間空白。現在首塊數秒內 emit，後續塊累計替換（與 LLM 流式同語義）。
      */
     async translateStream(req, emit) {
-      const result = await this.translate(req);
-      emit(result);
+      const targetLang = req.targetLang ?? this.defaultTargetLang;
+      const accumulated = [];
+      let echoedChunks = 0;
+      const totalChunks = Math.ceil(req.segments.length / _LocalONNXTranslationProvider.CHUNK_SIZE);
+      for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
+        const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
+        const chunkIndex = Math.floor(i / _LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+        const chunkResult = await this.translateChunk(chunk, targetLang);
+        accumulated.push(...chunkResult.segments);
+        if (chunkResult.echoed) echoedChunks += 1;
+        diagLog(
+          "local-onnx",
+          `chunk ${chunkIndex}/${totalChunks} done, cumulative`,
+          accumulated.length,
+          "segments, echoed:",
+          chunkResult.echoed
+        );
+        emit({
+          engineId: this.engineId,
+          degraded: !this.isPrimary,
+          // primary 成功不標降級；作 fallback 時仍標記。
+          segments: [...accumulated]
+        });
+      }
+      this.recordEchoSummary(echoedChunks, totalChunks);
+    }
+    /**
+     * 結束時若有 chunk 被判定為回顯原文 → 記聚合診斷（§5.6 留痕，popup「最近失敗」可見）。
+     * 純診斷行為，不做任何降級/回退。
+     */
+    recordEchoSummary(echoedChunks, totalChunks) {
+      if (echoedChunks === 0) return;
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-echo-chunks",
+          recoverable: true,
+          cause: new Error(
+            `local ONNX model echoed input in ${echoedChunks}/${totalChunks} chunks (low quality output)`
+          )
+        }
+      });
     }
   };
 

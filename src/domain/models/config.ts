@@ -40,7 +40,8 @@ export type DebugLogCategory =
   | 'strategy' // 字幕策略鏈（native-strategy 抓軌/翻譯/推送）
   | 'content' // content-script 總控（掛載/事件/熱重啟）
   | 'bridge' // timedtext 消息橋（waitForCapture/輪詢）
-  | 'interceptor'; // MAIN world 攔截器（XHR/fetch hook/字幕模組驅動）
+  | 'interceptor' // MAIN world 攔截器（XHR/fetch hook/字幕模組驅動）
+  | 'local-onnx'; // 本地 ONNX 翻譯適配器（chunk 進度/echo 統計）
 
 /** 調試日誌開關配置（每類一個布爾開關）。 */
 export type DebugLogConfig = Record<DebugLogCategory, boolean>;
@@ -55,6 +56,7 @@ export const DEBUG_LOG_OFF: DebugLogConfig = {
   content: false,
   bridge: false,
   interceptor: false,
+  'local-onnx': false,
 };
 
 /** 引擎整體配置（單一配置實體）。 */

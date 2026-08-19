@@ -196,26 +196,42 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
   });
 
   it('parseNumberedOutput：行號對齊還原譯文', () => {
-    const { translatedLines, echoed } = _testExports.parseNumberedOutput(
+    const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '1. 你好\n2. 世界',
       ['Hello', 'World']
     );
     expect(translatedLines).toEqual(['你好', '世界']);
     expect(echoed).toBe(false);
+    expect(parsedCount).toBe(2);
   });
 
-  it('parseNumberedOutput：缺行以原文兜底', () => {
-    const { translatedLines } = _testExports.parseNumberedOutput('2. 世界', ['Hello', 'World']);
+  it('parseNumberedOutput：缺行以原文兜底（parsedCount 只計解析到行）', () => {
+    const { translatedLines, parsedCount } = _testExports.parseNumberedOutput('2. 世界', [
+      'Hello',
+      'World',
+    ]);
     expect(translatedLines).toEqual(['Hello', '世界']);
+    expect(parsedCount).toBe(1);
   });
 
   it('parseNumberedOutput：全部回顯原文標記 echo', () => {
-    const { translatedLines, echoed } = _testExports.parseNumberedOutput(
+    const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '1. Hello\n2. World',
       ['Hello', 'World']
     );
     expect(translatedLines).toEqual(['Hello', 'World']);
     expect(echoed).toBe(true);
+    expect(parsedCount).toBe(2);
+  });
+
+  it('parseNumberedOutput：無行號輸出解析不到（parsedCount=0）→ 全部回落原文標記 echo（診斷可分辨解析誤判）', () => {
+    const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
+      '你好\n世界',
+      ['Hello', 'World']
+    );
+    expect(translatedLines).toEqual(['Hello', 'World']);
+    expect(echoed).toBe(true);
+    expect(parsedCount).toBe(0);
   });
 
   it('runInference：mock 返回行號譯文 → 按行序回傳，prompt 含 ChatML/行號', async () => {
@@ -230,11 +246,12 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
 
     expect(res.ok).toBe(true);
     expect((res as { translatedText?: string }).translatedText).toBe('你好\n世界');
+    expect((res as { echoed?: boolean }).echoed).toBe(false);
     expect(capturedInput).toContain('<|im_start|>system');
     expect(capturedInput).toContain('1. Hello\n2. World');
   });
 
-  it('runInference：模型回顯原文 → 落 echo 診斷（storage.local 寫入）', async () => {
+  it('runInference：模型回顯原文 → 落 echo 診斷（含 raw 片段 + 解析統計）', async () => {
     installCaches([makeRequest(MODEL_ONNX_URL)]);
     transformersMock.pipeline.mockResolvedValue(async () => [
       { generated_text: '1. Hello\n2. World' },
@@ -243,9 +260,14 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
 
     expect(res.ok).toBe(true);
+    expect((res as { echoed?: boolean }).echoed).toBe(true);
     expect(chrome.storage.local.set).toHaveBeenCalled();
     const stored = await chrome.storage.local.get('lastDiagnostic');
+    // M2-24 補充修復十六：cause 內嵌 raw 生成文本片段 + parsed 統計，popup 可分辨真回顯 vs 解析誤判。
     expect(stored.lastDiagnostic.message).toContain('echoed input');
+    expect(stored.lastDiagnostic.message).toContain('parsed 2/2 lines');
+    expect(stored.lastDiagnostic.message).toContain('raw output:');
+    expect(stored.lastDiagnostic.message).toContain('1. Hello\\n2. World');
   });
 
   it('runInference：無回顯（正常翻譯）不寫 echo 診斷', async () => {

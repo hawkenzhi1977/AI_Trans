@@ -10,7 +10,8 @@
     strategy: false,
     content: false,
     bridge: false,
-    interceptor: false
+    interceptor: false,
+    "local-onnx": false
   };
   var PROFILE_DEFAULTS = {
     streaming: {
@@ -121,7 +122,8 @@
     ["strategy", "dbg-strategy"],
     ["content", "dbg-content"],
     ["bridge", "dbg-bridge"],
-    ["interceptor", "dbg-interceptor"]
+    ["interceptor", "dbg-interceptor"],
+    ["local-onnx", "dbg-local-onnx"]
   ];
   function readDebugLog() {
     const out = { ...DEBUG_LOG_OFF };
