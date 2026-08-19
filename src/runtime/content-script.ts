@@ -1,12 +1,14 @@
 // 內容腳本入口：在 YouTube watch 頁注入並啟動 M1 翻譯流程。
 // 職責：加載配置 → 組裝 Registry → 自動掛載渲染器 → 訂閱播放狀態驅動渲染 → 啟動 Orchestrator。
 import { Orchestrator } from '../application';
+import { LateCaptureRetry } from '../application/late-capture-retry';
 import { buildDefaultRegistry } from './composition';
 import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store';
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { diagLog, setDebugFlags } from '../infrastructure/debug-log';
 import { OverlayRenderer } from '../adapters/render/overlay-renderer';
 import { TimedTextBridge } from './timedtext-bridge';
+import type { TimedTextCapture } from './timedtext-bridge';
 import { isWatchPage } from './watch-url';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
@@ -27,6 +29,17 @@ function extractVideoId(url: string): string {
 /** 等待播放器出現的超時（毫秒）：超時放棄等待，避免 Promise 永久懸掛。 */
 const MOUNT_WAIT_TIMEOUT_MS = 15_000;
 
+/**
+ * M2-24 補充修復十四：晚捕獲重試上限與冷卻。
+ * 真實環境根因：pot 重驅動鏈（無 pot 掛起 → 2s 排程 → 播放器帶 pot 重發）常超過
+ * waitForCapture 的 15s 窗口，捕獲成功但管線已永久降級。此機制在管線降級後仍訂閱
+ * bridge 的新捕獲事件，捕獲到達時輕量重跑策略鏈讓 native 複用晚捕獲。上限防止
+ * 捕獲持續到達但解析仍失敗時無限重啟。
+ */
+const MAX_LATE_CAPTURE_RETRIES = 3;
+/** 晚捕獲重試的冷卻間隔（毫秒）：捕獲重播 1.5s 一次，過濾後同 capturedAt 只觸發一次，故以重試間隔為準。 */
+const LATE_CAPTURE_RETRY_COOLDOWN_MS = 5_000;
+
 const store = new ChromeStorageConfigStore();
 
 class SubtitleController {
@@ -43,6 +56,13 @@ class SubtitleController {
   private unsubscribePlayback: (() => void) | null = null;
   private unsubscribeConfig: (() => void) | null = null;
   private unsubscribeAsrAuth: (() => void) | null = null;
+  // M2-24 補充修復十四：bridge 新捕獲訂閱句柄（R4：stop/dispose 必須解除）。
+  private unsubscribeCapture: (() => void) | null = null;
+  // M2-24 補充修復十四：晚捕獲重試狀態機（no-caption-strategy 降級後等待捕獲到達重試）。
+  private readonly lateCaptureRetry = new LateCaptureRetry({
+    maxRetries: MAX_LATE_CAPTURE_RETRIES,
+    cooldownMs: LATE_CAPTURE_RETRY_COOLDOWN_MS,
+  });
   private pendingMountObserver: MutationObserver | null = null;
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
   // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
@@ -144,6 +164,13 @@ class SubtitleController {
     // 提前到 ensureMounted 之前，讓攔截器儘早安裝（M1-43）。
     this.bridge.inject();
     this.bridge.start();
+
+    // M2-24 補充修復十四：訂閱 bridge 的新捕獲事件——管線因 pot 捕獲晚到而降級
+    // （no-caption-strategy）後，捕獲到達時輕量重跑策略鏈（見 onBridgeCapture）。
+    // R4：unsubscribe 返回值必須保存，stop() 時解除，不隨 restart 線性累積。
+    this.unsubscribeCapture = this.bridge.onCapture((capture) => {
+      this.onBridgeCapture(capture);
+    });
 
     // M1-47：通知 MAIN world 攔截器目標翻譯語言——攔截器收到後主動驅動播放器字幕模組
     // 發帶 pot 的 timedtext 請求（CC 關閉時播放器默認不發，攔截器捕獲不到）。
@@ -279,6 +306,11 @@ class SubtitleController {
     // R4：解除本控制器持有的 observePlayback 訂閱（Orchestrator 內另有一份自行清理）。
     this.unsubscribePlayback?.();
     this.unsubscribePlayback = null;
+    // M2-24 補充修復十四：解除 bridge 新捕獲訂閱並重置晚捕獲重試狀態
+    // （restart/換視頻後上一輪的 waiting/計數不得殘留，R4 + 防誤重試）。
+    this.unsubscribeCapture?.();
+    this.unsubscribeCapture = null;
+    this.lateCaptureRetry.disarm();
     // R4：暫停 MAIN world 攔截橋的消息監聽與輪詢，但**保留 latest 捕獲緩存**
     // （restart 熱重載後字幕已加載的播放器不會再發請求，丟緩存會永久回退 fetch）。
     this.bridge.stop();
@@ -411,14 +443,65 @@ class SubtitleController {
         start: s.start,
         end: s.end,
       }));
+      // M2-24 補充修復十四：字幕成功接管後解除晚捕獲等待（不再需要重試）。
+      this.lateCaptureRetry.disarm();
       diagLog('content', 'cues updated, count:', this.cues.length, 'calling scheduleDraw');
       this.scheduleDraw();
       return;
+    }
+    // M2-24 補充修復十四：全鏈無策略接管（含 native 捕獲晚到/超時）時，
+    // 置位晚捕獲重試等待——pot 捕獲常晚於 15s 窗口到達，需等後續捕獲到達再重試。
+    if (e.type === 'pipeline-error' && e.error.code === 'no-caption-strategy') {
+      const videoId = extractVideoId(this.currentUrl());
+      this.lateCaptureRetry.arm(videoId || null);
+      diagLog('content', 'no-caption-strategy: arming late-capture retry for videoId:', videoId);
     }
     diagLog('content', 'onEvent received', e.type, e.type === 'engine-degraded' ? e.reason : '');
     // 降級/錯誤事件：持久化診斷 + console 麵包屑，讓「字幕沒出來」的原因可被用戶查詢。
     // 異步寫入不阻塞事件處理；recordDiagnostic 內部已 try/catch 守護（§5.7）。
     void recordDiagnostic(e);
+  }
+
+  /**
+   * M2-24 補充修復十四：bridge 捕獲到**新** timedtext 響應。
+   * 管線因 native 捕獲晚到而降級（no-caption-strategy）時，捕獲最終到達即為重試信號：
+   * 同一視頻 + 未達上限 + 未在冷卻內 → 輕量重跑 Orchestrator（重新跑策略鏈），
+   * native 的 fetchTracks→tryReuseCapture 會立刻命中該晚捕獲（bridge 保留 latest）。
+   * 守衛：videoId 比對、重試上限、冷卻、segments-ready 解除（見 onEvent/stop）。
+   */
+  private onBridgeCapture(capture: TimedTextCapture): void {
+    // 狀態機判定：未置位 / 視頻不匹配 / 達上限 / 在冷卻內 → 不重試。
+    const attempt = this.lateCaptureRetry.onCapture(capture);
+    if (attempt === null) return;
+    // 調試輔助：暴露晚捕獲重試計數與捕獲到達延遲（no-caption 置位 → 捕獲到達），
+    // 供真實環境確認機制生效與 pot 捕獲晚到程度（§5.6 留痕）。
+    Reflect.set(globalThis, '__aiTransLateCaptureRetries', attempt);
+    Reflect.set(globalThis, '__aiTransCaptureLatencyMs', this.lateCaptureRetry.latencyMs);
+    diagLog('content', 'onBridgeCapture: late capture arrived, retrying native strategy (attempt', attempt, '/', MAX_LATE_CAPTURE_RETRIES, ')');
+    // §5.5/R6：異步重試失敗必須落診斷，不許未捕獲懸掛 Promise 靜默消失。
+    void this.retryAfterLateCapture().catch((err) => {
+      diagLog('content', 'retryAfterLateCapture failed:', err instanceof Error ? err.message : String(err));
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'platform',
+          code: 'native-capture-late-retry',
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err)),
+        },
+      });
+    });
+  }
+
+  /** M2-24 補充修復十四：輕量重跑策略鏈（晚捕獲重試）。不重掛 overlay、不重讀配置。 */
+  private async retryAfterLateCapture(): Promise<void> {
+    if (!this.orchestrator) return;
+    const url = this.currentUrl();
+    diagLog('content', 'retryAfterLateCapture: re-running strategy chain for', url);
+    // Orchestrator.start 內部先 stop() 再重建鏈（含 cleanups 清理，R4），
+    // 重跑 native 策略時 tryReuseCapture 會命中 bridge.latest（晚捕獲）。
+    await this.orchestrator.start(url);
+    diagLog('content', 'retryAfterLateCapture: completed');
   }
 
   /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */

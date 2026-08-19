@@ -4,6 +4,7 @@ export * from './orchestrator';
 export * from './caption-strategy-chain';
 export * from './translation-pipeline';
 export * from './asr-pipeline';
+export * from './late-capture-retry';
 export * from './strategies/native-caption-strategy';
 export * from './strategies/lookahead-asr-strategy';
 export * from './strategies/realtime-asr-strategy';

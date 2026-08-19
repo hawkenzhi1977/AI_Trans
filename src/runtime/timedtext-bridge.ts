@@ -45,6 +45,10 @@ export class TimedTextBridge {
   private readonly waiters = new Set<() => void>();
   /** M2-22 第四層：等待軌道信息的 Promise 解析器隊列。 */
   private readonly trackWaiters = new Set<() => void>();
+  /** M2-24 補充修復十四：新捕獲訂閱者（晚捕獲重試等場景用）。 */
+  private readonly captureSubscribers = new Set<(capture: TimedTextCapture) => void>();
+  /** 已通知過訂閱者的捕獲時間戳：攔截器每 1.5s 重播同一捕獲，需過濾重複。 */
+  private lastNotifiedCapturedAt: number | null = null;
 
   constructor() {
     // R1：監聽器作回調傳遞前綁定接收者（避免移除時 this 丟失）。
@@ -128,11 +132,26 @@ export class TimedTextBridge {
     return this.latest;
   }
 
+  /**
+   * M2-24 補充修復十四：訂閱「新捕獲」事件。
+   * 僅在真正**新的**捕獲到達時觸發（攔截器 1.5s 重播同一捕獲不重複觸發），
+   * 用於晚捕獲重試（管線已降級後捕獲才到的場景）。
+   * 返回 unsubscribe；stop/dispose 後消息不再接收，訂閱自然失效（R4）。
+   */
+  onCapture(cb: (capture: TimedTextCapture) => void): () => void {
+    this.captureSubscribers.add(cb);
+    return () => {
+      this.captureSubscribers.delete(cb);
+    };
+  }
+
   /** 清空 latest 緩存（視頻切換時調用，避免複用舊視頻字幕）。 */
   clearLatest(): void {
     const previousVideoId = this.latest?.videoId ?? '(none)';
     diagLog('bridge', 'clearLatest() called, previous videoId:', previousVideoId);
     this.latest = null;
+    // M2-24 補充修復十四：重置通知去重時間戳，新視頻首個捕獲可正常觸發訂閱者。
+    this.lastNotifiedCapturedAt = null;
   }
 
   /**
@@ -197,6 +216,8 @@ export class TimedTextBridge {
   dispose(): void {
     this.stop();
     this.latest = null;
+    this.lastNotifiedCapturedAt = null;
+    this.captureSubscribers.clear();
     for (const w of this.waiters) w();
     this.waiters.clear();
     for (const w of this.trackWaiters) w();
@@ -239,6 +260,19 @@ export class TimedTextBridge {
       if (!payload || typeof payload.url !== 'string' || typeof payload.responseText !== 'string') return;
       // 取最新（後到的覆蓋先到的；雙軌字幕時 en 軌通常最後到）。
       this.latest = payload;
+      // M2-24 補充修復十四：僅對「新捕獲」（capturedAt 變化）通知訂閱者，
+      // 攔截器 1.5s 重播同一捕獲時不重複觸發（避免晚捕獲重試被重播刷屏）。
+      if (payload.capturedAt !== this.lastNotifiedCapturedAt) {
+        this.lastNotifiedCapturedAt = payload.capturedAt;
+        const subscribers = Array.from(this.captureSubscribers);
+        for (const cb of subscribers) {
+          try {
+            cb(payload);
+          } catch {
+            // §5.7：訂閱者異常不允許冒泡破壞消息接收鏈——吞掉（通知失敗不致命）。
+          }
+        }
+      }
       this.notifyWaiters();
     } else if (data.type === TRACK_INFO_EVENT) {
       // M2-22 第三層：接收 MAIN world 發現的軌道信息。

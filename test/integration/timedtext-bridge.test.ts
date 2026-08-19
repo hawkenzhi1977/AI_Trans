@@ -48,6 +48,76 @@ describe('TimedTextBridge — 消息接收與存儲', () => {
     expect(bridge.getLatest()).toBeNull();
   });
 
+  it('[M2-24 補充修復十四] onCapture：新捕獲到達時觸發訂閱者', () => {
+    bridge.start();
+    const cb = vi.fn();
+    bridge.onCapture(cb);
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith(payload);
+  });
+
+  it('[M2-24 補充修復十四] onCapture：1.5s 重播同一捕獲不重複觸發（capturedAt 去重）', () => {
+    bridge.start();
+    const cb = vi.fn();
+    bridge.onCapture(cb);
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    // 首次捕獲觸發
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    // 重播（同一 capturedAt）不應重複觸發
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(cb).toHaveBeenCalledTimes(1);
+    // 新捕獲（capturedAt 變化）再次觸發
+    const payload2 = { url: 'u2', responseText: 'r2', contentType: 'c', capturedAt: 2 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload: payload2 } }));
+    expect(cb).toHaveBeenCalledTimes(2);
+  });
+
+  it('[M2-24 補充修復十四] onCapture：unsubscribe 後不再觸發（R4）', () => {
+    bridge.start();
+    const cb = vi.fn();
+    const unsub = bridge.onCapture(cb);
+    unsub();
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('[M2-24 補充修復十四] onCapture：stop 後消息不再接收，訂閱自然失效（R4）', () => {
+    bridge.start();
+    const cb = vi.fn();
+    bridge.onCapture(cb);
+    bridge.stop();
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('[M2-24 補充修復十四] onCapture：clearLatest 後新捕獲再次觸發（重置去重時間戳）', () => {
+    bridge.start();
+    const cb = vi.fn();
+    bridge.onCapture(cb);
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    bridge.clearLatest();
+    // 新視頻的捕獲（同 capturedAt 值也應觸發，因 clearLatest 重置了去重狀態）
+    window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    expect(cb).toHaveBeenCalledTimes(2);
+  });
+
+  it('[M2-24 補充修復十四] onCapture：訂閱者拋錯不中斷消息接收（§5.7 容錯）', () => {
+    bridge.start();
+    const cb = vi.fn(() => { throw new Error('subscriber boom'); });
+    bridge.onCapture(cb);
+    const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
+    expect(() => {
+      window.dispatchEvent(new MessageEvent('message', { data: { __aiTrans: true, type: 'ai-trans:timedtext-capture', payload } }));
+    }).not.toThrow();
+    // 消息仍被存為 latest（接收鏈未破壞）
+    expect(bridge.getLatest()).toEqual(payload);
+  });
+
   it('dispose 後不再接收消息，且緩存清空（R4）', () => {
     bridge.start();
     const payload = { url: 'u', responseText: 'r', contentType: 'c', capturedAt: 1 };
