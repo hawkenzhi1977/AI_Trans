@@ -51,6 +51,7 @@ const DEBUG_CATEGORY_IDS: Array<[DebugLogCategory, string]> = [
   ['bridge', 'dbg-bridge'],
   ['interceptor', 'dbg-interceptor'],
   ['local-onnx', 'dbg-local-onnx'],
+  ['popup', 'dbg-popup'],
 ];
 
 /** 讀取調試日誌 checkbox 狀態。 */
@@ -96,7 +97,7 @@ function readForm(): EngineConfig {
       type: translationType,
       model: $<HTMLInputElement>('translation-model').value || undefined,
       endpoint: $<HTMLInputElement>('translation-endpoint').value || undefined,
-      fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'local-onnx' | 'none') || undefined,
+      fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'none') || undefined,
       localModelName: DEFAULT_LOCAL_TRANSLATION_MODEL,
     },
     asr: {
@@ -256,6 +257,9 @@ async function init(): Promise<void> {
 
   // 本地 ONNX 模型相關事件處理。
   initLocalOnnxModelUI();
+
+  // ASR Whisper 模型手動下載事件處理。
+  initAsrModelUI();
 
   // 版本號顯示
   const versionEl = $('version');
@@ -477,5 +481,211 @@ function initLocalOnnxModelUI(): void {
   btnClear.addEventListener('click', () => void clearModelCache());
 
   // 初始檢查模型狀態。
+  void checkModelStatus();
+}
+
+// ============================================================
+// ASR Whisper 模型下載 UI 邏輯
+// ============================================================
+
+/** Whisper 模型檔位映射（HuggingFace Hub 模型 ID）。 */
+const WHISPER_MODEL_IDS: Record<string, string> = {
+  tiny: 'Xenova/whisper-tiny.en',
+  base: 'Xenova/whisper-base.en',
+  small: 'Xenova/whisper-small.en',
+};
+
+/** Whisper 模型大小提示。 */
+const WHISPER_MODEL_SIZES: Record<string, string> = {
+  'Xenova/whisper-tiny.en': '約 150 MB',
+  'Xenova/whisper-base.en': '約 290 MB',
+  'Xenova/whisper-small.en': '約 460 MB',
+};
+
+/** ASR 模型狀態。 */
+type AsrModelStatus = 'checking' | 'not-downloaded' | 'downloading' | 'downloaded' | 'error';
+
+/** 初始化 ASR 模型 UI——狀態檢查、下載、快取清理。 */
+function initAsrModelUI(): void {
+  const modelNameInput = $<HTMLInputElement>('asr-model-name');
+  const sizeInfo = $<HTMLParagraphElement>('asr-model-size-info');
+  const statusBadge = $<HTMLSpanElement>('asr-model-status-badge');
+  const progressContainer = $<HTMLDivElement>('asr-model-progress-container');
+  const progressBar = $<HTMLProgressElement>('asr-model-progress-bar');
+  const progressText = $<HTMLSpanElement>('asr-model-progress-text');
+  const progressDetail = $<HTMLParagraphElement>('asr-model-progress-detail');
+  const btnDownload = $<HTMLButtonElement>('btn-download-asr-model');
+  const btnClear = $<HTMLButtonElement>('btn-clear-asr-model');
+  const tierSelect = $<HTMLSelectElement>('asr-tier');
+  const customModelInput = $<HTMLInputElement>('asr-custom-model');
+
+  /** 獲取當前選中的模型 ID。 */
+  function getCurrentModelId(): string {
+    const customPath = customModelInput.value.trim();
+    if (customPath) return customPath;
+    return WHISPER_MODEL_IDS[tierSelect.value] ?? WHISPER_MODEL_IDS.base;
+  }
+
+  /** 更新模型名稱顯示和大小提示。 */
+  function updateModelName(): void {
+    const modelId = getCurrentModelId();
+    modelNameInput.value = modelId;
+    const size = WHISPER_MODEL_SIZES[modelId] ?? '大小未知';
+    sizeInfo.textContent = size;
+  }
+
+  /** 更新狀態標籤樣式與文字。 */
+  function updateStatusBadge(status: AsrModelStatus, message?: string): void {
+    const styles: Record<AsrModelStatus, { bg: string; color: string; text: string }> = {
+      checking: { bg: '#eee', color: '#666', text: '檢測中...' },
+      'not-downloaded': { bg: '#fff3cd', color: '#856404', text: '未下載' },
+      downloading: { bg: '#cce5ff', color: '#004085', text: '下載中...' },
+      downloaded: { bg: '#d4edda', color: '#155724', text: '已就緒' },
+      error: { bg: '#f8d7da', color: '#721c24', text: '錯誤' },
+    };
+    const style = styles[status];
+    statusBadge.style.background = style.bg;
+    statusBadge.style.color = style.color;
+    statusBadge.textContent = message ?? style.text;
+  }
+
+  /** 顯示/隱藏進度條。 */
+  function setProgressVisible(visible: boolean): void {
+    progressContainer.style.display = visible ? '' : 'none';
+  }
+
+  /** 更新進度條。 */
+  function updateProgress(percent: number, detail?: string): void {
+    progressBar.value = percent;
+    progressText.textContent = `${Math.round(percent)}%`;
+    if (detail) progressDetail.textContent = detail;
+  }
+
+  /** 格式化位元組。 */
+  function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  }
+
+  /** 檢查 ASR 模型狀態。 */
+  async function checkModelStatus(): Promise<void> {
+    const modelId = getCurrentModelId();
+    updateModelName();
+    updateStatusBadge('checking');
+    try {
+      const response = await chrome.runtime.sendMessage({
+        topic: 'asr-whisper:check-status',
+        payload: { modelId },
+      });
+      const res = response as { ok: boolean; result?: { downloaded: boolean } };
+      if (res.ok && res.result?.downloaded) {
+        updateStatusBadge('downloaded');
+        btnDownload.disabled = true;
+        btnClear.disabled = false;
+      } else {
+        updateStatusBadge('not-downloaded');
+        btnDownload.disabled = false;
+        btnClear.disabled = true;
+      }
+    } catch (err) {
+      updateStatusBadge('error', '檢測失敗');
+      console.warn('[AI_Trans] check ASR model status failed:', err);
+    }
+  }
+
+  /** 下載 ASR 模型。 */
+  async function downloadModel(): Promise<void> {
+    const modelId = getCurrentModelId();
+    updateStatusBadge('downloading');
+    setProgressVisible(true);
+    updateProgress(0, '正在初始化...');
+    btnDownload.disabled = true;
+    btnClear.disabled = true;
+
+    const progressListener = (
+      message: unknown,
+      _sender: chrome.runtime.MessageSender,
+      _sendResponse: (response?: unknown) => void
+    ): void => {
+      const msg = message as { type?: string };
+      if (msg.type === 'asr-whisper:download-progress') {
+        const progressMsg = msg as {
+          type: string;
+          progress: number;
+          loaded: number;
+          total: number;
+        };
+        updateProgress(
+          progressMsg.progress,
+          `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+        );
+      } else if (msg.type === 'asr-whisper:download-complete') {
+        const completeMsg = msg as { type: string; ok: boolean; error?: string };
+        chrome.runtime.onMessage.removeListener(progressListener);
+        setProgressVisible(false);
+        if (completeMsg.ok) {
+          updateStatusBadge('downloaded');
+          btnClear.disabled = false;
+          showStatus('ASR 模型下載完成');
+        } else {
+          updateStatusBadge('error', '下載失敗');
+          btnDownload.disabled = false;
+          showStatus(`下載失敗: ${completeMsg.error ?? 'unknown error'}`);
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(progressListener);
+
+    try {
+      void chrome.runtime.sendMessage({
+        topic: 'asr-whisper:download',
+        payload: { modelId },
+      });
+    } catch (err) {
+      chrome.runtime.onMessage.removeListener(progressListener);
+      setProgressVisible(false);
+      updateStatusBadge('error', '下載失敗');
+      btnDownload.disabled = false;
+      showStatus(`下載失敗: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 清除 ASR 模型快取。 */
+  async function clearModelCache(): Promise<void> {
+    if (!confirm('確定要清除 ASR 模型快取嗎？')) return;
+
+    const modelId = getCurrentModelId();
+    try {
+      const response = await chrome.runtime.sendMessage({
+        topic: 'asr-whisper:clear-cache',
+        payload: { modelId },
+      });
+      const res = response as { ok: boolean };
+      if (res.ok) {
+        updateStatusBadge('not-downloaded');
+        btnDownload.disabled = false;
+        btnClear.disabled = true;
+        showStatus('ASR 模型快取已清除');
+      } else {
+        showStatus('清除快取失敗');
+      }
+    } catch (err) {
+      showStatus(`清除快取失敗: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // 綁定按鈕事件。
+  btnDownload.addEventListener('click', () => void downloadModel());
+  btnClear.addEventListener('click', () => void clearModelCache());
+
+  // 檔位或自定義模型變更時更新模型名並重新檢查狀態。
+  tierSelect.addEventListener('change', () => void checkModelStatus());
+  customModelInput.addEventListener('input', () => void checkModelStatus());
+
+  // 初始檢查。
+  updateModelName();
   void checkModelStatus();
 }

@@ -30,7 +30,7 @@
         <select id="translation-type">
           <option value="cloud-llm">雲端 LLM（OpenAI 兼容）</option>
           <option value="local">本地模型端點</option>
-          <option value="local-onnx">本地 ONNX 模型（離線）</option>
+          <option value="local-onnx">本地 ONNX 小模型（離線兜底）</option>
           <option value="mt">傳統 MT（字典兜底）</option>
         </select>
       </div>
@@ -38,7 +38,7 @@
         <label for="translation-fallback">失敗兜底</label>
         <select id="translation-fallback">
           <option value="mt">MT 兜底</option>
-          <option value="local-onnx">本地 ONNX 小模型（推薦）</option>
+          
           <option value="none">不兜底</option>
         </select>
       </div>
@@ -107,6 +107,35 @@
     <input id="asr-endpoint" type="text" placeholder="https://api.openai.com/v1/audio/transcriptions" />
     <label for="asr-api-key">API Key（本地安全存儲）</label>
     <input id="asr-api-key" type="password" autocomplete="off" placeholder="sk-..." />
+  </fieldset>
+
+  <h2>ASR 模型下載</h2>
+  <fieldset id="asr-model-section">
+    <p class="hint">Whisper 模型首次使用時會自動下載，你也可以手動預先下載以加速首次轉錄。模型檔位在上方「語音識別」中選擇。</p>
+    <label for="asr-model-name">模型名稱（依檔位自動選擇）</label>
+    <input id="asr-model-name" type="text" disabled />
+    <p class="hint" id="asr-model-size-info">約 150 MB</p>
+
+    <div style="margin-top: 12px;">
+      <label>模型狀態</label>
+      <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+        <span id="asr-model-status-badge" style="padding: 4px 10px; border-radius: 12px; font-size: 12px; background: #eee; color: #666;">檢測中...</span>
+      </div>
+    </div>
+
+    <div id="asr-model-progress-container" style="display: none; margin-top: 12px;">
+      <label>下載進度</label>
+      <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+        <progress id="asr-model-progress-bar" value="0" max="100" style="flex: 1; height: 20px;"></progress>
+        <span id="asr-model-progress-text" style="font-size: 12px; min-width: 40px;">0%</span>
+      </div>
+      <p id="asr-model-progress-detail" class="hint" style="margin-top: 4px;"></p>
+    </div>
+
+    <div style="margin-top: 12px; display: flex; gap: 8px;">
+      <button id="btn-download-asr-model" type="button" style="padding: 6px 14px; font-size: 13px;">下載模型</button>
+      <button id="btn-clear-asr-model" type="button" style="padding: 6px 14px; font-size: 13px;">清除快取</button>
+    </div>
   </fieldset>
 
   <h2>字幕</h2>
@@ -199,6 +228,7 @@
         <label><input type="checkbox" id="dbg-bridge" /> bridge（timedtext 消息橋）</label>
         <label><input type="checkbox" id="dbg-interceptor" /> interceptor（MAIN world 攔截器）</label>
         <label><input type="checkbox" id="dbg-local-onnx" /> local-onnx（本地 ONNX 翻譯）</label>
+        <label><input type="checkbox" id="dbg-popup" /> popup（popup 生命週期診斷）</label>
       </div>
     </div>
   </fieldset>

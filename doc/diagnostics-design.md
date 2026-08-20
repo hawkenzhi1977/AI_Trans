@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-08-19（**M2-24 補充修復十六**：新增 §2.20「local-onnx 字幕完全空白 + echo 不可辨」場景、§4.18「local-onnx-echo-output 診斷升級（內嵌 raw 片段 + parsed x/N + 耗時）」、§4.19「local-onnx-echo-chunks 聚合診斷」；先前：**M2-24 補充修復十五（§2.19 + §4.17）**）
+> 最後更新：2026-08-20（**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」（webgpu 不可用降級 wasm）、§4.21「popup-init-slow」（>3s）、§4.22「popup-init-timeout」（>10s）；先前：**M2-25**（新增 `offscreen-close-failed` Offscreen 空閒關閉失敗）；先前：**M2-24 補充修復十六**（§2.20 + §4.18 + §4.19）；先前：**M2-24 補充修復十五（§2.19 + §4.17）**）
 
 ---
 
@@ -271,6 +271,18 @@
 - **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`translateChunk`/`translateStream` 逐塊 emit/`recordEchoSummary`/響應 `echoed` 字段）、src/runtime/offscreen.ts（`parseNumberedOutput` `parsedCount`/echo 診斷 cause 升級）、src/domain/models/config.ts + src/runtime/options/*（`local-onnx` 調試分類）
 
 
+### 2.21 本地 ONNX 模型載入後 popup 彈不出（M2-26）
+
+- **現象**: M2-25（Offscreen 空閒關閉）合入後用戶實測**仍彈不出**——本地 ONNX 翻譯模型（Qwen2.5-0.5B INT4 WASM ~350MB）下載就緒、播放/翻譯運行一段時間後點擴充圖示 popup 彈不出（半透明圓圈），刷新插件才恢復；翻譯照常（無翻譯錯誤日誌）。
+- **根因（三層）**: ①**堆佔用過大**——wasm 後端把 350MB 權重放進 JS heap（~500MB），與 popup 共享 extension 渲染進程，逼近單進程上限 → popup 頁面創建失敗。②**無可觀測性**——popup init 卡住時無任何儀器記錄卡在哪。③**manifest `commands` 塊破壞 SW 註冊**——先前未合併的「快捷鍵開 Options」（自訂 command `open-options`）在 E2E headless Chromium 令整包 SW 註冊失敗（`_execute_action` 內建命令可、自訂 command 任何鍵值皆不行）→ 擴充加載失敗（E2E 9/16 掛）。
+- **修復後行為**: ①`loadPipeline` **webgpu-first**（權重駐 VRAM、heap ~50-100MB），失败置 `webgpuFailed` 後續直走 wasm + 落 `local-onnx-webgpu-fallback`；②popup **init watchdog**（3s slow / 10s timeout）；③移除 manifest `commands`，Options 經 popup「開啟設定」按鈕到達。
+- **診斷碼**: `local-onnx-webgpu-fallback`（webgpu 不可用降級 wasm）；`popup-init-slow`（>3s）；`popup-init-timeout`（>10s）。
+- **觸發條件**: Offscreen `loadPipeline` webgpu 初始化 reject → `local-onnx-webgpu-fallback`；popup 打開後 init 未在 3s/10s 內完成 → `popup-init-slow`/`popup-init-timeout`。
+- **用戶響應**: popup 若能打開，「最近失敗」顯示 init 慢/超時（platform 類）；若完全打不開，見 Options「最近失敗」或 console `[AI_Trans:sw] offscreen created` + SW 生命週期麵包屑定位卡點。
+- **開發者響應**: Options「調試日誌」+ Offscreen console `local-onnx JS heap: ~NMB` breadcrumb 觀察堆佔用；SW console `[AI_Trans:sw] startup/installed/suspend` 確認 SW 回收節奏。
+- **代碼落點**: src/runtime/offscreen.ts（webgpu-first 後端 + `preferWebGpu()`/`webgpuFailed` + `logJsHeapBreadcrumb`）、src/runtime/popup/popup.ts（startInitWatchdog/stopInitWatchdog + fireInitTimeout）、src/runtime/service-worker.ts（offscreen created + 生命週期麵包屑）、manifest.json（移除 commands）
+
+
 ---
 
 ## 3. 策略鏈執行
@@ -528,6 +540,42 @@
 - **用戶響應**: 若絕大多數 chunk 回顯 → 該模型對當前語言對不適用，換主引擎或改善 prompt；少數回顯可忽略（該 chunk 已回退原文顯示）
 - **開發者響應**: 結合逐 chunk 麵包屑定位回顯 chunk 的輸入特徵（長度/語言）；對照 `parsedCount` 排除解析誤判
 - **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`recordEchoSummary` + `translateStream` 統計）
+
+
+### 4.20 本地 ONNX WebGPU 後端不可用降級 wasm（M2-26）
+
+- **診斷碼**: `local-onnx-webgpu-fallback`
+- **port / kind**: `translation` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「降級: local-onnx webgpu unavailable, falling back to wasm: <reason>」——提示翻譯仍可進行（wasm 後端），只是堆佔用較高
+- **觸發條件**: Offscreen `loadPipeline` 先試 `device: 'webgpu'`，初始化 reject（WebGPU 不可用/驅動不支持/VRAM 不足）
+- **根因**: WebGPU 後端在當前環境不可用；自動降級 wasm（權重回 JS heap）。`webgpuFailed=true` 使後續載入直走 wasm、不重試
+- **用戶響應**: 翻譯功能不受影響（wasm 承接）；若 popup 仍彈不出，對照 §2.21 堆佔用問題
+- **開發者響應**: Offscreen console 查看 webgpu reject 原因 + `local-onnx JS heap` breadcrumb 確認堆佔用
+- **代碼落點**: src/runtime/offscreen.ts（`loadPipeline` webgpu catch 分支 + `recordDiagnostic`）
+
+
+### 4.21 popup init 慢（M2-26）
+
+- **診斷碼**: `popup-init-slow`
+- **port / kind**: `platform` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「降級: popup init took >3s (slow start)」
+- **觸發條件**: popup 打開後 init（port connect + loadConfig）未在 **3s** 內完成
+- **根因**: extension 渲染進程負載高（如本地 ONNX wasm 堆佔用）或存儲讀取慢；init 最終仍可能成功
+- **用戶響應**: 若 popup 最終能打開則可忽略（僅慢）；若持續彈不出 → 見 §2.21 / `popup-init-timeout`
+- **開發者響應**: 對照 SW console 生命週期麵包屑 + Offscreen heap breadcrumb 定位進程負載
+- **代碼落點**: src/runtime/popup/popup.ts（`startInitWatchdog` 3s timer）
+
+
+### 4.22 popup init 超時（M2-26）
+
+- **診斷碼**: `popup-init-timeout`
+- **port / kind**: `platform` / `error`（不可恢復、需干預）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: popup init timed out (>10s)」
+- **觸發條件**: popup 打開後 init 未在 **10s** 內完成（獨立於 slow、覆蓋更嚴重最終狀態）
+- **根因**: extension 渲染進程被撐爆（本地 ONNX wasm 堆 ~500MB）→ popup 頁面無法按時創建/初始化
+- **用戶響應**: 刷新插件或重啟瀏覽器；若反覆出現 → 檢查本地 ONNX 模型是否佔滿進程（§2.21），考慮 webgpu 環境
+- **開發者響應**: SW console `[AI_Trans:sw]` 麵包屑 + Offscreen heap breadcrumb；確認是否進程堆超限
+- **代碼落點**: src/runtime/popup/popup.ts（`fireInitTimeout` 10s timer）
 
 
 ---

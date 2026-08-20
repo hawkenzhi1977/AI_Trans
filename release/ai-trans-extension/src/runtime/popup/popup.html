@@ -10,6 +10,7 @@
     .line.ok { color: #0a7d32; word-break: break-word; }
     .actions { margin-top: 12px; display: flex; gap: 8px; }
     button { flex: 1; padding: 7px 10px; font-size: 12px; cursor: pointer; }
+    .diag { margin-top: 8px; font-size: 10px; font-family: monospace; color: #555; white-space: pre-wrap; max-height: 80px; overflow-y: auto; border-top: 1px solid #eee; padding-top: 4px; }
   </style>
 </head>
 <body>
@@ -27,6 +28,7 @@
     <button id="btn-asr">啟用 ASR</button>
     <button id="btn-reload">重新載入頁面</button>
   </div>
+  <div class="diag" id="popup-diag-dom"></div>
   <script src="popup.js"></script>
 </body>
 </html>

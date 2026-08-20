@@ -11,7 +11,8 @@
     content: false,
     bridge: false,
     interceptor: false,
-    "local-onnx": false
+    "local-onnx": false,
+    popup: false
   };
   var PROFILE_DEFAULTS = {
     streaming: {
@@ -123,7 +124,8 @@
     ["content", "dbg-content"],
     ["bridge", "dbg-bridge"],
     ["interceptor", "dbg-interceptor"],
-    ["local-onnx", "dbg-local-onnx"]
+    ["local-onnx", "dbg-local-onnx"],
+    ["popup", "dbg-popup"]
   ];
   function readDebugLog() {
     const out = { ...DEBUG_LOG_OFF };
@@ -292,6 +294,7 @@
       fillForm(DEFAULT_CONFIG);
     });
     initLocalOnnxModelUI();
+    initAsrModelUI();
     const versionEl = $("version");
     if (versionEl) {
       try {
@@ -462,6 +465,163 @@
     btnDownload.addEventListener("click", () => void downloadModel());
     btnWarmup.addEventListener("click", () => void warmupModel());
     btnClear.addEventListener("click", () => void clearModelCache());
+    void checkModelStatus();
+  }
+  var WHISPER_MODEL_IDS = {
+    tiny: "Xenova/whisper-tiny.en",
+    base: "Xenova/whisper-base.en",
+    small: "Xenova/whisper-small.en"
+  };
+  var WHISPER_MODEL_SIZES = {
+    "Xenova/whisper-tiny.en": "\u7D04 150 MB",
+    "Xenova/whisper-base.en": "\u7D04 290 MB",
+    "Xenova/whisper-small.en": "\u7D04 460 MB"
+  };
+  function initAsrModelUI() {
+    const modelNameInput = $("asr-model-name");
+    const sizeInfo = $("asr-model-size-info");
+    const statusBadge = $("asr-model-status-badge");
+    const progressContainer = $("asr-model-progress-container");
+    const progressBar = $("asr-model-progress-bar");
+    const progressText = $("asr-model-progress-text");
+    const progressDetail = $("asr-model-progress-detail");
+    const btnDownload = $("btn-download-asr-model");
+    const btnClear = $("btn-clear-asr-model");
+    const tierSelect = $("asr-tier");
+    const customModelInput = $("asr-custom-model");
+    function getCurrentModelId() {
+      const customPath = customModelInput.value.trim();
+      if (customPath) return customPath;
+      return WHISPER_MODEL_IDS[tierSelect.value] ?? WHISPER_MODEL_IDS.base;
+    }
+    function updateModelName() {
+      const modelId = getCurrentModelId();
+      modelNameInput.value = modelId;
+      const size = WHISPER_MODEL_SIZES[modelId] ?? "\u5927\u5C0F\u672A\u77E5";
+      sizeInfo.textContent = size;
+    }
+    function updateStatusBadge(status, message) {
+      const styles = {
+        checking: { bg: "#eee", color: "#666", text: "\u6AA2\u6E2C\u4E2D..." },
+        "not-downloaded": { bg: "#fff3cd", color: "#856404", text: "\u672A\u4E0B\u8F09" },
+        downloading: { bg: "#cce5ff", color: "#004085", text: "\u4E0B\u8F09\u4E2D..." },
+        downloaded: { bg: "#d4edda", color: "#155724", text: "\u5DF2\u5C31\u7DD2" },
+        error: { bg: "#f8d7da", color: "#721c24", text: "\u932F\u8AA4" }
+      };
+      const style = styles[status];
+      statusBadge.style.background = style.bg;
+      statusBadge.style.color = style.color;
+      statusBadge.textContent = message ?? style.text;
+    }
+    function setProgressVisible(visible) {
+      progressContainer.style.display = visible ? "" : "none";
+    }
+    function updateProgress(percent, detail) {
+      progressBar.value = percent;
+      progressText.textContent = `${Math.round(percent)}%`;
+      if (detail) progressDetail.textContent = detail;
+    }
+    function formatBytes(bytes) {
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+    }
+    async function checkModelStatus() {
+      const modelId = getCurrentModelId();
+      updateModelName();
+      updateStatusBadge("checking");
+      try {
+        const response = await chrome.runtime.sendMessage({
+          topic: "asr-whisper:check-status",
+          payload: { modelId }
+        });
+        const res = response;
+        if (res.ok && res.result?.downloaded) {
+          updateStatusBadge("downloaded");
+          btnDownload.disabled = true;
+          btnClear.disabled = false;
+        } else {
+          updateStatusBadge("not-downloaded");
+          btnDownload.disabled = false;
+          btnClear.disabled = true;
+        }
+      } catch (err) {
+        updateStatusBadge("error", "\u6AA2\u6E2C\u5931\u6557");
+        console.warn("[AI_Trans] check ASR model status failed:", err);
+      }
+    }
+    async function downloadModel() {
+      const modelId = getCurrentModelId();
+      updateStatusBadge("downloading");
+      setProgressVisible(true);
+      updateProgress(0, "\u6B63\u5728\u521D\u59CB\u5316...");
+      btnDownload.disabled = true;
+      btnClear.disabled = true;
+      const progressListener = (message, _sender, _sendResponse) => {
+        const msg = message;
+        if (msg.type === "asr-whisper:download-progress") {
+          const progressMsg = msg;
+          updateProgress(
+            progressMsg.progress,
+            `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+          );
+        } else if (msg.type === "asr-whisper:download-complete") {
+          const completeMsg = msg;
+          chrome.runtime.onMessage.removeListener(progressListener);
+          setProgressVisible(false);
+          if (completeMsg.ok) {
+            updateStatusBadge("downloaded");
+            btnClear.disabled = false;
+            showStatus("ASR \u6A21\u578B\u4E0B\u8F09\u5B8C\u6210");
+          } else {
+            updateStatusBadge("error", "\u4E0B\u8F09\u5931\u6557");
+            btnDownload.disabled = false;
+            showStatus(`\u4E0B\u8F09\u5931\u6557: ${completeMsg.error ?? "unknown error"}`);
+          }
+        }
+      };
+      chrome.runtime.onMessage.addListener(progressListener);
+      try {
+        void chrome.runtime.sendMessage({
+          topic: "asr-whisper:download",
+          payload: { modelId }
+        });
+      } catch (err) {
+        chrome.runtime.onMessage.removeListener(progressListener);
+        setProgressVisible(false);
+        updateStatusBadge("error", "\u4E0B\u8F09\u5931\u6557");
+        btnDownload.disabled = false;
+        showStatus(`\u4E0B\u8F09\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    async function clearModelCache() {
+      if (!confirm("\u78BA\u5B9A\u8981\u6E05\u9664 ASR \u6A21\u578B\u5FEB\u53D6\u55CE\uFF1F")) return;
+      const modelId = getCurrentModelId();
+      try {
+        const response = await chrome.runtime.sendMessage({
+          topic: "asr-whisper:clear-cache",
+          payload: { modelId }
+        });
+        const res = response;
+        if (res.ok) {
+          updateStatusBadge("not-downloaded");
+          btnDownload.disabled = false;
+          btnClear.disabled = true;
+          showStatus("ASR \u6A21\u578B\u5FEB\u53D6\u5DF2\u6E05\u9664");
+        } else {
+          showStatus("\u6E05\u9664\u5FEB\u53D6\u5931\u6557");
+        }
+      } catch (err) {
+        showStatus(`\u6E05\u9664\u5FEB\u53D6\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    btnDownload.addEventListener("click", () => void downloadModel());
+    btnClear.addEventListener("click", () => void clearModelCache());
+    tierSelect.addEventListener("change", () => void checkModelStatus());
+    customModelInput.addEventListener("input", () => void checkModelStatus());
+    updateModelName();
     void checkModelStatus();
   }
 })();

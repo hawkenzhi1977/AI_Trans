@@ -3,6 +3,7 @@
 // 通信協議：content-script 透過 chrome.runtime.connect 建立 port 長連接（避免 SW 掛起）。
 // 同時負責本地 ONNX 翻譯模型的推理（Transformers.js + ONNX Runtime Web）。
 import { recordDiagnostic } from '../infrastructure/diagnostics';
+import { IdleTimeout } from '../infrastructure/idle-timeout';
 import { DEFAULT_LOCAL_TRANSLATION_MODEL } from '../domain/models/config';
 
 /** Offscreen Document 接收的消息類型（ASR + 本地 ONNX 翻譯）。 */
@@ -13,7 +14,10 @@ type OffscreenRequest =
   | { type: 'local-onnx:warmup' }
   | { type: 'local-onnx:download' }
   | { type: 'local-onnx:clear-cache' }
-  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string };
+  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string }
+  | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
+  | { type: 'asr-whisper:download'; payload: { modelId: string } }
+  | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } };
 
 /** Offscreen Document 發送的響應類型。 */
 type OffscreenResponse =
@@ -26,12 +30,103 @@ type OffscreenResponse =
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
-  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean };
+  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
+  | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string }
+  | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
+  | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
+  | { type: 'asr-whisper:cache-cleared'; ok: boolean };
 
 let mediaStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let scriptProcessor: ScriptProcessorNode | null = null;
 let currentPort: chrome.runtime.Port | null = null;
+
+// ============================================================
+// 空閒生命週期（M2-25）：offscreen 與 popup 共享 extension 進程，
+// 空閒時必須釋放 WASM 模型 + 音頻資源並關閉 document，否則進程被佔滿
+// 導致 popup 無法創建（真實環境「播放後 popup 彈不出」根因修復）。
+// ============================================================
+
+/** 空閒超時（毫秒）：10 分鐘無活動（翻譯/下載/音頻流）則關閉。 */
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+/** in-flight 守衛的重試間隔（有請求在飛時延後關閉）。 */
+const IDLE_RETRY_MS = 30_000;
+/** in-flight 請求計數——非 0 時不允許空閒關閉，避免打斷在飛請求。 */
+let busyCount = 0;
+/** 是否已發起空閒關閉（防止重複觸發）。 */
+let idleCloseRequested = false;
+
+/** 標記一次活動——重置空閒計時（翻譯/下載/音頻流都算活動）。 */
+function markActivity(): void {
+  idleTimeout.reset();
+}
+
+/** 空閒超時回調：in-flight 時延後重查；否則釋放資源並請求 SW 關閉。 */
+function onIdleTimeout(): void {
+  if (busyCount > 0) {
+    // in-flight 守衛：有請求在飛時短延遲後再查，避免關閉打斷正在處理的推理/下載。
+    setTimeout(onIdleTimeout, IDLE_RETRY_MS);
+    return;
+  }
+  void shutdownForIdle();
+}
+
+/**
+ * 空閒關閉：釋放音頻捕獲 + WASM 模型記憶體後，通知 SW 調用 chrome.offscreen.closeDocument()
+ * （只有 SW 能關閉 offscreen document；本頁面不能自關）。
+ * §5.4：關閉前必須完整清理（stopCapture / dispose pipeline / 停止計時器）。
+ */
+async function shutdownForIdle(): Promise<void> {
+  if (idleCloseRequested) return;
+  idleCloseRequested = true;
+  idleTimeout.stop(); // 防止關閉流程中計時器重複觸發。
+  console.warn('[AI_Trans] offscreen idle timeout — releasing resources and closing document');
+  // 麵包屑：釋放前的 JS 堆（與載入後對比，驗證 WebGPU/WASM 佔用）。
+  logJsHeapBreadcrumb('offscreen 空閒釋放前');
+
+  // 釋放音頻捕獲（MediaStream / AudioContext / ScriptProcessor，§5.4）。
+  try {
+    await stopCapture();
+  } catch (err) {
+    console.warn('[AI_Trans] offscreen idle stopCapture failed:', err);
+  }
+
+  // 釋放翻譯 pipeline 的 WASM 記憶體（ORT session）。
+  if (translationPipeline !== null) {
+    try {
+      await disposePipeline(translationPipeline);
+    } catch (err) {
+      console.warn('[AI_Trans] offscreen idle dispose translation pipeline failed:', err);
+    }
+    translationPipeline = null;
+  }
+
+  // 釋放 ASR pipeline（僅下載用，正常已 dispose；兜底清理）。
+  if (asrPipeline !== null) {
+    try {
+      const candidate = asrPipeline as { dispose?: () => unknown | Promise<unknown> };
+      if (typeof candidate?.dispose === 'function') {
+        await candidate.dispose();
+      }
+    } catch {
+      // dispose 失敗不阻塞關閉。
+    }
+    asrPipeline = null;
+  }
+
+  // 通知 Service Worker 關閉 document。
+  try {
+    await chrome.runtime.sendMessage({ topic: 'offscreen:idle-close' });
+  } catch {
+    // SW 可能已回收；document 遲早由瀏覽器回收。
+  }
+}
+
+/** 空閒計時器（模組載入即啟動；每次活動 reset）。 */
+const idleTimeout = new IdleTimeout({
+  timeoutMs: IDLE_TIMEOUT_MS,
+  onTimeout: onIdleTimeout,
+});
 
 /** 啟動 tabCapture 音頻捕獲。 */
 async function startCapture(streamId: string, port: chrome.runtime.Port): Promise<void> {
@@ -61,6 +156,8 @@ async function startCapture(streamId: string, port: chrome.runtime.Port): Promis
     scriptProcessor.onaudioprocess = (event) => {
       const portRef = currentPort;
       if (!portRef) return;
+      // 音頻流動即活動——重置空閒計時（音頻活躍期間 offscreen 不得空閒關閉）。
+      markActivity();
       const inputData = event.inputBuffer.getChannelData(0);
       // 複製 Float32Array（事件回收後數據失效）。
       const pcm = new Float32Array(inputData.length);
@@ -125,6 +222,8 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'offscreen-asr') return;
 
   port.onMessage.addListener(async (msg: OffscreenRequest) => {
+    // ASR 捕獲相關消息也算活動——重置空閒計時。
+    markActivity();
     switch (msg.type) {
       case 'startCapture':
         await startCapture(msg.streamId, port);
@@ -143,46 +242,48 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 /**
- * 處理來自 Service Worker 轉發的 local-onnx 消息（通過 port 連接）。
+ * 處理來自 Service Worker 轉發的 local-onnx / asr-whisper 消息（通過 port 連接）。
  * 進度/狀態消息透過 chrome.runtime.sendMessage 廣播給所有 extension contexts（含 Options 頁面）。
  */
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
-  const msg = message as { topic?: string; type?: string };
+  const msg = message as { topic?: string; type?: string; payload?: { modelId?: string } };
   const type = msg.topic ?? msg.type;
-  if (!type?.startsWith('local-onnx:')) return false;
+  if (!type?.startsWith('local-onnx:') && !type?.startsWith('asr-whisper:')) return false;
+
+  // 本地模型消息即活動——重置空閒計時（翻譯/下載/狀態查詢都算活動）。
+  markActivity();
+
+  // in-flight 守衛：處理期間 busyCount 遞增，防止空閒關閉打斷（§5.5）。
+  busyCount += 1;
+  const respond = (result: OffscreenResponse): void => {
+    busyCount = Math.max(0, busyCount - 1);
+    sendResponse(result);
+    broadcastToAll(result);
+  };
 
   switch (type) {
     case 'local-onnx:check-status':
-      void checkModelStatus().then((status) => {
-        sendResponse(status);
-        broadcastToAll(status);
-      });
+      void checkModelStatus().then(respond);
       return true;
     case 'local-onnx:warmup':
       // M2-24 補充修復十三：手動/自動預加載——模型快取存在時載入記憶體，
       // 消除首次翻譯的 30-60s 載入延遲（此前首塊 request 超時被 SW 拒絕）。
-      void warmupModel().then((result) => {
-        sendResponse(result);
-        broadcastToAll(result);
-      });
+      void warmupModel().then(respond);
       return true;
     case 'local-onnx:download':
-      void downloadModel().then((result) => {
-        sendResponse(result);
-        // 廣播完成消息給所有 extension contexts（Options 頁面監聽）。
-        broadcastToAll(result);
-      });
+      // 下載模型（進度廣播完成消息給所有 extension contexts——Options 頁面監聽）。
+      void downloadModel().then(respond);
       return true;
     case 'local-onnx:clear-cache':
-      void clearModelCache().then((result) => {
-        sendResponse(result);
-        broadcastToAll(result);
-      });
+      void clearModelCache().then(respond);
       return true;
     case 'local-onnx:translate': {
       // 若 SW 轉發 port 通道已建立，本入口跳過——由 port 路徑處理，避免雙重推理
       // （chrome.runtime.sendMessage 會同時廣播給 SW 與 offscreen）。
-      if (onnxPortConnected) return false;
+      if (onnxPortConnected) {
+        busyCount = Math.max(0, busyCount - 1);
+        return false;
+      }
       const translateMsg = message as {
         topic: string;
         payload?: { text?: string; targetLang?: string; sourceLang?: string };
@@ -194,12 +295,18 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
         translateMsg.payload?.text ?? translateMsg.text ?? '',
         translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? '',
         translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
-      ).then((result) => {
-        sendResponse(result);
-        broadcastToAll(result);
-      });
+      ).then(respond);
       return true;
     }
+    case 'asr-whisper:check-status':
+      void checkAsrModelStatus(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
+      return true;
+    case 'asr-whisper:download':
+      void downloadAsrModel(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
+      return true;
+    case 'asr-whisper:clear-cache':
+      void clearAsrModelCache(msg.payload?.modelId).then(respond);
+      return true;
   }
   return false;
 });
@@ -218,13 +325,19 @@ function connectToServiceWorker(): void {
       topic?: string;
       type?: string;
       messageId?: string;
-      payload?: { text?: string; targetLang?: string; sourceLang?: string };
+      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string };
       text?: string;
       targetLang?: string;
       sourceLang?: string;
     };
     const type = msg.topic ?? msg.type;
     const messageId = msg.messageId;
+
+    // 經 SW 轉發的消息即活動——重置空閒計時。
+    markActivity();
+
+    // in-flight 守衛：處理期間 busyCount 遞增，防止空閒關閉打斷（§5.5）。
+    busyCount += 1;
 
     let result: unknown;
     let error: string | undefined;
@@ -256,11 +369,25 @@ function connectToServiceWorker(): void {
           );
           broadcastToAll(result as OffscreenResponse);
           break;
+        case 'asr-whisper:check-status':
+          result = await checkAsrModelStatus(msg.payload?.modelId ?? 'Xenova/whisper-base.en');
+          broadcastToAll(result as OffscreenResponse);
+          break;
+        case 'asr-whisper:download':
+          result = await downloadAsrModel(msg.payload?.modelId ?? 'Xenova/whisper-base.en');
+          broadcastToAll(result as OffscreenResponse);
+          break;
+        case 'asr-whisper:clear-cache':
+          result = await clearAsrModelCache(msg.payload?.modelId);
+          broadcastToAll(result as OffscreenResponse);
+          break;
         default:
           error = `Unknown message type: ${type}`;
       }
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
+    } finally {
+      busyCount = Math.max(0, busyCount - 1);
     }
 
     // 返回響應給 Service Worker。
@@ -276,6 +403,8 @@ function connectToServiceWorker(): void {
 
 // 啟動時建立 port 連接。
 connectToServiceWorker();
+// 啟動空閒計時器——document 存活期間監控活動，超時觸發資源釋放與關閉。
+idleTimeout.start();
 
 /** 廣播消息給所有 extension contexts（Options 頁面、content-script 等）。 */
 function broadcastToAll(response: OffscreenResponse): void {
@@ -310,6 +439,31 @@ let cacheGeneration = 0;
 
 /** 模型名稱（唯讀，預設為 Qwen2.5-0.5B）。 */
 const LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
+
+/**
+ * WebGPU 載入後端一次性失敗記憶（M2-26）——首次 webgpu 嘗試失敗後置 true，
+ * 後續載入直接走 wasm，避免每次載入都重試不可用的 webgpu（反覆失敗 + 延遲）。
+ * 僅影響本 Offscreen Document 生命週期；Document 重建後重置。
+ */
+let webgpuFailed = false;
+
+/**
+ * 決定模型載入後端設備——WebGPU 優先（權重進 GPU VRAM，不佔 extension 渲染進程
+ * JS 堆），無 WebGPU（`navigator.gpu` 缺失）或曾失敗時回退 WASM。
+ * WebGPU 將 ~350MB INT4 權重移出 extension 渲染進程，解除「popup/options 與
+ * offscreen 共用渲染進程被模型撐爆 → popup 打不開」的根因。
+ */
+function preferWebGpu(): boolean {
+  if (webgpuFailed) return false;
+  try {
+    return typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
+  } catch {
+    return false;
+  }
+}
+
+/** ASR Whisper pipeline 實例（僅用於下載，推理由 content-script 執行）。 */
+let asrPipeline: unknown = null;
 
 /** transformers.js 進度回調結構。 */
 interface TransformersProgress {
@@ -349,13 +503,13 @@ async function loadPipeline(
   const transformers = await import('@huggingface/transformers');
   const { pipeline, env } = transformers;
 
-  // 執行後端配置：WASM（WebGPU 可後續優化）。
+  // 執行後端配置：WASM（WebGPU 優先，見 preferWebGpu）。
   env.allowLocalModels = false;
   // 詳細日誌：輸出 [ort] 初始化與推理錯誤，便於診斷本地 ONNX 失敗根因（wasm trap / 記憶體 / 算子）。
   // 類型聲明缺失 logLevel，運行時為 transformers.js/ORT 共用 env 的有效字段。
   (env as unknown as { logLevel: string }).logLevel = 'info';
   // WASM 本地化：transformers.js v3 默認從 jsdelivr CDN 載入 wasm，
-  // 網絡不可達會導致 InferenceSession 初始化失敗。改指向擴充內資源。
+  // 網絡不可達會導致 InferenceSession 初始化失敗。改指向擴充內資源（webgpu 回退時仍需）。
   if (env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
     // numThreads 交由 transformers.js 自決：Offscreen 無 crossOriginIsolated 時自動降為 1，
@@ -364,11 +518,53 @@ async function loadPipeline(
 
   // 加載模型（首次會從 HuggingFace Hub 下載到 Cache API）。
   // dtype: 'q4' 下載 INT4 量化版（onnx/model_q4.onnx，約 350MB），避免默認 fp32 大檔。
-  return await pipeline('text-generation', LOCAL_MODEL_NAME, {
-    dtype: 'q4',
-    device: 'wasm',
-    ...(progressCallback ? { progress_callback: progressCallback } : {}),
-  });
+  // device: WebGPU 優先——權重放 GPU VRAM，不佔 extension 渲染進程 JS 堆（popup/options
+  // 與 offscreen 共用該進程，WASM 模型 ~500MB 會撐爆 → popup 打不開）。無 WebGPU /
+  // 曾失敗時回退 WASM（wasmPaths 已配置，翻譯不中斷）。
+  const device: 'webgpu' | 'wasm' = preferWebGpu() ? 'webgpu' : 'wasm';
+  try {
+    return await pipeline('text-generation', LOCAL_MODEL_NAME, {
+      dtype: 'q4',
+      device,
+      ...(progressCallback ? { progress_callback: progressCallback } : {}),
+    });
+  } catch (err) {
+    if (device !== 'webgpu') throw err;
+    // WebGPU 嘗試失敗（無 GPU/驅動問題/q4+webgpu 不支援）→ 記憶 + 落診斷 + 回退 WASM。
+    webgpuFailed = true;
+    console.warn('[AI_Trans] WebGPU 載入失敗，回退 WASM:', err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-webgpu-fallback',
+        recoverable: true,
+        cause: err instanceof Error ? err : new Error(String(err)),
+      },
+    });
+    return await pipeline('text-generation', LOCAL_MODEL_NAME, {
+      dtype: 'q4',
+      device: 'wasm',
+      ...(progressCallback ? { progress_callback: progressCallback } : {}),
+    });
+  }
+}
+
+/**
+ * 記錄當前 JS 堆使用量麵包屑（M2-26 儀器化）——便於實機驗證 WebGPU 前後
+ * extension 渲染進程記憶體差異。`performance.memory` 僅 Chrome 系有，守衛缺失環境。
+ */
+function logJsHeapBreadcrumb(label: string): void {
+  try {
+    const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+    if (mem) {
+      console.warn('[AI_Trans] %s | jsHeapMB=%d', label, Math.round(mem.usedJSHeapSize / 1048576));
+    } else {
+      console.warn('[AI_Trans] %s | jsHeapMB=unknown (performance.memory 缺失)', label);
+    }
+  } catch {
+    /* 麵包屑不影響主流程 */
+  }
 }
 
 /**
@@ -433,6 +629,8 @@ async function ensurePipelineLoaded(
           throw new ModelCacheClearedError();
         }
         translationPipeline = p;
+        // 麵包屑：模型載入完成後的 JS 堆記憶體（驗證 WebGPU 前後差異）。
+        logJsHeapBreadcrumb('local-onnx 模型已載入');
         return p;
       })
       .finally(() => {
@@ -694,6 +892,228 @@ async function clearModelCache(): Promise<OffscreenResponse> {
     });
     return {
       type: 'local-onnx:cache-cleared',
+      ok: false,
+    } satisfies OffscreenResponse;
+  }
+}
+
+// ============================================================
+// ASR Whisper 模型下載（Offscreen 側）
+// ============================================================
+
+/**
+ * 檢查指定的 Whisper 模型是否已緩存在 transformers-cache 中。
+ * 與翻譯模型區分：僅檢查 URL 包含特定 Whisper 模型 ID 的 .onnx 文件。
+ */
+async function hasAsrModelInCache(modelId: string): Promise<boolean> {
+  try {
+    const cachesApi = globalThis.caches;
+    if (typeof cachesApi === 'undefined' || typeof cachesApi.keys !== 'function') {
+      return false;
+    }
+    const cacheNames = await cachesApi.keys();
+    const target = cacheNames.find((name) => name === 'transformers-cache');
+    if (!target) return false;
+
+    const cache = await cachesApi.open(target);
+    const requests = await cache.keys();
+    return requests.some((r) => r.url.includes('.onnx') && r.url.includes(modelId));
+  } catch {
+    return false;
+  }
+}
+
+/** 檢查 ASR 模型狀態。 */
+async function checkAsrModelStatus(modelId: string): Promise<OffscreenResponse> {
+  try {
+    const downloaded = await hasAsrModelInCache(modelId);
+    return {
+      type: 'asr-whisper:status',
+      downloaded,
+      modelId,
+    } satisfies OffscreenResponse;
+  } catch (err) {
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'asr',
+        code: 'asr-whisper-status-check-failed',
+        recoverable: true,
+        cause: toReadableError(err),
+      },
+    });
+    return {
+      type: 'asr-whisper:status',
+      downloaded: false,
+      modelId,
+    } satisfies OffscreenResponse;
+  }
+}
+
+/** 下載 ASR Whisper 模型——使用 transformers.js pipeline 觸發下載到 Cache API。 */
+async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
+  try {
+    // 先檢查是否已緩存，避免重複下載。
+    if (await hasAsrModelInCache(modelId)) {
+      return {
+        type: 'asr-whisper:download-complete',
+        ok: true,
+      } satisfies OffscreenResponse;
+    }
+
+    const progressCallback = (progress: TransformersProgress): void => {
+      console.log('[AI_Trans:asr-whisper] progress_callback:', {
+        status: progress.status,
+        progress: progress.progress,
+        loaded: progress.loaded,
+        total: progress.total,
+        name: progress.name,
+        file: progress.file,
+      });
+
+      if (progress.status === 'progress' && progress.progress !== undefined) {
+        broadcastToAll({
+          type: 'asr-whisper:download-progress',
+          progress: progress.progress,
+          loaded: progress.loaded ?? 0,
+          total: progress.total ?? 0,
+        });
+      } else if (progress.status === 'initiate') {
+        console.log('[AI_Trans:asr-whisper] download initiated for:', progress.name ?? progress.file);
+        broadcastToAll({
+          type: 'asr-whisper:download-progress',
+          progress: 0,
+          loaded: 0,
+          total: progress.total ?? 0,
+        });
+      } else if (progress.status === 'ready') {
+        console.log('[AI_Trans:asr-whisper] model ready');
+        broadcastToAll({
+          type: 'asr-whisper:download-progress',
+          progress: 100,
+          loaded: progress.total ?? 0,
+          total: progress.total ?? 0,
+        });
+      }
+    };
+
+    const transformers = await import('@huggingface/transformers');
+    const { pipeline, env } = transformers;
+
+    // WASM 本地化（與翻譯模型共享 env 配置，但確保已設置）。
+    if (env.backends?.onnx?.wasm) {
+      env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
+    }
+
+    asrPipeline = await pipeline('automatic-speech-recognition', modelId, {
+      device: 'wasm',
+      progress_callback: progressCallback,
+    });
+
+    // 下載完成後 dispose pipeline——ASR 推理在 content-script 中執行，
+    // Offscreen 中的 pipeline 僅用於觸發下載，不需保留在記憶體。
+    if (asrPipeline) {
+      const candidate = asrPipeline as { dispose?: () => unknown | Promise<unknown> };
+      if (typeof candidate?.dispose === 'function') {
+        await candidate.dispose();
+      }
+      asrPipeline = null;
+    }
+
+    return {
+      type: 'asr-whisper:download-complete',
+      ok: true,
+    } satisfies OffscreenResponse;
+  } catch (err) {
+    const error = toReadableError(err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'asr',
+        code: 'asr-whisper-download-failed',
+        recoverable: true,
+        cause: error,
+      },
+    });
+    // 確保失敗時也清理 pipeline。
+    if (asrPipeline) {
+      try {
+        const candidate = asrPipeline as { dispose?: () => unknown | Promise<unknown> };
+        if (typeof candidate?.dispose === 'function') {
+          await candidate.dispose();
+        }
+      } catch { /* dispose 失敗不影響錯誤報告 */ }
+      asrPipeline = null;
+    }
+    return {
+      type: 'asr-whisper:download-complete',
+      ok: false,
+      error: error.message,
+    } satisfies OffscreenResponse;
+  }
+}
+
+/** 清除 ASR Whisper 模型緩存——僅刪除 Whisper 相關緩存，不影響翻譯模型。 */
+async function clearAsrModelCache(modelId?: string): Promise<OffscreenResponse> {
+  try {
+    // 先 dispose 已有的 ASR pipeline。
+    if (asrPipeline) {
+      const candidate = asrPipeline as { dispose?: () => unknown | Promise<unknown> };
+      if (typeof candidate?.dispose === 'function') {
+        await candidate.dispose();
+      }
+      asrPipeline = null;
+    }
+
+    // 清除 Cache API 中 Whisper 相關的緩存。
+    if (typeof caches !== 'undefined') {
+      const keys = await caches.keys();
+      for (const key of keys) {
+        if (key.includes('transformers') || key.includes('huggingface')) {
+          const cache = await caches.open(key);
+          const requests = await cache.keys();
+          for (const req of requests) {
+            const url = req.url;
+            const shouldDelete = modelId
+              ? (url.includes('.onnx') && url.includes(modelId))
+              : (url.includes('whisper') || url.includes('Xenova/whisper'));
+            if (shouldDelete) {
+              await cache.delete(req);
+            }
+          }
+        }
+      }
+    }
+
+    // 清除 IndexedDB 中 Whisper 相關的數據庫。
+    const dbs = await indexedDB.databases();
+    for (const db of dbs) {
+      if (db.name === 'transformers-cache' || db.name === 'transformers') {
+        // 對於 IndexedDB，我們無法精確按條目刪除，所以僅在有具體 modelId 時
+        // 嘗試刪除整個數據庫（與翻譯模型共享時這會有副作用）。
+        // 無 modelId 時不刪 IndexedDB 以避免誤刪翻譯模型。
+        if (modelId) {
+          indexedDB.deleteDatabase(db.name);
+        }
+      }
+    }
+
+    return {
+      type: 'asr-whisper:cache-cleared',
+      ok: true,
+    } satisfies OffscreenResponse;
+  } catch (err) {
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'asr',
+        code: 'asr-whisper-cache-clear-failed',
+        recoverable: true,
+        cause: err instanceof Error ? err : new Error(String(err)),
+      },
+    });
+    return {
+      type: 'asr-whisper:cache-cleared',
       ok: false,
     } satisfies OffscreenResponse;
   }
@@ -1009,6 +1429,11 @@ export function resetLocalOnnxModuleForTest(): void {
   loadPromise = null;
   loadPromiseHasProgress = false;
   cacheGeneration = 0;
+  // 重置空閒生命週期狀態（避免測試間互相污染）。
+  busyCount = 0;
+  idleCloseRequested = false;
+  // 重置 WebGPU 失敗記憶（M2-26；避免測試間互相污染）。
+  webgpuFailed = false;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -1022,4 +1447,11 @@ export const _testExports = {
   buildPrompt,
   parseNumberedOutput,
   warmupModel,
+  shutdownForIdle,
+  // M2-26：WebGPU 設備決策（供測試驗證 webgpu/wasm 選擇與回退）。
+  preferWebGpu,
+  // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。
+  get webgpuFailed(): boolean {
+    return webgpuFailed;
+  },
 };

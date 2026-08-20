@@ -48479,6 +48479,53 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
 
+  // src/infrastructure/idle-timeout.ts
+  var IdleTimeout = class {
+    constructor(opts) {
+      this.opts = opts;
+      this.lastActivityMs = this.now();
+    }
+    opts;
+    timer = null;
+    lastActivityMs;
+    stopped = false;
+    now() {
+      return this.opts.now ? this.opts.now() : Date.now();
+    }
+    /** 開始計時（重複調用無害；stop 後無效）。 */
+    start() {
+      if (this.stopped) return;
+      this.schedule();
+    }
+    /** 標記一次活動：刷新最後活動時間並重新排程（§5.4：不重複註冊計時器）。 */
+    reset() {
+      if (this.stopped) return;
+      this.lastActivityMs = this.now();
+      this.schedule();
+    }
+    /** 立即判斷是否已空閒（供測試/外部檢查）。 */
+    isIdle() {
+      return this.now() - this.lastActivityMs >= this.opts.timeoutMs;
+    }
+    /** 停止計時（一次性；stop 後 reset 不再生效）。 */
+    stop() {
+      this.stopped = true;
+      if (this.timer !== null) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+    }
+    schedule() {
+      if (this.timer !== null) clearTimeout(this.timer);
+      const remaining = Math.max(0, this.lastActivityMs + this.opts.timeoutMs - this.now());
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        if (this.stopped) return;
+        this.opts.onTimeout();
+      }, remaining);
+    }
+  };
+
   // src/domain/models/config.ts
   var DEFAULT_LOCAL_TRANSLATION_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
 
@@ -48487,6 +48534,58 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var audioContext = null;
   var scriptProcessor = null;
   var currentPort = null;
+  var IDLE_TIMEOUT_MS = 10 * 60 * 1e3;
+  var IDLE_RETRY_MS = 3e4;
+  var busyCount = 0;
+  var idleCloseRequested = false;
+  function markActivity() {
+    idleTimeout.reset();
+  }
+  function onIdleTimeout() {
+    if (busyCount > 0) {
+      setTimeout(onIdleTimeout, IDLE_RETRY_MS);
+      return;
+    }
+    void shutdownForIdle();
+  }
+  async function shutdownForIdle() {
+    if (idleCloseRequested) return;
+    idleCloseRequested = true;
+    idleTimeout.stop();
+    console.warn("[AI_Trans] offscreen idle timeout \u2014 releasing resources and closing document");
+    logJsHeapBreadcrumb("offscreen \u7A7A\u9592\u91CB\u653E\u524D");
+    try {
+      await stopCapture();
+    } catch (err) {
+      console.warn("[AI_Trans] offscreen idle stopCapture failed:", err);
+    }
+    if (translationPipeline !== null) {
+      try {
+        await disposePipeline(translationPipeline);
+      } catch (err) {
+        console.warn("[AI_Trans] offscreen idle dispose translation pipeline failed:", err);
+      }
+      translationPipeline = null;
+    }
+    if (asrPipeline !== null) {
+      try {
+        const candidate = asrPipeline;
+        if (typeof candidate?.dispose === "function") {
+          await candidate.dispose();
+        }
+      } catch {
+      }
+      asrPipeline = null;
+    }
+    try {
+      await chrome.runtime.sendMessage({ topic: "offscreen:idle-close" });
+    } catch {
+    }
+  }
+  var idleTimeout = new IdleTimeout({
+    timeoutMs: IDLE_TIMEOUT_MS,
+    onTimeout: onIdleTimeout
+  });
   async function startCapture(streamId, port) {
     await stopCapture();
     try {
@@ -48507,6 +48606,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       scriptProcessor.onaudioprocess = (event) => {
         const portRef = currentPort;
         if (!portRef) return;
+        markActivity();
         const inputData = event.inputBuffer.getChannelData(0);
         const pcm = new Float32Array(inputData.length);
         pcm.set(inputData);
@@ -48561,6 +48661,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   chrome.runtime.onConnect.addListener((port) => {
     if (port.name !== "offscreen-asr") return;
     port.onMessage.addListener(async (msg) => {
+      markActivity();
       switch (msg.type) {
         case "startCapture":
           await startCapture(msg.streamId, port);
@@ -48578,45 +48679,49 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const msg = message;
     const type = msg.topic ?? msg.type;
-    if (!type?.startsWith("local-onnx:")) return false;
+    if (!type?.startsWith("local-onnx:") && !type?.startsWith("asr-whisper:")) return false;
+    markActivity();
+    busyCount += 1;
+    const respond = (result) => {
+      busyCount = Math.max(0, busyCount - 1);
+      sendResponse(result);
+      broadcastToAll(result);
+    };
     switch (type) {
       case "local-onnx:check-status":
-        void checkModelStatus().then((status) => {
-          sendResponse(status);
-          broadcastToAll(status);
-        });
+        void checkModelStatus().then(respond);
         return true;
       case "local-onnx:warmup":
-        void warmupModel().then((result) => {
-          sendResponse(result);
-          broadcastToAll(result);
-        });
+        void warmupModel().then(respond);
         return true;
       case "local-onnx:download":
-        void downloadModel().then((result) => {
-          sendResponse(result);
-          broadcastToAll(result);
-        });
+        void downloadModel().then(respond);
         return true;
       case "local-onnx:clear-cache":
-        void clearModelCache().then((result) => {
-          sendResponse(result);
-          broadcastToAll(result);
-        });
+        void clearModelCache().then(respond);
         return true;
       case "local-onnx:translate": {
-        if (onnxPortConnected) return false;
+        if (onnxPortConnected) {
+          busyCount = Math.max(0, busyCount - 1);
+          return false;
+        }
         const translateMsg = message;
         void runInference(
           translateMsg.payload?.text ?? translateMsg.text ?? "",
           translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? "",
           translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
-        ).then((result) => {
-          sendResponse(result);
-          broadcastToAll(result);
-        });
+        ).then(respond);
         return true;
       }
+      case "asr-whisper:check-status":
+        void checkAsrModelStatus(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(respond);
+        return true;
+      case "asr-whisper:download":
+        void downloadAsrModel(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(respond);
+        return true;
+      case "asr-whisper:clear-cache":
+        void clearAsrModelCache(msg.payload?.modelId).then(respond);
+        return true;
     }
     return false;
   });
@@ -48628,6 +48733,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const msg = message;
       const type = msg.topic ?? msg.type;
       const messageId = msg.messageId;
+      markActivity();
+      busyCount += 1;
       let result;
       let error;
       try {
@@ -48656,11 +48763,25 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             );
             broadcastToAll(result);
             break;
+          case "asr-whisper:check-status":
+            result = await checkAsrModelStatus(msg.payload?.modelId ?? "Xenova/whisper-base.en");
+            broadcastToAll(result);
+            break;
+          case "asr-whisper:download":
+            result = await downloadAsrModel(msg.payload?.modelId ?? "Xenova/whisper-base.en");
+            broadcastToAll(result);
+            break;
+          case "asr-whisper:clear-cache":
+            result = await clearAsrModelCache(msg.payload?.modelId);
+            broadcastToAll(result);
+            break;
           default:
             error = `Unknown message type: ${type}`;
         }
       } catch (err) {
         error = err instanceof Error ? err.message : String(err);
+      } finally {
+        busyCount = Math.max(0, busyCount - 1);
       }
       port.postMessage({ messageId, result, error });
     });
@@ -48670,6 +48791,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     });
   }
   connectToServiceWorker();
+  idleTimeout.start();
   function broadcastToAll(response) {
     try {
       chrome.runtime.sendMessage(response).catch(() => {
@@ -48682,6 +48804,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var loadPromiseHasProgress = false;
   var cacheGeneration = 0;
   var LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
+  var webgpuFailed = false;
+  function preferWebGpu() {
+    if (webgpuFailed) return false;
+    try {
+      return typeof navigator !== "undefined" && "gpu" in navigator && Boolean(navigator.gpu);
+    } catch {
+      return false;
+    }
+  }
+  var asrPipeline = null;
   function toReadableError(err) {
     if (err instanceof Error) {
       const code = err.code;
@@ -48699,11 +48831,43 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     if (env3.backends?.onnx?.wasm) {
       env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
     }
-    return await pipeline("text-generation", LOCAL_MODEL_NAME, {
-      dtype: "q4",
-      device: "wasm",
-      ...progressCallback ? { progress_callback: progressCallback } : {}
-    });
+    const device = preferWebGpu() ? "webgpu" : "wasm";
+    try {
+      return await pipeline("text-generation", LOCAL_MODEL_NAME, {
+        dtype: "q4",
+        device,
+        ...progressCallback ? { progress_callback: progressCallback } : {}
+      });
+    } catch (err) {
+      if (device !== "webgpu") throw err;
+      webgpuFailed = true;
+      console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-webgpu-fallback",
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err))
+        }
+      });
+      return await pipeline("text-generation", LOCAL_MODEL_NAME, {
+        dtype: "q4",
+        device: "wasm",
+        ...progressCallback ? { progress_callback: progressCallback } : {}
+      });
+    }
+  }
+  function logJsHeapBreadcrumb(label) {
+    try {
+      const mem = performance.memory;
+      if (mem) {
+        console.warn("[AI_Trans] %s | jsHeapMB=%d", label, Math.round(mem.usedJSHeapSize / 1048576));
+      } else {
+        console.warn("[AI_Trans] %s | jsHeapMB=unknown (performance.memory \u7F3A\u5931)", label);
+      }
+    } catch {
+    }
   }
   var ModelCacheClearedError = class extends Error {
     constructor() {
@@ -48738,6 +48902,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           throw new ModelCacheClearedError();
         }
         translationPipeline = p;
+        logJsHeapBreadcrumb("local-onnx \u6A21\u578B\u5DF2\u8F09\u5165");
         return p;
       }).finally(() => {
         if (loadPromise === promise) {
@@ -48935,6 +49100,190 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       });
       return {
         type: "local-onnx:cache-cleared",
+        ok: false
+      };
+    }
+  }
+  async function hasAsrModelInCache(modelId) {
+    try {
+      const cachesApi = globalThis.caches;
+      if (typeof cachesApi === "undefined" || typeof cachesApi.keys !== "function") {
+        return false;
+      }
+      const cacheNames = await cachesApi.keys();
+      const target = cacheNames.find((name) => name === "transformers-cache");
+      if (!target) return false;
+      const cache = await cachesApi.open(target);
+      const requests = await cache.keys();
+      return requests.some((r) => r.url.includes(".onnx") && r.url.includes(modelId));
+    } catch {
+      return false;
+    }
+  }
+  async function checkAsrModelStatus(modelId) {
+    try {
+      const downloaded = await hasAsrModelInCache(modelId);
+      return {
+        type: "asr-whisper:status",
+        downloaded,
+        modelId
+      };
+    } catch (err) {
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "asr",
+          code: "asr-whisper-status-check-failed",
+          recoverable: true,
+          cause: toReadableError(err)
+        }
+      });
+      return {
+        type: "asr-whisper:status",
+        downloaded: false,
+        modelId
+      };
+    }
+  }
+  async function downloadAsrModel(modelId) {
+    try {
+      if (await hasAsrModelInCache(modelId)) {
+        return {
+          type: "asr-whisper:download-complete",
+          ok: true
+        };
+      }
+      const progressCallback = (progress) => {
+        console.log("[AI_Trans:asr-whisper] progress_callback:", {
+          status: progress.status,
+          progress: progress.progress,
+          loaded: progress.loaded,
+          total: progress.total,
+          name: progress.name,
+          file: progress.file
+        });
+        if (progress.status === "progress" && progress.progress !== void 0) {
+          broadcastToAll({
+            type: "asr-whisper:download-progress",
+            progress: progress.progress,
+            loaded: progress.loaded ?? 0,
+            total: progress.total ?? 0
+          });
+        } else if (progress.status === "initiate") {
+          console.log("[AI_Trans:asr-whisper] download initiated for:", progress.name ?? progress.file);
+          broadcastToAll({
+            type: "asr-whisper:download-progress",
+            progress: 0,
+            loaded: 0,
+            total: progress.total ?? 0
+          });
+        } else if (progress.status === "ready") {
+          console.log("[AI_Trans:asr-whisper] model ready");
+          broadcastToAll({
+            type: "asr-whisper:download-progress",
+            progress: 100,
+            loaded: progress.total ?? 0,
+            total: progress.total ?? 0
+          });
+        }
+      };
+      const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
+      const { pipeline, env: env3 } = transformers;
+      if (env3.backends?.onnx?.wasm) {
+        env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
+      }
+      asrPipeline = await pipeline("automatic-speech-recognition", modelId, {
+        device: "wasm",
+        progress_callback: progressCallback
+      });
+      if (asrPipeline) {
+        const candidate = asrPipeline;
+        if (typeof candidate?.dispose === "function") {
+          await candidate.dispose();
+        }
+        asrPipeline = null;
+      }
+      return {
+        type: "asr-whisper:download-complete",
+        ok: true
+      };
+    } catch (err) {
+      const error = toReadableError(err);
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "asr",
+          code: "asr-whisper-download-failed",
+          recoverable: true,
+          cause: error
+        }
+      });
+      if (asrPipeline) {
+        try {
+          const candidate = asrPipeline;
+          if (typeof candidate?.dispose === "function") {
+            await candidate.dispose();
+          }
+        } catch {
+        }
+        asrPipeline = null;
+      }
+      return {
+        type: "asr-whisper:download-complete",
+        ok: false,
+        error: error.message
+      };
+    }
+  }
+  async function clearAsrModelCache(modelId) {
+    try {
+      if (asrPipeline) {
+        const candidate = asrPipeline;
+        if (typeof candidate?.dispose === "function") {
+          await candidate.dispose();
+        }
+        asrPipeline = null;
+      }
+      if (typeof caches !== "undefined") {
+        const keys = await caches.keys();
+        for (const key of keys) {
+          if (key.includes("transformers") || key.includes("huggingface")) {
+            const cache = await caches.open(key);
+            const requests = await cache.keys();
+            for (const req of requests) {
+              const url = req.url;
+              const shouldDelete = modelId ? url.includes(".onnx") && url.includes(modelId) : url.includes("whisper") || url.includes("Xenova/whisper");
+              if (shouldDelete) {
+                await cache.delete(req);
+              }
+            }
+          }
+        }
+      }
+      const dbs = await indexedDB.databases();
+      for (const db of dbs) {
+        if (db.name === "transformers-cache" || db.name === "transformers") {
+          if (modelId) {
+            indexedDB.deleteDatabase(db.name);
+          }
+        }
+      }
+      return {
+        type: "asr-whisper:cache-cleared",
+        ok: true
+      };
+    } catch (err) {
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "asr",
+          code: "asr-whisper-cache-clear-failed",
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err))
+        }
+      });
+      return {
+        type: "asr-whisper:cache-cleared",
         ok: false
       };
     }
@@ -49164,6 +49513,9 @@ ${numbered}
     loadPromise = null;
     loadPromiseHasProgress = false;
     cacheGeneration = 0;
+    busyCount = 0;
+    idleCloseRequested = false;
+    webgpuFailed = false;
   }
   var _testExports = {
     hasModelInCache,
@@ -49174,7 +49526,14 @@ ${numbered}
     ensurePipelineLoaded,
     buildPrompt,
     parseNumberedOutput,
-    warmupModel
+    warmupModel,
+    shutdownForIdle,
+    // M2-26：WebGPU 設備決策（供測試驗證 webgpu/wasm 選擇與回退）。
+    preferWebGpu,
+    // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。
+    get webgpuFailed() {
+      return webgpuFailed;
+    }
   };
 })();
 /*! Bundled license information:

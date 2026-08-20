@@ -10,7 +10,8 @@
     content: false,
     bridge: false,
     interceptor: false,
-    "local-onnx": false
+    "local-onnx": false,
+    popup: false
   };
 
   // src/infrastructure/debug-log.ts

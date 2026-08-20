@@ -76,3 +76,107 @@ describe('Service Worker — §5.6 配置路由失敗響應', () => {
     expect(listener({ topic: 'unknown' }, {}, vi.fn())).toBe(false);
   });
 });
+
+describe('Service Worker — offscreen 空閒關閉（M2-25）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+  });
+
+  function getListener(): (msg: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => boolean {
+    const chromeMock = chrome as unknown as {
+      runtime: {
+        onMessage: {
+          addListener: ReturnType<typeof vi.fn>;
+        };
+      };
+    };
+    return chromeMock.runtime.onMessage.addListener.mock.calls[0][0];
+  }
+
+  it('offscreen:idle-close → 調用 chrome.offscreen.closeDocument 並清空 port', async () => {
+    await loadWorker();
+    const listener = getListener();
+    const closeDocMock = chrome.offscreen.closeDocument as ReturnType<typeof vi.fn>;
+    expect(listener({ topic: 'offscreen:idle-close' }, {}, vi.fn())).toBe(false);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(closeDocMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('offscreen:idle-close 關閉失敗 → 落診斷（§5.6 不靜默）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    (chrome.offscreen.closeDocument as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('offscreen already closed')
+    );
+    listener({ topic: 'offscreen:idle-close' }, {}, vi.fn());
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    const rec = stored.lastDiagnostic as { message?: string } | undefined;
+    expect(rec?.message).toBeDefined();
+    expect(rec!.message).toContain('offscreen already closed');
+  });
+});
+
+// M2-26：SW 生命週期麵包屑（空閒回收/重啟可見）+ offscreen created。
+describe('Service Worker — 生命週期麵包屑（M2-26）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+  });
+
+  function getLifecycleListener(event: 'onStartup' | 'onInstalled' | 'onSuspend'): () => void {
+    const chromeMock = chrome as unknown as {
+      runtime: Record<string, { addListener: ReturnType<typeof vi.fn> }>;
+    };
+    const addListenerMock = chromeMock.runtime[event].addListener;
+    expect(addListenerMock).toHaveBeenCalled();
+    return addListenerMock.mock.calls[0][0] as () => void;
+  }
+
+  it('onStartup / onInstalled / onSuspend → console.warn 麵包屑', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await loadWorker();
+
+    getLifecycleListener('onStartup')();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SW onStartup'));
+
+    getLifecycleListener('onInstalled')();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SW onInstalled'));
+
+    getLifecycleListener('onSuspend')();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SW onSuspend'));
+
+    warnSpy.mockRestore();
+  });
+
+  it('offscreen created → console.warn 麵包屑（createDocument 前）', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await loadWorker();
+
+    const addListenerMock = (chrome.runtime.onMessage.addListener as ReturnType<typeof vi.fn>);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const listener = addListenerMock.mock.calls[0][0] as any;
+
+    // 觸發一個需要 ensureOffscreenDocument 的路徑（local-onnx: 轉發）。
+    listener({ topic: 'local-onnx:check-status' }, {}, vi.fn());
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('offscreen created'));
+    warnSpy.mockRestore();
+  });
+});
+
+// M2-26 補充：移除 manifest `commands` 鍵後，真實 Chrome 不再注入 `chrome.commands`
+// 命名空間（undefined）。頂層未守衛的 `chrome.commands.onCommand` 引用會令 SW 註冊失敗
+// （status 15）。jsdom mock 與 E2E Chromium 都注入該命名空間，唯有此回歸測試貼近真實。
+describe('Service Worker — chrome.commands 未定義仍可求值（M2-26 補充）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    // 模擬真實 Chrome：manifest 無 commands 鍵 → chrome.commands 命名空間被裁剪。
+    delete (chrome as unknown as { commands?: unknown }).commands;
+  });
+
+  it('SW 模組頂層求值不依賴 chrome.commands（不拋 TypeError）', async () => {
+    expect((chrome as unknown as { commands?: unknown }).commands).toBeUndefined();
+    await expect(loadWorker()).resolves.not.toThrow();
+  });
+});

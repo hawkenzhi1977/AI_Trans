@@ -28,6 +28,9 @@ const chromeMock = {
   runtime: {
     getURL: vi.fn((path: string) => `chrome-extension://fake/${path}`),
     getManifest: vi.fn(() => ({ version: '0.2.0' })),
+    // M2-26：SW ensureOffscreenDocument 用；返空上下文 → 觸發 createDocument。
+    getContexts: vi.fn(async () => [] as unknown[]),
+    ContextType: { OFFSCREEN_DOCUMENT: 'OFFSCREEN_DOCUMENT' },
     onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
     onConnect: { addListener: vi.fn(), removeListener: vi.fn() },
     sendMessage: vi.fn(),
@@ -38,7 +41,16 @@ const chromeMock = {
       onDisconnect: { addListener: vi.fn(), removeListener: vi.fn() },
       disconnect: vi.fn(),
     })),
+    // M2-26：SW 生命週期事件（麵包屑測試用）；add 為 vi.fn() 供取出監聽器驅動。
+    onStartup: { addListener: vi.fn(), removeListener: vi.fn() },
+    onInstalled: { addListener: vi.fn(), removeListener: vi.fn() },
+    onSuspend: { addListener: vi.fn(), removeListener: vi.fn() },
     lastError: undefined,
+  },
+  offscreen: {
+    createDocument: vi.fn(async () => {}),
+    closeDocument: vi.fn(async () => {}),
+    Reason: { USER_MEDIA: 'USER_MEDIA' },
   },
   tabs: {
     query: vi.fn(async () => []),

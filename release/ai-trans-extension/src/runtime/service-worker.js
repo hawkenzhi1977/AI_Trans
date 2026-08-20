@@ -8,7 +8,8 @@ var DEBUG_LOG_OFF = {
   content: false,
   bridge: false,
   interceptor: false,
-  "local-onnx": false
+  "local-onnx": false,
+  popup: false
 };
 var DEFAULT_CONFIG = {
   translation: { type: "cloud-llm", fallbackType: "mt" },
@@ -69,6 +70,75 @@ var ChromeStorageConfigStore = class _ChromeStorageConfigStore {
   }
 };
 
+// src/infrastructure/diagnostics.ts
+var DIAGNOSTIC_KEY = "lastDiagnostic";
+function extractDiagnostic(e) {
+  switch (e.type) {
+    case "engine-degraded":
+      if (e.port === "translation" || e.port === "asr") {
+        return { kind: "degraded", message: e.reason };
+      }
+      return void 0;
+    case "pipeline-error":
+      return { kind: "error", message: formatCause(e.error.cause) };
+    default:
+      return void 0;
+  }
+}
+function formatCause(cause) {
+  if (cause instanceof Error) {
+    return `${cause.name}: ${cause.message}`;
+  }
+  return String(cause ?? "unknown error");
+}
+function isUserActionable(message) {
+  const patterns = [
+    // 網絡錯誤
+    "Failed to fetch",
+    "NetworkError",
+    "CORS",
+    "Mixed Content",
+    "net::ERR_",
+    // HTTP 狀態碼
+    "401",
+    "403",
+    "404",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    // 權限類
+    "tab-capture-not-authorized",
+    "not authorized",
+    "permission",
+    "access denied",
+    // 配置類
+    "model",
+    "endpoint",
+    "API key",
+    "not found",
+    "invalid"
+  ];
+  const lower = message.toLowerCase();
+  return patterns.some((p) => lower.includes(p.toLowerCase()));
+}
+async function recordDiagnostic(e) {
+  const diag = extractDiagnostic(e);
+  if (!diag) return;
+  const record = {
+    kind: diag.kind,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+    message: diag.message,
+    actionable: isUserActionable(diag.message)
+  };
+  console.warn(`[AI_Trans] translation degraded: ${diag.message}`);
+  try {
+    await chrome.storage.local.set({ [DIAGNOSTIC_KEY]: record });
+  } catch {
+  }
+}
+
 // src/runtime/service-worker.ts
 var store = new ChromeStorageConfigStore();
 void store.get();
@@ -81,6 +151,7 @@ async function ensureOffscreenDocument() {
     documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
   });
   if (existingContexts.length > 0) return;
+  console.warn("[AI_Trans:sw] offscreen created");
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
     reasons: [chrome.offscreen.Reason.USER_MEDIA],
@@ -163,6 +234,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     );
     return true;
   }
+  if (msg.topic === "offscreen:idle-close") {
+    chrome.offscreen.closeDocument().then(() => {
+      offscreenPort = null;
+      console.warn("[AI_Trans] offscreen document closed after idle timeout");
+    }).catch((err) => {
+      const cause = err instanceof Error ? err : new Error(String(err));
+      console.warn("[AI_Trans] offscreen closeDocument failed:", cause);
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "audio",
+          code: "offscreen-close-failed",
+          recoverable: true,
+          cause
+        }
+      });
+    });
+    return false;
+  }
   if (msg.topic?.startsWith("local-onnx:")) {
     void sendToOffscreen(msg).then((result) => sendResponse({ ok: true, result })).catch(
       (err) => sendResponse({
@@ -172,6 +262,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     );
     return true;
   }
+  if (msg.topic?.startsWith("asr-whisper:")) {
+    void sendToOffscreen(msg).then((result) => sendResponse({ ok: true, result })).catch(
+      (err) => sendResponse({
+        ok: false,
+        error: `asr-whisper operation failed: ${err instanceof Error ? err.message : String(err)}`
+      })
+    );
+    return true;
+  }
   return false;
 });
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => console.warn("[AI_Trans:sw] SW onStartup"));
+}
+if (chrome.runtime.onInstalled) {
+  chrome.runtime.onInstalled.addListener(() => console.warn("[AI_Trans:sw] SW onInstalled"));
+}
+if (chrome.runtime.onSuspend) {
+  chrome.runtime.onSuspend.addListener(() => console.warn("[AI_Trans:sw] SW onSuspend"));
+}
 

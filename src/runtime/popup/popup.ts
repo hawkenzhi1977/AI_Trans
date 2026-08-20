@@ -10,22 +10,123 @@ import { DEFAULT_CONFIG } from '../../domain/models/config';
 
 const store = new ChromeStorageConfigStore();
 
+const OPTIONS_URL = chrome.runtime.getURL('src/runtime/options/options.html');
+
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
   if (!el) throw new Error(`missing #${id}`);
   return el;
 }
 
+/** 將關鍵事件寫入 popup 底部 DOM 診斷區，讓用戶肉眼可見 popup 是否執行、按鈕點擊是否觸發。 */
+function popupDiag(msg: string): void {
+  const el = document.getElementById('popup-diag-dom');
+  if (!el) return;
+  const ts = new Date().toISOString().slice(11, 19);
+  const line = `${ts} ${msg}`;
+  el.textContent = el.textContent ? `${el.textContent}\n${line}` : line;
+  console.log(`[AI_Trans:popup:diag] ${msg}`);
+}
+
+// M2-26 可觀測性：popup init watchdog（§5.6「字幕沒出來」可追溯）。
+// slow（>3s）：僅落 breadcrumb 診斷提醒「初始化慢」；timeout（10s）：popup 通常已被用戶關閉，
+// 但仍持續落持久化診斷（storage），下次打開可見「上次 init 未完成」，定位是否被 offscreen 模型 OOM 拖累。
+const INIT_SLOW_MS = 3000;
+const INIT_TIMEOUT_MS = 10000;
+let initSlowFired = false;
+let initTimer: ReturnType<typeof setTimeout> | undefined;
+let initTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+function startInitWatchdog(): void {
+  initTimer = setTimeout(() => {
+    if (initSlowFired) return;
+    initSlowFired = true;
+    console.warn('[AI_Trans:popup] init-slow | >3s，可能被 offscreen 模型載入/OOM 拖累');
+    popupDiag('init-slow >3s');
+    void recordDiagnostic({
+      type: 'pipeline-error',
+      error: { port: 'platform', code: 'popup-init-slow', recoverable: true, cause: new Error('popup init exceeded 3s') },
+    });
+  }, INIT_SLOW_MS);
+  initTimeoutTimer = setTimeout(fireInitTimeout, INIT_TIMEOUT_MS);
+}
+
+function stopInitWatchdog(): void {
+  if (initTimer !== undefined) {
+    clearTimeout(initTimer);
+    initTimer = undefined;
+  }
+  if (initTimeoutTimer !== undefined) {
+    clearTimeout(initTimeoutTimer);
+    initTimeoutTimer = undefined;
+  }
+}
+
+function fireInitTimeout(): void {
+  // timeout 是比 slow 更嚴重的事件，獨立記錄（不受 slow 已觸發影響）；
+  // 單一 setTimeout 只 fire 一次，無需額外冪等守衛。
+  console.error('[AI_Trans:popup] init-timeout | >10s，init 未返回（極可能進程被 OOM/掛起）');
+  popupDiag('init-timeout >10s');
+  void recordDiagnostic({
+    type: 'pipeline-error',
+    error: { port: 'platform', code: 'popup-init-timeout', recoverable: true, cause: new Error('popup init did not complete within 10s') },
+  });
+}
+
+// watchdog 在 init() 開頭啟動（與 t0 對齊），完成/早退時 stopInitWatchdog。
+// 不放在 module load：避免 vi.resetModules 重載時舊實例計時器殘留污染後續測試。
+
+/** 用 chrome.tabs API 打開/激活 Options 頁面，替代 chrome.runtime.openOptionsPage()。
+ *  openOptionsPage() 依賴 Chrome 內部追蹤 tab 狀態，長時間播放後可能靜默失敗。
+ *  改用 tabs.query + tabs.create / tabs.update 更可控。 */
+async function openOptionsPage(): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({ url: OPTIONS_URL });
+    if (tabs.length > 0 && tabs[0].id != null) {
+      await chrome.tabs.update(tabs[0].id, { active: true });
+      popupDiag('options tab focused');
+    } else {
+      await chrome.tabs.create({ url: OPTIONS_URL });
+      popupDiag('options tab created');
+    }
+  } catch (err) {
+    popupDiag(`options open failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function init(): Promise<void> {
   // §5.6：storage 讀取失敗不能使 popup 整頁無聲不可用（void init 的 rejection 會靜默消失）。
   // 失敗時顯示錯誤狀態而不是卡在空白。
+  const t0 = performance.now();
+  console.log('[AI_Trans:popup] init-start | elapsed=0ms');
+  popupDiag('init-start');
+  startInitWatchdog(); // M2-26：與 t0 對齊啟動 slow/timeout 計時
+
+  // 立即綁定「設定」按鈕——不依賴任何 async 數據，避免 storage 讀取阻塞期間用戶點擊無響應。
+  // 播放期間 content-script 頻繁寫入 diagnostics 到 storage，導致 store.get() 可能阻塞數秒，
+  // 若此 handler 在 store.get() 之後才綁定，用戶點擊只會觸發瀏覽器默認 focus/defocus。
+  $('btn-options').addEventListener('click', () => {
+    console.log('[AI_Trans:popup] btn-options-click | elapsed=%dms', performance.now() - t0);
+    popupDiag('btn-options clicked');
+    void openOptionsPage();
+  });
+
   let config: EngineConfig;
+  console.log('[AI_Trans:popup] store-get-start | elapsed=%dms', performance.now() - t0);
   try {
     config = await store.get();
+    console.log('[AI_Trans:popup] store-get-done | elapsed=%dms | type=%s',
+      performance.now() - t0, config.translation.type);
+    popupDiag('store-get done');
   } catch (err) {
+    console.warn('[AI_Trans:popup] store-get-error | elapsed=%dms | %s',
+      performance.now() - t0,
+      err instanceof Error ? err.message : String(err));
+    popupDiag(`store-get error: ${err instanceof Error ? err.message : String(err)}`);
     $('status-diagnostic').textContent = `最近失敗: 錯誤: 配置讀取失敗: ${err instanceof Error ? err.message : String(err)}`;
     $('status-diagnostic').classList.add('warn');
     bindActions(configFallback());
+    stopInitWatchdog(); // M2-26：早退也視為完成，停止 slow/timeout 計時
     return;
   }
 
@@ -37,13 +138,17 @@ async function init(): Promise<void> {
   // DevTools 仍保留所有記錄，popup 過濾內部調測信息。
   // 舊記錄無 actionable 字段時默認顯示（向後兼容）。
   let diagText: string | undefined;
+  console.log('[AI_Trans:popup] diag-read-start | elapsed=%dms', performance.now() - t0);
   try {
     const diag = await readLastDiagnostic();
+    console.log('[AI_Trans:popup] diag-read-done | elapsed=%dms | hasDiag=%s',
+      performance.now() - t0, diag ? 'yes' : 'no');
     // 僅顯示 actionable 的錯誤（undefined 視為 true，兼容舊記錄）
     if (diag && diag.actionable !== false) {
       diagText = formatDiagnostic(diag);
     }
   } catch {
+    console.warn('[AI_Trans:popup] diag-read-error | elapsed=%dms', performance.now() - t0);
     diagText = undefined; // 診斷讀取失敗不阻塞 popup 其餘功能
   }
   const diagEl = $('status-diagnostic');
@@ -54,8 +159,12 @@ async function init(): Promise<void> {
     diagEl.textContent = '最近失敗: 無';
   }
 
+  console.log('[AI_Trans:popup] bind-actions | elapsed=%dms', performance.now() - t0);
   bindActions(config);
   await updateAsrButton();
+  console.log('[AI_Trans:popup] init-done | elapsed=%dms', performance.now() - t0);
+  popupDiag('init-done');
+  stopInitWatchdog(); // M2-26：init 完成，停止 slow/timeout 計時（避免誤報）
 }
 
 /** 更新 ASR 按鈕狀態（已授權顯示「ASR 已啟用」，未授權顯示「啟用 ASR」）。 */
@@ -75,9 +184,7 @@ async function updateAsrButton(): Promise<void> {
 
 /** 綁定 popup 按鈕事件（config 讀取失敗時以默認值佔位，不影響手動操作）。 */
 function bindActions(config: EngineConfig): void {
-  $('btn-options').addEventListener('click', () => {
-    void chrome.runtime.openOptionsPage();
-  });
+  // btn-options 的 handler 已在 init() 最開始立即綁定（不依賴 async 數據），此處不再重複。
 
   // 測試連接：直接向配置端點發最小請求，驗證端點可達 + 模型存在 + 響應有效。
   $('btn-test').addEventListener('click', async () => {
@@ -184,5 +291,16 @@ function describeAsr(c: EngineConfig): string {
   if (c.asr.type === 'local-whisper') return `ASR: 本地 Whisper (${c.asr.modelTier ?? 'base'})`;
   return 'ASR: 雲端';
 }
+
+// M2-26：watchdog 控制與狀態（供 integrate 測試用 fake timers 驅動 slow/timeout）。
+export const _testExports = {
+  startInitWatchdog,
+  stopInitWatchdog,
+  fireInitTimeout,
+  resetWatchdogForTest() {
+    initSlowFired = false;
+    stopInitWatchdog();
+  },
+};
 
 void init();

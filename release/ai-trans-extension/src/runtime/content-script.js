@@ -48503,7 +48503,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     content: false,
     bridge: false,
     interceptor: false,
-    "local-onnx": false
+    "local-onnx": false,
+    popup: false
   };
   var DEFAULT_CONFIG = {
     translation: { type: "cloud-llm", fallbackType: "mt" },

@@ -10,7 +10,8 @@
     content: false,
     bridge: false,
     interceptor: false,
-    "local-onnx": false
+    "local-onnx": false,
+    popup: false
   };
   var DEFAULT_CONFIG = {
     translation: { type: "cloud-llm", fallbackType: "mt" },
@@ -231,31 +232,121 @@
 
   // src/runtime/popup/popup.ts
   var store = new ChromeStorageConfigStore();
+  var OPTIONS_URL = chrome.runtime.getURL("src/runtime/options/options.html");
   function $(id) {
     const el = document.getElementById(id);
     if (!el) throw new Error(`missing #${id}`);
     return el;
   }
+  function popupDiag(msg) {
+    const el = document.getElementById("popup-diag-dom");
+    if (!el) return;
+    const ts = (/* @__PURE__ */ new Date()).toISOString().slice(11, 19);
+    const line = `${ts} ${msg}`;
+    el.textContent = el.textContent ? `${el.textContent}
+${line}` : line;
+    console.log(`[AI_Trans:popup:diag] ${msg}`);
+  }
+  var INIT_SLOW_MS = 3e3;
+  var INIT_TIMEOUT_MS = 1e4;
+  var initSlowFired = false;
+  var initTimer;
+  var initTimeoutTimer;
+  function startInitWatchdog() {
+    initTimer = setTimeout(() => {
+      if (initSlowFired) return;
+      initSlowFired = true;
+      console.warn("[AI_Trans:popup] init-slow | >3s\uFF0C\u53EF\u80FD\u88AB offscreen \u6A21\u578B\u8F09\u5165/OOM \u62D6\u7D2F");
+      popupDiag("init-slow >3s");
+      void recordDiagnostic({
+        type: "pipeline-error",
+        error: { port: "platform", code: "popup-init-slow", recoverable: true, cause: new Error("popup init exceeded 3s") }
+      });
+    }, INIT_SLOW_MS);
+    initTimeoutTimer = setTimeout(fireInitTimeout, INIT_TIMEOUT_MS);
+  }
+  function stopInitWatchdog() {
+    if (initTimer !== void 0) {
+      clearTimeout(initTimer);
+      initTimer = void 0;
+    }
+    if (initTimeoutTimer !== void 0) {
+      clearTimeout(initTimeoutTimer);
+      initTimeoutTimer = void 0;
+    }
+  }
+  function fireInitTimeout() {
+    console.error("[AI_Trans:popup] init-timeout | >10s\uFF0Cinit \u672A\u8FD4\u56DE\uFF08\u6975\u53EF\u80FD\u9032\u7A0B\u88AB OOM/\u639B\u8D77\uFF09");
+    popupDiag("init-timeout >10s");
+    void recordDiagnostic({
+      type: "pipeline-error",
+      error: { port: "platform", code: "popup-init-timeout", recoverable: true, cause: new Error("popup init did not complete within 10s") }
+    });
+  }
+  async function openOptionsPage() {
+    try {
+      const tabs = await chrome.tabs.query({ url: OPTIONS_URL });
+      if (tabs.length > 0 && tabs[0].id != null) {
+        await chrome.tabs.update(tabs[0].id, { active: true });
+        popupDiag("options tab focused");
+      } else {
+        await chrome.tabs.create({ url: OPTIONS_URL });
+        popupDiag("options tab created");
+      }
+    } catch (err) {
+      popupDiag(`options open failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   async function init() {
+    const t0 = performance.now();
+    console.log("[AI_Trans:popup] init-start | elapsed=0ms");
+    popupDiag("init-start");
+    startInitWatchdog();
+    $("btn-options").addEventListener("click", () => {
+      console.log("[AI_Trans:popup] btn-options-click | elapsed=%dms", performance.now() - t0);
+      popupDiag("btn-options clicked");
+      void openOptionsPage();
+    });
     let config;
+    console.log("[AI_Trans:popup] store-get-start | elapsed=%dms", performance.now() - t0);
     try {
       config = await store.get();
+      console.log(
+        "[AI_Trans:popup] store-get-done | elapsed=%dms | type=%s",
+        performance.now() - t0,
+        config.translation.type
+      );
+      popupDiag("store-get done");
     } catch (err) {
+      console.warn(
+        "[AI_Trans:popup] store-get-error | elapsed=%dms | %s",
+        performance.now() - t0,
+        err instanceof Error ? err.message : String(err)
+      );
+      popupDiag(`store-get error: ${err instanceof Error ? err.message : String(err)}`);
       $("status-diagnostic").textContent = `\u6700\u8FD1\u5931\u6557: \u932F\u8AA4: \u914D\u7F6E\u8B80\u53D6\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
       $("status-diagnostic").classList.add("warn");
       bindActions(configFallback());
+      stopInitWatchdog();
       return;
     }
     $("status-translation").textContent = describeTranslation(config);
     $("status-asr").textContent = describeAsr(config);
     $("status-lang").textContent = `\u76EE\u6A19\u8A9E\u8A00: ${config.targetLang} \xB7 ${config.displayMode === "mono" ? "\u50C5\u8B6F\u6587" : "\u96D9\u8A9E"}`;
     let diagText;
+    console.log("[AI_Trans:popup] diag-read-start | elapsed=%dms", performance.now() - t0);
     try {
       const diag = await readLastDiagnostic();
+      console.log(
+        "[AI_Trans:popup] diag-read-done | elapsed=%dms | hasDiag=%s",
+        performance.now() - t0,
+        diag ? "yes" : "no"
+      );
       if (diag && diag.actionable !== false) {
         diagText = formatDiagnostic(diag);
       }
     } catch {
+      console.warn("[AI_Trans:popup] diag-read-error | elapsed=%dms", performance.now() - t0);
       diagText = void 0;
     }
     const diagEl = $("status-diagnostic");
@@ -265,8 +356,12 @@
     } else {
       diagEl.textContent = "\u6700\u8FD1\u5931\u6557: \u7121";
     }
+    console.log("[AI_Trans:popup] bind-actions | elapsed=%dms", performance.now() - t0);
     bindActions(config);
     await updateAsrButton();
+    console.log("[AI_Trans:popup] init-done | elapsed=%dms", performance.now() - t0);
+    popupDiag("init-done");
+    stopInitWatchdog();
   }
   async function updateAsrButton() {
     const btn = $("btn-asr");
@@ -282,9 +377,6 @@
     }
   }
   function bindActions(config) {
-    $("btn-options").addEventListener("click", () => {
-      void chrome.runtime.openOptionsPage();
-    });
     $("btn-test").addEventListener("click", async () => {
       const connEl = $("status-connection");
       connEl.textContent = "\u9023\u63A5\u6E2C\u8A66: \u6E2C\u8A66\u4E2D\u2026";
@@ -371,6 +463,15 @@
     if (c.asr.type === "local-whisper") return `ASR: \u672C\u5730 Whisper (${c.asr.modelTier ?? "base"})`;
     return "ASR: \u96F2\u7AEF";
   }
+  var _testExports = {
+    startInitWatchdog,
+    stopInitWatchdog,
+    fireInitTimeout,
+    resetWatchdogForTest() {
+      initSlowFired = false;
+      stopInitWatchdog();
+    }
+  };
   void init();
 })();
 

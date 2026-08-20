@@ -1,6 +1,7 @@
-// 集成測試：offscreen local-onnx 模型載入彈性化（補充修復九）。
+// 集成測試：offscreen local-onnx 模型載入彈性化（補充修復九）+ WebGPU 載入後端（M2-26）。
 // 覆蓋：hasModelInCache 用 Cache API 判定的正確性、runInference lazy 載入恢復、
-// checkModelStatus 不依賴內存 translationPipeline、推理失敗錯誤可讀化。
+// checkModelStatus 不依賴內存 translationPipeline、推理失敗錯誤可讀化、
+// WebGPU 設備選擇 / WASM 回退 / webgpuFailed 一次性記憶。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // transformers.js mock（優先於 vitest.config 的 alias mock）。
@@ -14,10 +15,22 @@ const transformersMock = vi.hoisted(() => {
 });
 vi.mock('@huggingface/transformers', () => transformersMock);
 
+// 診斷 mock（委派真實實現——既有測試斷言 storage 寫入仍生效；同時提供 spy 供
+// WebGPU 回退診斷調用斷言）。importOriginal 提供真實實現，spy 包裹後轉發。
+vi.mock('../../src/infrastructure/diagnostics', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/infrastructure/diagnostics')>();
+  return {
+    recordDiagnostic: vi.fn(async (e: Parameters<typeof actual.recordDiagnostic>[0]) =>
+      actual.recordDiagnostic(e)
+    ),
+  };
+});
+
 import {
   resetLocalOnnxModuleForTest,
   _testExports,
 } from '../../src/runtime/offscreen';
+import { recordDiagnostic } from '../../src/infrastructure/diagnostics';
 
 /** 構造假 Request（僅測試 url 欄位）。 */
 function makeRequest(url: string): Request {
@@ -475,5 +488,159 @@ describe('offscreen local-onnx 快取清除與重新下載彈性（補充修復�
       progress_callback?: unknown;
     };
     expect(typeof secondCallOptions.progress_callback).toBe('function');
+  });
+});
+
+describe('offscreen 空閒關閉（M2-25）', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    resetLocalOnnxModuleForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it('空閒關閉：dispose 翻譯 pipeline 並通知 SW 關閉 document', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    const disposeSpy = vi.fn(async () => {});
+    transformersMock.pipeline.mockResolvedValue({ dispose: disposeSpy });
+
+    // 先載入 pipeline（模擬運行中持有 WASM 模型記憶體）。
+    await _testExports.downloadModel();
+    expect(disposeSpy).not.toHaveBeenCalled();
+
+    await _testExports.shutdownForIdle();
+
+    // 釋放 wasm 記憶體（dispose pipeline）。
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    // 通知 SW 調用 chrome.offscreen.closeDocument。
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      topic: 'offscreen:idle-close',
+    });
+  });
+
+  it('空閒關閉冪等：重複觸發不重複 dispose（idleCloseRequested 守衛）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    const disposeSpy = vi.fn(async () => {});
+    transformersMock.pipeline.mockResolvedValue({ dispose: disposeSpy });
+
+    await _testExports.downloadModel();
+    await _testExports.shutdownForIdle();
+    await _testExports.shutdownForIdle();
+
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('無 pipeline 時空閒關閉仍安全（不拋錯）', async () => {
+    await _testExports.shutdownForIdle();
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      topic: 'offscreen:idle-close',
+    });
+  });
+});
+
+// ============================================================
+// M2-26：WebGPU 載入後端 + WASM 回退（popup 阻塞根因修復）
+// ============================================================
+describe('offscreen local-onnx WebGPU 載入後端（M2-26）', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    resetLocalOnnxModuleForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it('無 navigator.gpu → preferWebGpu=false，載入走 device:wasm（零回歸）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue({});
+
+    expect(_testExports.preferWebGpu()).toBe(false);
+    await _testExports.ensurePipelineLoaded();
+
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(1);
+    expect(transformersMock.pipeline.mock.calls[0][2]).toMatchObject({ device: 'wasm' });
+    expect(recordDiagnostic).not.toHaveBeenCalled();
+  });
+
+  it('有 navigator.gpu → preferWebGpu=true，載入走 device:webgpu', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue({});
+    // jsdom 默認 navigator 無 gpu；stub 出 WebGPU 可用環境。
+    vi.stubGlobal('navigator', { gpu: {} });
+
+    expect(_testExports.preferWebGpu()).toBe(true);
+    await _testExports.ensurePipelineLoaded();
+
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(1);
+    expect(transformersMock.pipeline.mock.calls[0][2]).toMatchObject({ device: 'webgpu' });
+    expect(recordDiagnostic).not.toHaveBeenCalled();
+  });
+
+  it('webgpu 嘗試失敗 → 回退 wasm 成功 + local-onnx-webgpu-fallback 診斷 + webgpuFailed=true', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    // 第一次（webgpu）reject、第二次（wasm 回退）resolve。
+    transformersMock.pipeline
+      .mockRejectedValueOnce(new Error('WebGPU device creation failed'))
+      .mockResolvedValue({});
+    vi.stubGlobal('navigator', { gpu: {} });
+
+    await _testExports.ensurePipelineLoaded();
+
+    // 共兩次 pipeline 調用：webgpu（失敗）→ wasm（成功）。
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(2);
+    expect(transformersMock.pipeline.mock.calls[0][2]).toMatchObject({ device: 'webgpu' });
+    expect(transformersMock.pipeline.mock.calls[1][2]).toMatchObject({ device: 'wasm' });
+    expect(recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'pipeline-error',
+        error: expect.objectContaining({ code: 'local-onnx-webgpu-fallback' }),
+      })
+    );
+  });
+
+  it('webgpuFailed=true 後 → preferWebGpu=false（後續載入不再嘗試 webgpu）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    // webgpu reject → wasm 成功（觸發 webgpuFailed=true）。
+    transformersMock.pipeline
+      .mockRejectedValueOnce(new Error('WebGPU device creation failed'))
+      .mockResolvedValue({});
+    vi.stubGlobal('navigator', { gpu: {} });
+
+    await _testExports.ensurePipelineLoaded();
+    // 失敗記憶生效：preferWebGpu 翻轉為 false，後續載入將直接走 wasm。
+    expect(_testExports.webgpuFailed).toBe(true);
+    expect(_testExports.preferWebGpu()).toBe(false);
+  });
+
+  it('resetLocalOnnxModuleForTest → webgpuFailed 歸零（Document 重建重置）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline
+      .mockRejectedValueOnce(new Error('WebGPU device creation failed'))
+      .mockResolvedValue({});
+    vi.stubGlobal('navigator', { gpu: {} });
+
+    await _testExports.ensurePipelineLoaded();
+    expect(_testExports.webgpuFailed).toBe(true);
+
+    resetLocalOnnxModuleForTest();
+    expect(_testExports.webgpuFailed).toBe(false);
+  });
+
+  it('webgpu 與 wasm 皆失敗 → 拋原始錯誤（不吞）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockRejectedValue(new Error('all backends failed'));
+    vi.stubGlobal('navigator', { gpu: {} });
+
+    await expect(_testExports.ensurePipelineLoaded()).rejects.toThrow('all backends failed');
   });
 });

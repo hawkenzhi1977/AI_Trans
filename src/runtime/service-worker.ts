@@ -2,6 +2,7 @@
 // M1 的重點邏輯在 Content Script 側；SW 保持輕量，避免被回收中斷。
 // 同時負責本地 ONNX 翻譯模型的消息路由（轉發給 Offscreen Document）。
 import { ChromeStorageConfigStore } from '../infrastructure/chrome-config-store';
+import { recordDiagnostic } from '../infrastructure/diagnostics';
 
 // 保持 SW 存活以供配置存取；實際業務在 Content Script。
 const store = new ChromeStorageConfigStore();
@@ -29,6 +30,7 @@ async function ensureOffscreenDocument(): Promise<void> {
   if (existingContexts.length > 0) return;
 
   // 建立 offscreen document。
+  console.warn('[AI_Trans:sw] offscreen created');
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
     reasons: [chrome.offscreen.Reason.USER_MEDIA],
@@ -154,6 +156,33 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // Offscreen 空閒超時 → 關閉 document（釋放 WASM 模型 + 音頻資源）。
+  // 背景：offscreen 與 popup 共享 extension 渲染進程，空閒不關閉會導致進程被佔滿，
+  // popup 無法創建（真實環境「播放後 popup 彈不出」根因修復，M2-25）。
+  if (msg.topic === 'offscreen:idle-close') {
+    chrome.offscreen
+      .closeDocument()
+      .then(() => {
+        offscreenPort = null;
+        console.warn('[AI_Trans] offscreen document closed after idle timeout');
+      })
+      .catch((err) => {
+        // §5.6：關閉失敗必須落診斷（不靜默）。
+        const cause = err instanceof Error ? err : new Error(String(err));
+        console.warn('[AI_Trans] offscreen closeDocument failed:', cause);
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'audio',
+            code: 'offscreen-close-failed',
+            recoverable: true,
+            cause,
+          },
+        });
+      });
+    return false;
+  }
+
   // 本地 ONNX 翻譯模型相關消息——轉發給 Offscreen Document。
   if (msg.topic?.startsWith('local-onnx:')) {
     void sendToOffscreen(msg)
@@ -167,5 +196,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // ASR Whisper 模型相關消息——轉發給 Offscreen Document。
+  if (msg.topic?.startsWith('asr-whisper:')) {
+    void sendToOffscreen(msg)
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: `asr-whisper operation failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+      );
+    return true;
+  }
+
   return false;
 });
+
+// M2-26 可觀測性：SW 生命週期麵包屑（僅 SW console，空閒回收/重啟可见）。
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => console.warn('[AI_Trans:sw] SW onStartup'));
+}
+if (chrome.runtime.onInstalled) {
+  chrome.runtime.onInstalled.addListener(() => console.warn('[AI_Trans:sw] SW onInstalled'));
+}
+if (chrome.runtime.onSuspend) {
+  chrome.runtime.onSuspend.addListener(() => console.warn('[AI_Trans:sw] SW onSuspend'));
+}

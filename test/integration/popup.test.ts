@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetChromeMock } from '../support/setup-dom';
 import { DIAGNOSTIC_KEY } from '../../src/infrastructure/diagnostics';
 
@@ -134,5 +134,67 @@ describe('popup 診斷顯示', () => {
     expect(reloadSpy).toHaveBeenCalledWith(42);
     const el = document.getElementById('status-connection')!;
     expect(el.textContent).not.toContain('未找到');
+  });
+});
+
+// M2-26：popup init watchdog（§5.6「字幕沒出來」可追溯）——用 fake timers 驅動 slow/timeout。
+describe('popup init watchdog（M2-26）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('init 快速完成（stopInitWatchdog）→ 不觸發 slow/timeout 診斷', async () => {
+    const { _testExports } = await import('../../src/runtime/popup/popup');
+    vi.useFakeTimers();
+    _testExports.resetWatchdogForTest();
+    _testExports.startInitWatchdog();
+    _testExports.stopInitWatchdog(); // 模擬 init 在 3s 內完成
+    await vi.advanceTimersByTimeAsync(15000); // 即使超過 10s 也不 fire
+
+    const stored = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as Record<string, unknown>;
+    expect(stored[DIAGNOSTIC_KEY]).toBeUndefined();
+  });
+
+  it('init >3s → popup-init-slow 診斷（message 含 exceeded 3s）', async () => {
+    const { _testExports } = await import('../../src/runtime/popup/popup');
+    vi.useFakeTimers();
+    _testExports.resetWatchdogForTest();
+    _testExports.startInitWatchdog();
+    await vi.advanceTimersByTimeAsync(3500); // 觸發 slow（未到 10s timeout）
+
+    const rec = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as { lastDiagnostic: { kind: string; message: string } };
+    expect(rec.lastDiagnostic.kind).toBe('error');
+    expect(rec.lastDiagnostic.message).toContain('popup init exceeded 3s');
+  });
+
+  it('init >10s → slow(3s) 與 timeout(10s) 皆記錄，最終落 timeout（後寫覆蓋）', async () => {
+    const { _testExports } = await import('../../src/runtime/popup/popup');
+    vi.useFakeTimers();
+    _testExports.resetWatchdogForTest();
+    _testExports.startInitWatchdog();
+    await vi.advanceTimersByTimeAsync(10500); // slow（3s）先寫、timeout（10s）後寫覆蓋
+
+    const rec = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as { lastDiagnostic: { kind: string; message: string } };
+    expect(rec.lastDiagnostic.kind).toBe('error');
+    // 最終落的是 timeout（更嚴重、後寫覆蓋 slow）。
+    expect(rec.lastDiagnostic.message).toContain('popup init did not complete within 10s');
+  });
+
+  it('stopInitWatchdog 後即使時間推進也不 fire（計時器已清除）', async () => {
+    const { _testExports } = await import('../../src/runtime/popup/popup');
+    vi.useFakeTimers();
+    _testExports.resetWatchdogForTest();
+    _testExports.startInitWatchdog();
+    await vi.advanceTimersByTimeAsync(1000); // 未達 3s
+    _testExports.stopInitWatchdog(); // init 在 1s 完成
+    await vi.advanceTimersByTimeAsync(20000); // 推進超過 slow/timeout 門檻
+
+    const stored = (await chrome.storage.local.get(DIAGNOSTIC_KEY)) as Record<string, unknown>;
+    expect(stored[DIAGNOSTIC_KEY]).toBeUndefined();
   });
 });

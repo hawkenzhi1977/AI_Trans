@@ -13,6 +13,16 @@ const HTML = `
   <select id="asr-tier"><option value="tiny">tiny</option><option value="base">base</option><option value="small">small</option></select>
   <input id="asr-endpoint" />
   <input id="asr-custom-model" />
+  <input id="asr-model-name" disabled />
+  <p id="asr-model-size-info"></p>
+  <span id="asr-model-status-badge">檢測中...</span>
+  <div id="asr-model-progress-container" style="display:none;">
+    <progress id="asr-model-progress-bar" value="0" max="100"></progress>
+    <span id="asr-model-progress-text">0%</span>
+    <p id="asr-model-progress-detail"></p>
+  </div>
+  <button id="btn-download-asr-model">下載模型</button>
+  <button id="btn-clear-asr-model">清除快取</button>
   <select id="target-lang"><option value="zh-Hant">中文（繁體）</option><option value="en">English</option><option value="ja">日本語</option></select>
   <select id="display-mode"><option value="mono">僅譯文</option><option value="bilingual">雙語</option></select>
   <select id="performance-profile"><option value="streaming">streaming</option><option value="balanced">balanced</option><option value="quality">quality</option></select>
@@ -33,6 +43,7 @@ const HTML = `
   <input type="checkbox" id="dbg-bridge" />
   <input type="checkbox" id="dbg-interceptor" />
   <input type="checkbox" id="dbg-local-onnx" />
+  <input type="checkbox" id="dbg-popup" />
   <input id="translation-api-key" />
   <input id="asr-api-key" />
   <input id="local-model-name" disabled />
@@ -227,8 +238,10 @@ describe('Options — M2-24 補充修復十三 預加載模型按鈕', () => {
     await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
     // 模擬模型已下載（check-status 返回 ok）→ 預加載按鈕可用。
     const sendMessage = chrome.runtime.sendMessage as ReturnType<typeof vi.fn>;
+    sendMessage.mockReset();
     sendMessage
-      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // check-status
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // local-onnx check-status
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // asr-whisper check-status
       .mockResolvedValueOnce({ ok: true }); // warmup
     await loadOptions();
     const btnWarmup = document.getElementById('btn-warmup-model') as HTMLButtonElement;
@@ -244,8 +257,10 @@ describe('Options — M2-24 補充修復十三 預加載模型按鈕', () => {
   it('預加載失敗時標籤顯示錯誤並提示原因（§5.6 不靜默）', async () => {
     await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
     const sendMessage = chrome.runtime.sendMessage as ReturnType<typeof vi.fn>;
+    sendMessage.mockReset();
     sendMessage
-      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // check-status
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // local-onnx check-status
+      .mockResolvedValueOnce({ ok: true, result: { downloaded: true } }) // asr-whisper check-status
       .mockResolvedValueOnce({ ok: false, error: 'Local ONNX model not downloaded' }); // warmup 失敗
     await loadOptions();
     (document.getElementById('btn-warmup-model') as HTMLButtonElement).click();
