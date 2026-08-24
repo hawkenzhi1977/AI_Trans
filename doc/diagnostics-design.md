@@ -273,7 +273,7 @@
 
 ### 2.21 本地 ONNX 模型載入後 popup 彈不出（M2-26）
 
-- **現象**: M2-25（Offscreen 空閒關閉）合入後用戶實測**仍彈不出**——本地 ONNX 翻譯模型（Qwen2.5-0.5B INT4 WASM ~350MB）下載就緒、播放/翻譯運行一段時間後點擴充圖示 popup 彈不出（半透明圓圈），刷新插件才恢復；翻譯照常（無翻譯錯誤日誌）。
+- **現象**: M2-25（Offscreen 空閒關閉）合入後用戶實測**仍彈不出**——本地 ONNX 翻譯模型（Qwen2.5-0.5B INT4 WASM ~750MB 模型倉庫）下載就緒、播放/翻譯運行一段時間後點擴充圖示 popup 彈不出（半透明圓圈），刷新插件才恢復；翻譯照常（無翻譯錯誤日誌）。
 - **根因（三層）**: ①**堆佔用過大**——wasm 後端把 350MB 權重放進 JS heap（~500MB），與 popup 共享 extension 渲染進程，逼近單進程上限 → popup 頁面創建失敗。②**無可觀測性**——popup init 卡住時無任何儀器記錄卡在哪。③**manifest `commands` 塊破壞 SW 註冊**——先前未合併的「快捷鍵開 Options」（自訂 command `open-options`）在 E2E headless Chromium 令整包 SW 註冊失敗（`_execute_action` 內建命令可、自訂 command 任何鍵值皆不行）→ 擴充加載失敗（E2E 9/16 掛）。
 - **修復後行為**: ①`loadPipeline` **webgpu-first**（權重駐 VRAM、heap ~50-100MB），失败置 `webgpuFailed` 後續直走 wasm + 落 `local-onnx-webgpu-fallback`；②popup **init watchdog**（3s slow / 10s timeout）；③移除 manifest `commands`，Options 經 popup「開啟設定」按鈕到達。
 - **診斷碼**: `local-onnx-webgpu-fallback`（webgpu 不可用降級 wasm）；`popup-init-slow`（>3s）；`popup-init-timeout`（>10s）。

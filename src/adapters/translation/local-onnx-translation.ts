@@ -1,7 +1,7 @@
 /**
  * 本地 ONNX 翻譯適配器——使用 Transformers.js + ONNX Runtime Web 在 Offscreen Document 推理。
  * 當雲端 LLM 失敗時作為 fallback 引擎，實現完全離線的本地翻譯兜底。
- * 模型：onnx-community/Qwen2.5-0.5B-Instruct (INT4 ONNX，約 350MB)。
+ * 模型：onnx-community/Qwen2.5-0.5B-Instruct (INT4 ONNX，模型倉庫總計約 750MB)。
  */
 import type { TranslationProvider } from '../../domain/ports/translation-provider';
 import type { TranslationRequest, TranslationResult } from '../../domain/models/translation';

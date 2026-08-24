@@ -520,7 +520,7 @@ async function loadPipeline(
   }
 
   // 加載模型（首次會從 HuggingFace Hub 下載到 Cache API）。
-  // dtype: 'q4' 下載 INT4 量化版（onnx/model_q4.onnx，約 350MB），避免默認 fp32 大檔。
+  // dtype: 'q4' 下載 INT4 量化版（模型倉庫總計約 750MB，含 onnx/model_q4.onnx + tokenizer + 配置），避免默認 fp32 大檔。
   // device: WebGPU 優先——權重放 GPU VRAM，不佔 extension 渲染進程 JS 堆（popup/options
   // 與 offscreen 共用該進程，WASM 模型 ~500MB 會撐爆 → popup 打不開）。無 WebGPU /
   // 曾失敗時回退 WASM（wasmPaths 已配置，翻譯不中斷）。
