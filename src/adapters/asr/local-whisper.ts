@@ -61,9 +61,11 @@ export class LocalWhisperASR implements ASRProvider {
         env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
       }
       // 轉型以匹配本地 WhisperPipeline 接口（transformers.js 返回類型更複雜）。
+      // dtype: 'q8' 明確指定量化精度，消除 transformers.js 的 "dtype not specified" 警告。
       this.pipeline = (await pipeline(
         'automatic-speech-recognition',
-        this.modelId
+        this.modelId,
+        { dtype: 'q8' }
       )) as unknown as WhisperPipeline;
     } catch (err) {
       const error = new Error(

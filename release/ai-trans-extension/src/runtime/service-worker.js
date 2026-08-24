@@ -159,6 +159,9 @@ async function ensureOffscreenDocument() {
   });
 }
 async function sendToOffscreen(message) {
+  return sendToOffscreenInternal(message, false);
+}
+async function sendToOffscreenInternal(message, isRetry) {
   await ensureOffscreenDocument();
   const maxWait = 5e3;
   const startTime = Date.now();
@@ -171,10 +174,11 @@ async function sendToOffscreen(message) {
   return new Promise((resolve, reject) => {
     const messageId = Math.random().toString(36).substring(7);
     const msg = message;
+    const currentPort = offscreenPort;
     const responseListener = (response) => {
       const res = response;
       if (res.messageId === messageId) {
-        offscreenPort?.onMessage.removeListener(responseListener);
+        currentPort.onMessage.removeListener(responseListener);
         if (res.error) {
           reject(new Error(res.error));
         } else {
@@ -182,10 +186,36 @@ async function sendToOffscreen(message) {
         }
       }
     };
-    offscreenPort.onMessage.addListener(responseListener);
-    offscreenPort.postMessage({ ...msg, messageId });
+    currentPort.onMessage.addListener(responseListener);
+    const disconnectListener = () => {
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
+      const err = new Error("Offscreen Document disconnected before response");
+      if (!isRetry) {
+        offscreenPort = null;
+        void sendToOffscreenInternal(message, true).then(resolve).catch(reject);
+      } else {
+        reject(err);
+      }
+    };
+    currentPort.onDisconnect.addListener(disconnectListener);
+    try {
+      currentPort.postMessage({ ...msg, messageId });
+    } catch (err) {
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("Extension context invalidated") && !isRetry) {
+        offscreenPort = null;
+        void sendToOffscreenInternal(message, true).then(resolve).catch(reject);
+      } else {
+        reject(err instanceof Error ? err : new Error(errMsg));
+      }
+      return;
+    }
     setTimeout(() => {
-      offscreenPort?.onMessage.removeListener(responseListener);
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
       reject(new Error("Offscreen Document response timeout"));
     }, 12e4);
   });

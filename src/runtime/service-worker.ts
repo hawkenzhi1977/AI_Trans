@@ -41,8 +41,13 @@ async function ensureOffscreenDocument(): Promise<void> {
 /**
  * 發送消息給 Offscreen Document 並等待響應。
  * 使用 port 連接確保消息只發送給 Offscreen Document（避免廣播循環）。
+ * 偵測到 Extension context invalidated 時自動重試一次（offscreen 被關閉後重建）。
  */
 async function sendToOffscreen<T>(message: unknown): Promise<T> {
+  return sendToOffscreenInternal<T>(message, false);
+}
+
+async function sendToOffscreenInternal<T>(message: unknown, isRetry: boolean): Promise<T> {
   await ensureOffscreenDocument();
 
   // 等待 Offscreen Document 建立 port 連接（最多 5 秒）。
@@ -60,12 +65,13 @@ async function sendToOffscreen<T>(message: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
     const messageId = Math.random().toString(36).substring(7);
     const msg = message as Record<string, unknown>;
+    const currentPort = offscreenPort!;
 
     // 監聽 port 消息，等待響應。
     const responseListener = (response: unknown) => {
       const res = response as { messageId?: string; result?: unknown; error?: string };
       if (res.messageId === messageId) {
-        offscreenPort?.onMessage.removeListener(responseListener);
+        currentPort.onMessage.removeListener(responseListener);
         if (res.error) {
           reject(new Error(res.error));
         } else {
@@ -73,15 +79,45 @@ async function sendToOffscreen<T>(message: unknown): Promise<T> {
         }
       }
     };
-    offscreenPort!.onMessage.addListener(responseListener);
+    currentPort.onMessage.addListener(responseListener);
 
-    // 發送消息。
-    offscreenPort!.postMessage({ ...msg, messageId });
+    // port disconnect 時 fail-fast（不等 120s 超時）。
+    const disconnectListener = () => {
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
+      const err = new Error('Offscreen Document disconnected before response');
+      // 偵測 context invalidated → 重試一次。
+      if (!isRetry) {
+        offscreenPort = null;
+        void sendToOffscreenInternal<T>(message, true).then(resolve).catch(reject);
+      } else {
+        reject(err);
+      }
+    };
+    currentPort.onDisconnect.addListener(disconnectListener);
 
-    // 超時處理（120 秒）。首次請求可能觸發模型載入（350MB 從 Cache API 載入記憶體需 30-60s），
+    // 發送消息——捕獲 Extension context invalidated。
+    try {
+      currentPort.postMessage({ ...msg, messageId });
+    } catch (err) {
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('Extension context invalidated') && !isRetry) {
+        // port 已失效，清除後重試。
+        offscreenPort = null;
+        void sendToOffscreenInternal<T>(message, true).then(resolve).catch(reject);
+      } else {
+        reject(err instanceof Error ? err : new Error(errMsg));
+      }
+      return;
+    }
+
+    // 超時處理（120 秒）。首次請求可能觸發模型載入（750MB 從 Cache API 載入記憶體需 30-60s），
     // 30s 會誤殺首次推理（M2-24 補充修復十三：翻譯卡死 71s 根因）。後續推理遠快於此。
     setTimeout(() => {
-      offscreenPort?.onMessage.removeListener(responseListener);
+      currentPort.onMessage.removeListener(responseListener);
+      currentPort.onDisconnect.removeListener(disconnectListener);
       reject(new Error('Offscreen Document response timeout'));
     }, 120000);
   });

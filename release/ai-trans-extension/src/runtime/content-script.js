@@ -51204,7 +51204,8 @@ Output example:
         }
         this.pipeline = await pipeline(
           "automatic-speech-recognition",
-          this.modelId
+          this.modelId,
+          { dtype: "q8" }
         );
       } catch (err) {
         const error = new Error(

@@ -690,3 +690,46 @@ describe('offscreen local-onnx WebGPU 載入後端（M2-26）', () => {
     await expect(_testExports.ensurePipelineLoaded()).rejects.toThrow('all backends failed');
   });
 });
+
+// 進度聚合器測試——多檔案下載時計算整體百分比（避免進度條在文件切換時跳回 0%）。
+describe('DownloadProgressAggregator — 多檔案下載進度聚合', () => {
+  const { DownloadProgressAggregator } = _testExports;
+
+  it('單檔案：loaded 從 0 到 total → progress 從 0 到 100', () => {
+    const agg = new DownloadProgressAggregator();
+    expect(agg.update('model.onnx', 0, 1000).progress).toBe(0);
+    expect(agg.update('model.onnx', 500, 1000).progress).toBe(50);
+    expect(agg.update('model.onnx', 1000, 1000).progress).toBe(100);
+  });
+
+  it('多檔案：整體百分比 = 所有檔案 loaded 之和 / total 之和', () => {
+    const agg = new DownloadProgressAggregator();
+    // 兩個檔案各 1000 bytes。
+    agg.update('model.onnx', 0, 1000);
+    agg.update('tokenizer.json', 0, 1000);
+    // 第一個檔案下載 50%。
+    expect(agg.update('model.onnx', 500, 1000).progress).toBe(25); // 500/2000 = 25%
+    // 第一個完成，第二個還在 0。
+    expect(agg.update('model.onnx', 1000, 1000).progress).toBe(50); // 1000/2000 = 50%
+    // 第二個下載 50%。
+    expect(agg.update('tokenizer.json', 500, 1000).progress).toBe(75); // 1500/2000 = 75%
+    // 全部完成。
+    expect(agg.update('tokenizer.json', 1000, 1000).progress).toBe(100);
+  });
+
+  it('reset() 清空所有檔案追蹤', () => {
+    const agg = new DownloadProgressAggregator();
+    agg.update('model.onnx', 500, 1000);
+    agg.reset();
+    // reset 後第一個檔案從 0 開始。
+    expect(agg.update('model.onnx', 0, 1000).progress).toBe(0);
+  });
+
+  it('loaded/total 累計返回所有檔案的總和', () => {
+    const agg = new DownloadProgressAggregator();
+    agg.update('a.onnx', 100, 200);
+    const result = agg.update('b.onnx', 50, 300);
+    expect(result.loaded).toBe(150); // 100 + 50
+    expect(result.total).toBe(500); // 200 + 300
+  });
+});

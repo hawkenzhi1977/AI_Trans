@@ -48815,6 +48815,24 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   var asrPipeline = null;
   var asrDownloadInProgress = false;
+  var DownloadProgressAggregator = class {
+    files = /* @__PURE__ */ new Map();
+    /** 更新單文件進度並返回整體百分比（0-100）與累計 loaded/total。 */
+    update(file, loaded, total) {
+      this.files.set(file, { loaded, total });
+      let totalLoaded = 0;
+      let totalBytes = 0;
+      for (const f of this.files.values()) {
+        totalLoaded += f.loaded;
+        totalBytes += f.total;
+      }
+      const progress = totalBytes > 0 ? Math.round(totalLoaded / totalBytes * 100) : 0;
+      return { progress, loaded: totalLoaded, total: totalBytes };
+    }
+    reset() {
+      this.files.clear();
+    }
+  };
   function toReadableError(err) {
     if (err instanceof Error) {
       const code = err.code;
@@ -48863,9 +48881,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     try {
       const mem = performance.memory;
       if (mem) {
-        console.warn("[AI_Trans] %s | jsHeapMB=%d", label, Math.round(mem.usedJSHeapSize / 1048576));
+        console.warn(`[AI_Trans] ${label} | jsHeapMB=${Math.round(mem.usedJSHeapSize / 1048576)}`);
       } else {
-        console.warn("[AI_Trans] %s | jsHeapMB=unknown (performance.memory \u7F3A\u5931)", label);
+        console.warn(`[AI_Trans] ${label} | jsHeapMB=unknown (performance.memory \u7F3A\u5931)`);
       }
     } catch {
     }
@@ -49017,39 +49035,29 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   async function downloadModel() {
     try {
+      const aggregator = new DownloadProgressAggregator();
       const progressCallback = (progress) => {
-        console.log("[AI_Trans:local-onnx] progress_callback:", {
-          status: progress.status,
-          progress: progress.progress,
-          loaded: progress.loaded,
-          total: progress.total,
-          name: progress.name,
-          file: progress.file
-        });
-        if (progress.status === "progress" && progress.progress !== void 0) {
+        const fileKey = progress.file ?? progress.name ?? "unknown";
+        if (progress.status === "progress" && progress.loaded !== void 0) {
+          const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
           broadcastToAll({
             type: "local-onnx:download-progress",
-            progress: progress.progress,
-            loaded: progress.loaded ?? 0,
-            total: progress.total ?? 0
+            progress: agg.progress,
+            loaded: agg.loaded,
+            total: agg.total
           });
         } else if (progress.status === "initiate") {
-          console.log("[AI_Trans:local-onnx] download initiated for:", progress.name ?? progress.file);
-          broadcastToAll({
-            type: "local-onnx:download-progress",
-            progress: 0,
-            loaded: 0,
-            total: progress.total ?? 0
-          });
+          console.log("[AI_Trans:local-onnx] download initiated for:", fileKey);
+          aggregator.update(fileKey, 0, progress.total ?? 0);
         } else if (progress.status === "done") {
-          console.log("[AI_Trans:local-onnx] file download done:", progress.name ?? progress.file);
+          console.log("[AI_Trans:local-onnx] file download done:", fileKey);
         } else if (progress.status === "ready") {
           console.log("[AI_Trans:local-onnx] model ready");
           broadcastToAll({
             type: "local-onnx:download-progress",
             progress: 100,
-            loaded: progress.total ?? 0,
-            total: progress.total ?? 0
+            loaded: 0,
+            total: 0
           });
         }
       };
@@ -49170,37 +49178,29 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           ok: true
         };
       }
+      const aggregator = new DownloadProgressAggregator();
       const progressCallback = (progress) => {
-        console.log("[AI_Trans:asr-whisper] progress_callback:", {
-          status: progress.status,
-          progress: progress.progress,
-          loaded: progress.loaded,
-          total: progress.total,
-          name: progress.name,
-          file: progress.file
-        });
-        if (progress.status === "progress" && progress.progress !== void 0) {
+        const fileKey = progress.file ?? progress.name ?? "unknown";
+        if (progress.status === "progress" && progress.loaded !== void 0) {
+          const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
           broadcastToAll({
             type: "asr-whisper:download-progress",
-            progress: progress.progress,
-            loaded: progress.loaded ?? 0,
-            total: progress.total ?? 0
+            progress: agg.progress,
+            loaded: agg.loaded,
+            total: agg.total
           });
         } else if (progress.status === "initiate") {
-          console.log("[AI_Trans:asr-whisper] download initiated for:", progress.name ?? progress.file);
-          broadcastToAll({
-            type: "asr-whisper:download-progress",
-            progress: 0,
-            loaded: 0,
-            total: progress.total ?? 0
-          });
+          console.log("[AI_Trans:asr-whisper] download initiated for:", fileKey);
+          aggregator.update(fileKey, 0, progress.total ?? 0);
+        } else if (progress.status === "done") {
+          console.log("[AI_Trans:asr-whisper] file download done:", fileKey);
         } else if (progress.status === "ready") {
           console.log("[AI_Trans:asr-whisper] model ready");
           broadcastToAll({
             type: "asr-whisper:download-progress",
             progress: 100,
-            loaded: progress.total ?? 0,
-            total: progress.total ?? 0
+            loaded: 0,
+            total: 0
           });
         }
       };
@@ -49211,6 +49211,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       }
       asrPipeline = await pipeline("automatic-speech-recognition", modelId, {
         device: "wasm",
+        dtype: "q8",
         progress_callback: progressCallback
       });
       if (asrPipeline) {
@@ -49557,7 +49558,9 @@ ${numbered}
     // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。
     get webgpuFailed() {
       return webgpuFailed;
-    }
+    },
+    // 進度聚合器（供測試驗證多檔案下載進度計算）。
+    DownloadProgressAggregator
   };
 })();
 /*! Bundled license information:

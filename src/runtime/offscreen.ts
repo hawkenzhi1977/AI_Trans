@@ -479,6 +479,33 @@ interface TransformersProgress {
 }
 
 /**
+ * 多檔案下載進度聚合器——transformers.js 的 progress_callback 是 per-file 觸發的，
+ * 每個文件各有 initiate → progress(0-100) → done 生命周期。直接廣播單文件進度會導致
+ * 進度條在文件切換時從 100% 跳回 0%。此聚合器追蹤所有文件的 loaded/total bytes，
+ * 計算整體百分比。
+ */
+class DownloadProgressAggregator {
+  private files = new Map<string, { loaded: number; total: number }>();
+
+  /** 更新單文件進度並返回整體百分比（0-100）與累計 loaded/total。 */
+  update(file: string, loaded: number, total: number): { progress: number; loaded: number; total: number } {
+    this.files.set(file, { loaded, total });
+    let totalLoaded = 0;
+    let totalBytes = 0;
+    for (const f of this.files.values()) {
+      totalLoaded += f.loaded;
+      totalBytes += f.total;
+    }
+    const progress = totalBytes > 0 ? Math.round((totalLoaded / totalBytes) * 100) : 0;
+    return { progress, loaded: totalLoaded, total: totalBytes };
+  }
+
+  reset(): void {
+    this.files.clear();
+  }
+}
+
+/**
  * 統一錯誤轉換——ORT/transformers 可能拋出「數字型」錯誤碼（如 wasm trap 的
  * 1835858576，非 Error 對象文本），轉為保留 code/stack 的可讀 Error（§5.6 留痕）。
  */
@@ -561,9 +588,9 @@ function logJsHeapBreadcrumb(label: string): void {
   try {
     const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
     if (mem) {
-      console.warn('[AI_Trans] %s | jsHeapMB=%d', label, Math.round(mem.usedJSHeapSize / 1048576));
+      console.warn(`[AI_Trans] ${label} | jsHeapMB=${Math.round(mem.usedJSHeapSize / 1048576)}`);
     } else {
-      console.warn('[AI_Trans] %s | jsHeapMB=unknown (performance.memory 缺失)', label);
+      console.warn(`[AI_Trans] ${label} | jsHeapMB=unknown (performance.memory 缺失)`);
     }
   } catch {
     /* 麵包屑不影響主流程 */
@@ -787,45 +814,34 @@ async function hasModelInCache(): Promise<boolean> {
  */
 async function downloadModel(): Promise<OffscreenResponse> {
   try {
+    // 進度聚合器：多檔案下載時計算整體百分比（避免進度條在文件切換時跳回 0%）。
+    const aggregator = new DownloadProgressAggregator();
+
     // 進度回調：實時回報下載進度給 Options 頁面。
     const progressCallback = (progress: TransformersProgress): void => {
-      // §5.6：記錄所有進度回調以便診斷（進度始終為 0 問題）。
-      console.log('[AI_Trans:local-onnx] progress_callback:', {
-        status: progress.status,
-        progress: progress.progress,
-        loaded: progress.loaded,
-        total: progress.total,
-        name: progress.name,
-        file: progress.file,
-      });
+      const fileKey = progress.file ?? progress.name ?? 'unknown';
 
-      if (progress.status === 'progress' && progress.progress !== undefined) {
+      if (progress.status === 'progress' && progress.loaded !== undefined) {
+        const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
         broadcastToAll({
           type: 'local-onnx:download-progress',
-          progress: progress.progress,
-          loaded: progress.loaded ?? 0,
-          total: progress.total ?? 0,
+          progress: agg.progress,
+          loaded: agg.loaded,
+          total: agg.total,
         });
       } else if (progress.status === 'initiate') {
-        // 開始下載——發送初始進度。
-        console.log('[AI_Trans:local-onnx] download initiated for:', progress.name ?? progress.file);
-        broadcastToAll({
-          type: 'local-onnx:download-progress',
-          progress: 0,
-          loaded: 0,
-          total: progress.total ?? 0,
-        });
+        console.log('[AI_Trans:local-onnx] download initiated for:', fileKey);
+        // initiate 時註冊文件（loaded=0），但不廣播 0%（避免進度條跳回）。
+        aggregator.update(fileKey, 0, progress.total ?? 0);
       } else if (progress.status === 'done') {
-        // 單個檔案下載完成。
-        console.log('[AI_Trans:local-onnx] file download done:', progress.name ?? progress.file);
+        console.log('[AI_Trans:local-onnx] file download done:', fileKey);
       } else if (progress.status === 'ready') {
-        // 模型準備就緒。
         console.log('[AI_Trans:local-onnx] model ready');
         broadcastToAll({
           type: 'local-onnx:download-progress',
           progress: 100,
-          loaded: progress.total ?? 0,
-          total: progress.total ?? 0,
+          loaded: 0,
+          total: 0,
         });
       }
     };
@@ -987,38 +1003,32 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
       } satisfies OffscreenResponse;
     }
 
-    const progressCallback = (progress: TransformersProgress): void => {
-      console.log('[AI_Trans:asr-whisper] progress_callback:', {
-        status: progress.status,
-        progress: progress.progress,
-        loaded: progress.loaded,
-        total: progress.total,
-        name: progress.name,
-        file: progress.file,
-      });
+    // 進度聚合器：多檔案下載時計算整體百分比。
+    const aggregator = new DownloadProgressAggregator();
 
-      if (progress.status === 'progress' && progress.progress !== undefined) {
+    const progressCallback = (progress: TransformersProgress): void => {
+      const fileKey = progress.file ?? progress.name ?? 'unknown';
+
+      if (progress.status === 'progress' && progress.loaded !== undefined) {
+        const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
         broadcastToAll({
           type: 'asr-whisper:download-progress',
-          progress: progress.progress,
-          loaded: progress.loaded ?? 0,
-          total: progress.total ?? 0,
+          progress: agg.progress,
+          loaded: agg.loaded,
+          total: agg.total,
         });
       } else if (progress.status === 'initiate') {
-        console.log('[AI_Trans:asr-whisper] download initiated for:', progress.name ?? progress.file);
-        broadcastToAll({
-          type: 'asr-whisper:download-progress',
-          progress: 0,
-          loaded: 0,
-          total: progress.total ?? 0,
-        });
+        console.log('[AI_Trans:asr-whisper] download initiated for:', fileKey);
+        aggregator.update(fileKey, 0, progress.total ?? 0);
+      } else if (progress.status === 'done') {
+        console.log('[AI_Trans:asr-whisper] file download done:', fileKey);
       } else if (progress.status === 'ready') {
         console.log('[AI_Trans:asr-whisper] model ready');
         broadcastToAll({
           type: 'asr-whisper:download-progress',
           progress: 100,
-          loaded: progress.total ?? 0,
-          total: progress.total ?? 0,
+          loaded: 0,
+          total: 0,
         });
       }
     };
@@ -1033,6 +1043,7 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
 
     asrPipeline = await pipeline('automatic-speech-recognition', modelId, {
       device: 'wasm',
+      dtype: 'q8',
       progress_callback: progressCallback,
     });
 
@@ -1488,4 +1499,6 @@ export const _testExports = {
   get webgpuFailed(): boolean {
     return webgpuFailed;
   },
+  // 進度聚合器（供測試驗證多檔案下載進度計算）。
+  DownloadProgressAggregator,
 };
