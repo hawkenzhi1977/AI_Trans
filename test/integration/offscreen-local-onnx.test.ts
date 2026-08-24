@@ -178,6 +178,52 @@ describe('offscreen local-onnx 模型載入彈性化', () => {
     const res = await _testExports.checkModelStatus();
     expect((res as { downloaded: boolean }).downloaded).toBe(false);
   });
+
+  it('checkModelStatus：模型已載入記憶體 → loaded true（M1-59）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+
+    // 先下載（會載入 pipeline 到記憶體）。
+    await _testExports.downloadModel();
+    const res = await _testExports.checkModelStatus();
+
+    expect(res.type).toBe('local-onnx:status');
+    expect((res as { loaded?: boolean }).loaded).toBe(true);
+    expect((res as { loading?: boolean }).loading).toBe(false);
+    expect((res as { downloaded: boolean }).downloaded).toBe(true);
+  });
+
+  it('checkModelStatus：背景預熱進行中 → loading true（M1-59）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    // 掛起載入：模擬 check-status 觸發的背景預熱仍在進行。
+    transformersMock.pipeline.mockImplementationOnce(() => new Promise(() => {}));
+
+    const res = await _testExports.checkModelStatus();
+    // 快取存在 → downloaded true；載入進行中 → loading true、loaded false。
+    expect((res as { downloaded: boolean }).downloaded).toBe(true);
+    expect((res as { loaded?: boolean }).loaded).toBe(false);
+    expect((res as { loading?: boolean }).loading).toBe(true);
+  });
+
+  it('checkModelStatus：背景預熱完成 → 廣播 local-onnx:status loaded true（M1-59）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => []);
+
+    await _testExports.checkModelStatus();
+    // 等待背景預熱完成並廣播。
+    await new Promise((r) => setTimeout(r, 20));
+
+    const broadcastMsgs = (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mock.calls
+      .map((c) => c[0])
+      .filter((m) => (m as { type?: string }).type === 'local-onnx:status');
+    expect(broadcastMsgs.length).toBeGreaterThan(0);
+    const last = broadcastMsgs[broadcastMsgs.length - 1] as {
+      loaded?: boolean;
+      loading?: boolean;
+    };
+    expect(last.loaded).toBe(true);
+    expect(last.loading).toBe(false);
+  });
 });
 
 describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', () => {

@@ -25,13 +25,13 @@ type OffscreenResponse =
   | { type: 'captureStopped' }
   | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
   | { type: 'error'; message: string }
-  | { type: 'local-onnx:status'; downloaded: boolean; modelName: string }
+  | { type: 'local-onnx:status'; downloaded: boolean; modelName: string; loaded?: boolean; loading?: boolean; downloading?: boolean }
   | { type: 'local-onnx:warmup-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
   | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
-  | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string }
+  | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
   | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
   | { type: 'asr-whisper:cache-cleared'; ok: boolean };
@@ -465,6 +465,9 @@ function preferWebGpu(): boolean {
 /** ASR Whisper pipeline 實例（僅用於下載，推理由 content-script 執行）。 */
 let asrPipeline: unknown = null;
 
+/** ASR Whisper 模型下載進行中旗標（M1-59）——供 check-status 讓 Options 頁顯示「下載中」。 */
+let asrDownloadInProgress = false;
+
 /** transformers.js 進度回調結構。 */
 interface TransformersProgress {
   status: string;
@@ -694,24 +697,45 @@ async function checkModelStatus(): Promise<OffscreenResponse> {
   try {
     const downloaded = await hasModelInCache();
     // 快取存在且未載入 → 後台預熱（非阻塞；失敗僅記錄診斷，不影響狀態判定）。
+    // M1-59：背景預熱完成/失敗時主動 broadcast 最新狀態，讓開啟中的 Options 頁即時
+    // 從「預加載中」刷新為「已預加載（記憶體）」（此前 Options 只會在頁面生命週期
+    // 內主動查一次狀態，背景預熱完成後不會自動刷新）。
     if (downloaded && translationPipeline === null) {
-      void ensurePipelineLoaded().catch((err) => {
-        recordDiagnostic({
-          type: 'pipeline-error',
-          error: {
-            port: 'translation',
-            code: 'local-onnx-pipeline-warmup-failed',
-            recoverable: true,
-            cause: toReadableError(err),
-          },
+      void ensurePipelineLoaded()
+        .then(() => {
+          broadcastToAll({
+            type: 'local-onnx:status',
+            downloaded,
+            modelName: LOCAL_MODEL_NAME,
+            loaded: true,
+            loading: false,
+            downloading: false,
+          });
+        })
+        .catch((err) => {
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'translation',
+              code: 'local-onnx-pipeline-warmup-failed',
+              recoverable: true,
+              cause: toReadableError(err),
+            },
+          });
         });
-      });
     }
 
+    // M1-59：擴充狀態字段——讓 Options 頁能區分「已下載」與「已預加載到記憶體」，
+    // 並在地圖背景預熱（check-status 觸發）進行中時顯示「預加載中」。
+    const loaded = translationPipeline !== null;
+    const loading = loadPromise !== null && !loaded;
     return {
       type: 'local-onnx:status',
       downloaded,
       modelName: LOCAL_MODEL_NAME,
+      loaded,
+      loading,
+      downloading: false,
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：狀態檢查失敗必須落診斷。
@@ -931,6 +955,7 @@ async function checkAsrModelStatus(modelId: string): Promise<OffscreenResponse> 
       type: 'asr-whisper:status',
       downloaded,
       modelId,
+      downloading: asrDownloadInProgress,
     } satisfies OffscreenResponse;
   } catch (err) {
     recordDiagnostic({
@@ -952,6 +977,7 @@ async function checkAsrModelStatus(modelId: string): Promise<OffscreenResponse> 
 
 /** 下載 ASR Whisper 模型——使用 transformers.js pipeline 觸發下載到 Cache API。 */
 async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
+  asrDownloadInProgress = true;
   try {
     // 先檢查是否已緩存，避免重複下載。
     if (await hasAsrModelInCache(modelId)) {
@@ -1050,6 +1076,8 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
       ok: false,
       error: error.message,
     } satisfies OffscreenResponse;
+  } finally {
+    asrDownloadInProgress = false;
   }
 }
 
@@ -1434,6 +1462,8 @@ export function resetLocalOnnxModuleForTest(): void {
   idleCloseRequested = false;
   // 重置 WebGPU 失敗記憶（M2-26；避免測試間互相污染）。
   webgpuFailed = false;
+  // M1-59：重置 ASR 下載進行中旗標（避免測試間互相污染）。
+  asrDownloadInProgress = false;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -1448,6 +1478,10 @@ export const _testExports = {
   parseNumberedOutput,
   warmupModel,
   shutdownForIdle,
+  // M1-59：ASR 狀態檢查/下載（供測試驗證 downloading 旗標與狀態字段）。
+  checkAsrModelStatus,
+  downloadAsrModel,
+  hasAsrModelInCache,
   // M2-26：WebGPU 設備決策（供測試驗證 webgpu/wasm 選擇與回退）。
   preferWebGpu,
   // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { resetChromeMock } from '../support/setup-dom';
+import { resetChromeMock, dispatchRuntimeMessage } from '../support/setup-dom';
 import type { EngineConfig } from '../../src/domain/models/config';
 
 // options.ts 在 import 時即執行 void init()。測試用動態 import 載入後斷言 DOM。
@@ -267,5 +267,70 @@ describe('Options — M2-24 補充修復十三 預加載模型按鈕', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(document.getElementById('local-model-status-badge')!.textContent).toContain('預加載失敗');
     expect(document.getElementById('status')!.textContent).toContain('Local ONNX model not downloaded');
+  });
+});
+
+describe('Options — M1-59 模型狀態廣播即時刷新', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('收到 local-onnx:status loaded=true 廣播 → badge 顯示已預加載（記憶體）', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    // check-status 返回模型已下載但未載入。
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      result: { downloaded: true, loaded: false, loading: false },
+    });
+    await loadOptions();
+    // 初始為「已就緒」。
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('已就緒');
+
+    // 背景預熱完成 → offscreen 廣播 loaded:true → Options 即時刷新。
+    dispatchRuntimeMessage({
+      type: 'local-onnx:status',
+      downloaded: true,
+      loaded: true,
+      loading: false,
+      downloading: false,
+    });
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('已預加載');
+  });
+
+  it('收到 local-onnx:status downloading=true 廣播 → badge 顯示下載中', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      result: { downloaded: false },
+    });
+    await loadOptions();
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('未下載');
+
+    dispatchRuntimeMessage({
+      type: 'local-onnx:status',
+      downloaded: false,
+      loading: true,
+      downloading: true,
+    });
+    expect(document.getElementById('local-model-status-badge')!.textContent).toContain('下載中');
+  });
+
+  it('收到 asr-whisper:status downloading=true 廣播 → badge 顯示下載中', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      result: { downloaded: false },
+    });
+    await loadOptions();
+    expect(document.getElementById('asr-model-status-badge')!.textContent).toContain('未下載');
+
+    dispatchRuntimeMessage({
+      type: 'asr-whisper:status',
+      downloaded: false,
+      downloading: true,
+      modelId: 'Xenova/whisper-base.en',
+    });
+    expect(document.getElementById('asr-model-status-badge')!.textContent).toContain('下載中');
   });
 });

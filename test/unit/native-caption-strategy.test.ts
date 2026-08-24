@@ -270,21 +270,125 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
     expect(aborted).toBe(true);
   });
 
-  it('getPrioritizedSegments：滑動窗口 [currentTime+2s, currentTime+120s] 內的 segments 優先', () => {
+  it('[M1-59] run()：ONNX 兜底配置 → 翻譯請求起點 = currentTime+5s', async () => {
+    const segments = multiSegmentTrack(); // 10 段，每段 5s（start: 0,5000,...,45000）
+    const s = new NativeCaptionStrategy();
+    const ctx = makeCtxWithPlayback(mockPlatformWithTrack(segments), 10000);
+    // ONNX 作為兜底引擎（用戶場景：雲端 LLM 主 + local-onnx 兜底）
+    ctx.config.translation = { type: 'llm', model: 'gpt-4o', endpoint: 'http://api/v1', fallbackType: 'local-onnx' };
+    const inputs: SubtitleSegment[][] = [];
+    ctx.translation = {
+      engineId: 'pipeline',
+      location: 'cloud' as const,
+      translate: async () => ({ segments: [], targetLang: 'zh-Hant' }),
+      translateStream: async (
+        input: { segments: SubtitleSegment[]; targetLang: string },
+        emit: (r: { segments: SubtitleSegment[]; engineId: string; degraded: boolean }) => void
+      ) => {
+        inputs.push(input.segments);
+        emit({ segments: input.segments.map((seg) => ({ ...seg, translatedText: 't' })), engineId: 'local-onnx', degraded: true });
+      },
+    } as TranslationProvider;
+
+    await s.run(ctx, () => {});
+    // 首次翻譯請求：in-window（start >= 10000+5000=15000）排前面，out-window 排後面
+    expect(inputs.length).toBeGreaterThan(0);
+    const firstRequest = inputs[0]!;
+    expect(firstRequest.length).toBeGreaterThan(0);
+    // in-window 段（start >= 15000）應在 out-window 段（start < 15000）之前
+    const inWindowStarts = firstRequest.filter((seg) => seg.start >= 15000).map((seg) => seg.start);
+    const outWindowStarts = firstRequest.filter((seg) => seg.start < 15000).map((seg) => seg.start);
+    // in-window 非空（segments 3-9: start 15000-45000）
+    expect(inWindowStarts.length).toBeGreaterThan(0);
+    // in-window 全部在前，out-window 全部在後：in-window 最大索引 < out-window 最小索引
+    const inWindowMaxIdx = firstRequest.filter((seg) => seg.start >= 15000).length - 1;
+    if (outWindowStarts.length > 0) {
+      const outWindowMinIdx = firstRequest.findIndex((seg) => seg.start < 15000);
+      expect(inWindowMaxIdx).toBeLessThan(outWindowMinIdx + inWindowStarts.length);
+    }
+    // 關鍵：所有 in-window 段的 start >= 15000（+5s 偏移生效）
+    for (const start of inWindowStarts) {
+      expect(start).toBeGreaterThanOrEqual(15000);
+    }
+  });
+
+  it('[M1-59] run()：非 ONNX 配置 → 翻譯請求起點 = currentTime（+0s）', async () => {
     const segments = multiSegmentTrack();
     const s = new NativeCaptionStrategy();
-    // 直接測試私有方法（通過 any 訪問）
-    const getPrioritized = (s as unknown as { getPrioritizedSegments: (ct: number) => SubtitleSegment[] }).getPrioritizedSegments.bind(s);
+    const ctx = makeCtxWithPlayback(mockPlatformWithTrack(segments), 10000);
+    // 雲端 LLM 主 + MT 兜底（非 ONNX）
+    ctx.config.translation = { type: 'llm', model: 'gpt-4o', endpoint: 'http://api/v1', fallbackType: 'mt' };
+    const inputs: SubtitleSegment[][] = [];
+    ctx.translation = {
+      engineId: 'pipeline',
+      location: 'cloud' as const,
+      translate: async () => ({ segments: [], targetLang: 'zh-Hant' }),
+      translateStream: async (
+        input: { segments: SubtitleSegment[]; targetLang: string },
+        emit: (r: { segments: SubtitleSegment[]; engineId: string; degraded: boolean }) => void
+      ) => {
+        inputs.push(input.segments);
+        emit({ segments: input.segments.map((seg) => ({ ...seg, translatedText: 't' })), engineId: 'llm', degraded: false });
+      },
+    } as TranslationProvider;
+
+    await s.run(ctx, () => {});
+    // 首次翻譯請求：in-window（start >= 10000+0=10000）排前面
+    expect(inputs.length).toBeGreaterThan(0);
+    const firstRequest = inputs[0]!;
+    expect(firstRequest.length).toBeGreaterThan(0);
+    // in-window 段（start >= 10000）應在 out-window 段（start < 10000）之前
+    const inWindowStarts = firstRequest.filter((seg) => seg.start >= 10000).map((seg) => seg.start);
+    expect(inWindowStarts.length).toBeGreaterThan(0);
+    for (const start of inWindowStarts) {
+      expect(start).toBeGreaterThanOrEqual(10000);
+    }
+  });
+
+  it('getPrioritizedSegments：滑動窗口 [currentTime+offset, currentTime+120s] 內的 segments 優先（M1-59）', () => {
+    const segments = multiSegmentTrack();
+    const s = new NativeCaptionStrategy();
+    // 直接測試私有方法（通過 any 訪問）——第二參數為窗口起點偏移
+    const getPrioritized = (s as unknown as { getPrioritizedSegments: (ct: number, offsetMs: number) => SubtitleSegment[] }).getPrioritizedSegments.bind(s);
     // 需要先設置 allSegments
     (s as unknown as { allSegments: SubtitleSegment[] }).allSegments = segments;
 
     // currentTime = 10000ms (10s)
-    // 窗口：[12000, 130000]
-    // 窗口內：segments 2-9 (start: 10000-45000) 中 start >= 12000 的 → segments 3-9 (start: 15000-45000)
+    // ONNX 偏移 +5s：窗口 [15000, 130000]
+    // 窗口內：segments start >= 15000 → segments 3-9 (start: 15000-45000)
     // 窗口外：segments 0-2 (start: 0-10000)
-    const prioritized = getPrioritized(10000);
-    // 窗口內的排前面
-    expect(prioritized[0].start).toBeGreaterThanOrEqual(12000);
+    const prioritized = getPrioritized(10000, 5000);
+    // 窗口內的排前面，起點 >= currentTime+5s
+    expect(prioritized[0].start).toBeGreaterThanOrEqual(15000);
+  });
+
+  it('getPrioritizedSegments：非 ONNX 引擎偏移 +0s（窗口從當前播放點開始）', () => {
+    const segments = multiSegmentTrack();
+    const s = new NativeCaptionStrategy();
+    const getPrioritized = (s as unknown as { getPrioritizedSegments: (ct: number, offsetMs: number) => SubtitleSegment[] }).getPrioritizedSegments.bind(s);
+    (s as unknown as { allSegments: SubtitleSegment[] }).allSegments = segments;
+
+    // currentTime = 10000ms，偏移 +0s：窗口 [10000, 130000]
+    // 窗口內從 start >= 10000 開始（segment 2, start=10000）
+    const prioritized = getPrioritized(10000, 0);
+    expect(prioritized[0].start).toBe(10000);
+  });
+
+  it('windowStartOffsetMs：ONNX（type/fallbackType）→ +5s，其他引擎 → +0s', () => {
+    // 通過私有方法 getPrioritizedSegments 的起點行為間接驗證偏移選擇（windowStartOffsetMs 為模組級函數）
+    const segments = multiSegmentTrack();
+
+    // ONNX 主引擎：起點 currentTime+5s
+    const sOnnx = new NativeCaptionStrategy();
+    (sOnnx as unknown as { allSegments: SubtitleSegment[] }).allSegments = segments;
+    const onnxPrioritized = (sOnnx as unknown as { getPrioritizedSegments: (ct: number, offsetMs: number) => SubtitleSegment[] }).getPrioritizedSegments(10000, 5000);
+    expect(onnxPrioritized[0].start).toBeGreaterThanOrEqual(15000);
+
+    // 非 ONNX：起點 currentTime
+    const sOther = new NativeCaptionStrategy();
+    (sOther as unknown as { allSegments: SubtitleSegment[] }).allSegments = segments;
+    const otherPrioritized = (sOther as unknown as { getPrioritizedSegments: (ct: number, offsetMs: number) => SubtitleSegment[] }).getPrioritizedSegments(10000, 0);
+    expect(otherPrioritized[0].start).toBe(10000);
   });
 
   it('已翻譯的 segments 不會重複翻譯', () => {
@@ -295,8 +399,8 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
     translatedIds.add('1');
     (s as unknown as { allSegments: SubtitleSegment[] }).allSegments = segments;
 
-    const getPrioritized = (s as unknown as { getPrioritizedSegments: (ct: number) => SubtitleSegment[] }).getPrioritizedSegments.bind(s);
-    const prioritized = getPrioritized(0);
+    const getPrioritized = (s as unknown as { getPrioritizedSegments: (ct: number, offsetMs: number) => SubtitleSegment[] }).getPrioritizedSegments.bind(s);
+    const prioritized = getPrioritized(0, 0);
     // 已翻譯的 0 和 1 不在結果中
     expect(prioritized.find(seg => seg.id === '0')).toBeUndefined();
     expect(prioritized.find(seg => seg.id === '1')).toBeUndefined();

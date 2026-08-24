@@ -345,6 +345,40 @@
       progressText.textContent = `${Math.round(percent)}%`;
       if (detail) progressDetail.textContent = detail;
     }
+    function applyModelStatus(status) {
+      if (status.downloading) {
+        updateStatusBadge("downloading");
+        btnDownload.disabled = true;
+        btnWarmup.disabled = true;
+        btnClear.disabled = false;
+        return;
+      }
+      if (status.loaded) {
+        updateStatusBadge("preloaded");
+        btnDownload.disabled = true;
+        btnWarmup.disabled = true;
+        btnClear.disabled = false;
+        return;
+      }
+      if (status.loading) {
+        updateStatusBadge("preloading");
+        btnDownload.disabled = true;
+        btnWarmup.disabled = true;
+        btnClear.disabled = false;
+        return;
+      }
+      if (status.downloaded) {
+        updateStatusBadge("downloaded");
+        btnDownload.disabled = true;
+        btnWarmup.disabled = false;
+        btnClear.disabled = false;
+      } else {
+        updateStatusBadge("not-downloaded");
+        btnDownload.disabled = false;
+        btnWarmup.disabled = true;
+        btnClear.disabled = true;
+      }
+    }
     async function checkModelStatus() {
       updateStatusBadge("checking");
       try {
@@ -352,11 +386,8 @@
           topic: "local-onnx:check-status"
         });
         const res = response;
-        if (res.ok && res.result?.downloaded) {
-          updateStatusBadge("downloaded");
-          btnDownload.disabled = true;
-          btnWarmup.disabled = false;
-          btnClear.disabled = false;
+        if (res.ok && res.result) {
+          applyModelStatus(res.result);
         } else {
           updateStatusBadge("not-downloaded");
           btnDownload.disabled = false;
@@ -465,6 +496,16 @@
     btnDownload.addEventListener("click", () => void downloadModel());
     btnWarmup.addEventListener("click", () => void warmupModel());
     btnClear.addEventListener("click", () => void clearModelCache());
+    chrome.runtime.onMessage.addListener(
+      (message) => {
+        const msg = message;
+        if (msg.type === "local-onnx:status") {
+          const statusMsg = msg;
+          applyModelStatus(statusMsg);
+        }
+        return false;
+      }
+    );
     void checkModelStatus();
   }
   var WHISPER_MODEL_IDS = {
@@ -528,6 +569,23 @@
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
     }
+    function applyModelStatus(status) {
+      if (status.downloading) {
+        updateStatusBadge("downloading");
+        btnDownload.disabled = true;
+        btnClear.disabled = false;
+        return;
+      }
+      if (status.downloaded) {
+        updateStatusBadge("downloaded");
+        btnDownload.disabled = true;
+        btnClear.disabled = false;
+      } else {
+        updateStatusBadge("not-downloaded");
+        btnDownload.disabled = false;
+        btnClear.disabled = true;
+      }
+    }
     async function checkModelStatus() {
       const modelId = getCurrentModelId();
       updateModelName();
@@ -538,10 +596,8 @@
           payload: { modelId }
         });
         const res = response;
-        if (res.ok && res.result?.downloaded) {
-          updateStatusBadge("downloaded");
-          btnDownload.disabled = true;
-          btnClear.disabled = false;
+        if (res.ok && res.result) {
+          applyModelStatus(res.result);
         } else {
           updateStatusBadge("not-downloaded");
           btnDownload.disabled = false;
@@ -619,6 +675,16 @@
     }
     btnDownload.addEventListener("click", () => void downloadModel());
     btnClear.addEventListener("click", () => void clearModelCache());
+    chrome.runtime.onMessage.addListener(
+      (message) => {
+        const msg = message;
+        if (msg.type === "asr-whisper:status") {
+          const statusMsg = msg;
+          applyModelStatus(statusMsg);
+        }
+        return false;
+      }
+    );
     tierSelect.addEventListener("change", () => void checkModelStatus());
     customModelInput.addEventListener("input", () => void checkModelStatus());
     updateModelName();

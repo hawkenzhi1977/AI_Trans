@@ -48814,6 +48814,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   var asrPipeline = null;
+  var asrDownloadInProgress = false;
   function toReadableError(err) {
     if (err instanceof Error) {
       const code = err.code;
@@ -48950,7 +48951,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     try {
       const downloaded = await hasModelInCache();
       if (downloaded && translationPipeline === null) {
-        void ensurePipelineLoaded().catch((err) => {
+        void ensurePipelineLoaded().then(() => {
+          broadcastToAll({
+            type: "local-onnx:status",
+            downloaded,
+            modelName: LOCAL_MODEL_NAME,
+            loaded: true,
+            loading: false,
+            downloading: false
+          });
+        }).catch((err) => {
           recordDiagnostic({
             type: "pipeline-error",
             error: {
@@ -48962,10 +48972,15 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           });
         });
       }
+      const loaded = translationPipeline !== null;
+      const loading = loadPromise !== null && !loaded;
       return {
         type: "local-onnx:status",
         downloaded,
-        modelName: LOCAL_MODEL_NAME
+        modelName: LOCAL_MODEL_NAME,
+        loaded,
+        loading,
+        downloading: false
       };
     } catch (err) {
       recordDiagnostic({
@@ -49126,7 +49141,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       return {
         type: "asr-whisper:status",
         downloaded,
-        modelId
+        modelId,
+        downloading: asrDownloadInProgress
       };
     } catch (err) {
       recordDiagnostic({
@@ -49146,6 +49162,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   async function downloadAsrModel(modelId) {
+    asrDownloadInProgress = true;
     try {
       if (await hasAsrModelInCache(modelId)) {
         return {
@@ -49233,6 +49250,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         ok: false,
         error: error.message
       };
+    } finally {
+      asrDownloadInProgress = false;
     }
   }
   async function clearAsrModelCache(modelId) {
@@ -49516,6 +49535,7 @@ ${numbered}
     busyCount = 0;
     idleCloseRequested = false;
     webgpuFailed = false;
+    asrDownloadInProgress = false;
   }
   var _testExports = {
     hasModelInCache,
@@ -49528,6 +49548,10 @@ ${numbered}
     parseNumberedOutput,
     warmupModel,
     shutdownForIdle,
+    // M1-59：ASR 狀態檢查/下載（供測試驗證 downloading 旗標與狀態字段）。
+    checkAsrModelStatus,
+    downloadAsrModel,
+    hasAsrModelInCache,
     // M2-26：WebGPU 設備決策（供測試驗證 webgpu/wasm 選擇與回退）。
     preferWebGpu,
     // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。

@@ -4,6 +4,31 @@ import { vi } from 'vitest';
 // 內存版 chrome.storage.local
 const memory = new Map<string, unknown>();
 
+// runtime.onMessage 監聽器註冊表——存儲在 chromeMock 對象上，讓 setup 文件實例與
+// 測試 import 實例共享同一份狀態（Vitest 將 setupFile 與測試 import 視為不同模塊實例）。
+const onMessageListeners = new Set<(msg: unknown) => boolean>();
+const onMessageAdd = vi.fn((cb: (msg: unknown) => boolean) => {
+  onMessageListeners.add(cb);
+});
+const onMessageRemove = vi.fn((cb: (msg: unknown) => boolean) => {
+  onMessageListeners.delete(cb);
+});
+
+/** 觸發所有已註冊的 runtime.onMessage 監聽器（測試驅動廣播用）。 */
+export function dispatchRuntimeMessage(message: unknown): void {
+  const listeners: Set<(msg: unknown) => boolean> | undefined =
+    (globalThis.chrome as { runtime?: { onMessage?: { _listeners?: Set<(msg: unknown) => boolean> } } })
+      ?.runtime?.onMessage?._listeners;
+  for (const cb of [...(listeners ?? [])]) {
+    cb(message);
+  }
+}
+
+/** 測試用：目前註冊的 onMessage 監聽器數量。 */
+export function getOnMessageListenerCount(): number {
+  return onMessageListeners.size;
+}
+
 const chromeMock = {
   storage: {
     local: {
@@ -31,13 +56,13 @@ const chromeMock = {
     // M2-26：SW ensureOffscreenDocument 用；返空上下文 → 觸發 createDocument。
     getContexts: vi.fn(async () => [] as unknown[]),
     ContextType: { OFFSCREEN_DOCUMENT: 'OFFSCREEN_DOCUMENT' },
-    onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+    onMessage: { addListener: onMessageAdd, removeListener: onMessageRemove, _listeners: onMessageListeners },
     onConnect: { addListener: vi.fn(), removeListener: vi.fn() },
     sendMessage: vi.fn(),
     connect: vi.fn(() => ({
       name: 'mock-port',
       postMessage: vi.fn(),
-      onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+onMessage: { addListener: onMessageAdd, removeListener: onMessageRemove },
       onDisconnect: { addListener: vi.fn(), removeListener: vi.fn() },
       disconnect: vi.fn(),
     })),
@@ -64,5 +89,10 @@ globalThis.chrome = chromeMock;
 
 export function resetChromeMock(): void {
   memory.clear();
+  // 透過 global chrome 對象清理監聽器（跨模塊實例共享；避免測試間監聽器累積）。
+  const listeners = (globalThis.chrome as { runtime?: { onMessage?: { _listeners?: Set<unknown> } } })
+    ?.runtime?.onMessage?._listeners;
+  listeners?.clear();
+  onMessageListeners.clear();
   vi.clearAllMocks();
 }

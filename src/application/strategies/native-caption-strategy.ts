@@ -3,10 +3,18 @@ import type { SubtitleSegment } from '../../domain/models/subtitle';
 import type { CaptionStrategy, StrategyContext } from '../../domain/ports/caption-strategy';
 import { diagLog } from '../../infrastructure/debug-log';
 
-/** 滑動窗口起始偏移（毫秒）：從 currentTime 之後 2s 開始翻譯，之前的內容無意義。 */
-const WINDOW_START_OFFSET_MS = 2000;
-/** 滑動窗口結束偏移（毫秒）：優先翻譯 currentTime+2s ~ currentTime+120s 範圍。 */
+/** 滑動窗口起點偏移（M1-59，按引擎區分）：本地 ONNX 用 +5s（推理慢、需多預留 lead time）；其他引擎用 +0s（從當前播放點開始）。 */
+const WINDOW_START_OFFSET_ONNX_MS = 5000;
+const WINDOW_START_OFFSET_DEFAULT_MS = 0;
+/** 滑動窗口結束偏移（毫秒）：優先翻譯 [起點, currentTime+120s] 範圍。 */
 const WINDOW_END_OFFSET_MS = 120_000;
+
+/** 依翻譯配置計算滑動窗口起點偏移：ONNX（主/兜底）→ +5s，其餘 → +0s。 */
+function windowStartOffsetMs(translation: { type: string; fallbackType?: string }): number {
+  return translation.type === 'local-onnx' || translation.fallbackType === 'local-onnx'
+    ? WINDOW_START_OFFSET_ONNX_MS
+    : WINDOW_START_OFFSET_DEFAULT_MS;
+}
 
 /**
  * 一級策略：原生字幕。抓取平台原生字幕軌 → 翻譯 → 推送 segments-ready。
@@ -94,7 +102,7 @@ export class NativeCaptionStrategy implements CaptionStrategy {
 
   /**
    * 動態優先級翻譯循環：
-   * 1. 按 currentTime+2s 為起點排序未翻譯 segments（滑動窗口優先）
+    * 1. 按 currentTime+offset 為起點排序未翻譯 segments（滑動窗口優先；M1-59：ONNX +5s / 其他 +0s）
    * 2. 流式翻譯，每 chunk 完成即 emit 累計結果
    * 3. seek 時中斷當前翻譯，重新優先化後繼續
    */
@@ -114,8 +122,8 @@ export class NativeCaptionStrategy implements CaptionStrategy {
       const currentTime = this.seekTime || ctx.playback().currentTime;
       this.seekTime = 0;
 
-      // 獲取按優先級排序的未翻譯 segments
-      const prioritized = this.getPrioritizedSegments(currentTime);
+      // 獲取按優先級排序的未翻譯 segments（M1-59：窗口起點偏移依引擎——ONNX +5s / 其他 +0s）
+      const prioritized = this.getPrioritizedSegments(currentTime, windowStartOffsetMs(ctx.config.translation));
       if (prioritized.length === 0) {
         diagLog('strategy', 'all segments translated, total:', this.translatedIds.size);
         break;
@@ -194,14 +202,14 @@ export class NativeCaptionStrategy implements CaptionStrategy {
 
   /**
    * 獲取按優先級排序的未翻譯 segments。
-   * 滑動窗口 [currentTime+2s, currentTime+120s] 內的 segments 優先，
-   * 窗口外的按時間順序排在後面。
+   * M1-59 滑動窗口 [currentTime+offset, currentTime+120s] 內的 segments 優先
+   * （offset：ONNX +5s / 其他 +0s），窗口外的按時間順序排在後面。
    */
-  private getPrioritizedSegments(currentTime: number): SubtitleSegment[] {
+  private getPrioritizedSegments(currentTime: number, offsetMs: number): SubtitleSegment[] {
     const untranslated = this.allSegments.filter(s => !this.translatedIds.has(s.id));
     if (untranslated.length === 0) return [];
 
-    const windowStart = currentTime + WINDOW_START_OFFSET_MS;
+    const windowStart = currentTime + offsetMs;
     const windowEnd = currentTime + WINDOW_END_OFFSET_MS;
 
     // 窗口內的 segments（優先）

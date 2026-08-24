@@ -49246,8 +49246,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   };
 
   // src/application/strategies/native-caption-strategy.ts
-  var WINDOW_START_OFFSET_MS = 2e3;
+  var WINDOW_START_OFFSET_ONNX_MS = 5e3;
+  var WINDOW_START_OFFSET_DEFAULT_MS = 0;
   var WINDOW_END_OFFSET_MS = 12e4;
+  function windowStartOffsetMs(translation) {
+    return translation.type === "local-onnx" || translation.fallbackType === "local-onnx" ? WINDOW_START_OFFSET_ONNX_MS : WINDOW_START_OFFSET_DEFAULT_MS;
+  }
   var NativeCaptionStrategy = class {
     origin = "native";
     stopped = false;
@@ -49317,7 +49321,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     /**
      * 動態優先級翻譯循環：
-     * 1. 按 currentTime+2s 為起點排序未翻譯 segments（滑動窗口優先）
+      * 1. 按 currentTime+offset 為起點排序未翻譯 segments（滑動窗口優先；M1-59：ONNX +5s / 其他 +0s）
      * 2. 流式翻譯，每 chunk 完成即 emit 累計結果
      * 3. seek 時中斷當前翻譯，重新優先化後繼續
      */
@@ -49330,7 +49334,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         }
         const currentTime = this.seekTime || ctx.playback().currentTime;
         this.seekTime = 0;
-        const prioritized = this.getPrioritizedSegments(currentTime);
+        const prioritized = this.getPrioritizedSegments(currentTime, windowStartOffsetMs(ctx.config.translation));
         if (prioritized.length === 0) {
           diagLog("strategy", "all segments translated, total:", this.translatedIds.size);
           break;
@@ -49427,13 +49431,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     /**
      * 獲取按優先級排序的未翻譯 segments。
-     * 滑動窗口 [currentTime+2s, currentTime+120s] 內的 segments 優先，
-     * 窗口外的按時間順序排在後面。
+     * M1-59 滑動窗口 [currentTime+offset, currentTime+120s] 內的 segments 優先
+     * （offset：ONNX +5s / 其他 +0s），窗口外的按時間順序排在後面。
      */
-    getPrioritizedSegments(currentTime) {
+    getPrioritizedSegments(currentTime, offsetMs) {
       const untranslated = this.allSegments.filter((s) => !this.translatedIds.has(s.id));
       if (untranslated.length === 0) return [];
-      const windowStart = currentTime + WINDOW_START_OFFSET_MS;
+      const windowStart = currentTime + offsetMs;
       const windowEnd = currentTime + WINDOW_END_OFFSET_MS;
       const inWindow = untranslated.filter((s) => s.start >= windowStart && s.start <= windowEnd);
       const outWindow = untranslated.filter((s) => s.start < windowStart || s.start > windowEnd);

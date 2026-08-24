@@ -332,6 +332,48 @@ function initLocalOnnxModelUI(): void {
     if (detail) progressDetail.textContent = detail;
   }
 
+  /** 依 offscreen 回報的狀態字段更新 badge。 */
+  function applyModelStatus(status: {
+    downloaded: boolean;
+    loaded?: boolean;
+    loading?: boolean;
+    downloading?: boolean;
+  }): void {
+    // M1-59：優先展示載入/下載進行中的狀態，讓 Options 頁與實際模型狀態同步。
+    if (status.downloading) {
+      updateStatusBadge('downloading');
+      btnDownload.disabled = true;
+      btnWarmup.disabled = true;
+      btnClear.disabled = false;
+      return;
+    }
+    if (status.loaded) {
+      updateStatusBadge('preloaded');
+      btnDownload.disabled = true;
+      btnWarmup.disabled = true;
+      btnClear.disabled = false;
+      return;
+    }
+    if (status.loading) {
+      updateStatusBadge('preloading');
+      btnDownload.disabled = true;
+      btnWarmup.disabled = true;
+      btnClear.disabled = false;
+      return;
+    }
+    if (status.downloaded) {
+      updateStatusBadge('downloaded');
+      btnDownload.disabled = true;
+      btnWarmup.disabled = false;
+      btnClear.disabled = false;
+    } else {
+      updateStatusBadge('not-downloaded');
+      btnDownload.disabled = false;
+      btnWarmup.disabled = true;
+      btnClear.disabled = true;
+    }
+  }
+
   /** 檢查模型狀態。 */
   async function checkModelStatus(): Promise<void> {
     updateStatusBadge('checking');
@@ -339,12 +381,12 @@ function initLocalOnnxModelUI(): void {
       const response = await chrome.runtime.sendMessage({
         topic: 'local-onnx:check-status',
       });
-      const res = response as { ok: boolean; result?: { downloaded: boolean } };
-      if (res.ok && res.result?.downloaded) {
-        updateStatusBadge('downloaded');
-        btnDownload.disabled = true;
-        btnWarmup.disabled = false;
-        btnClear.disabled = false;
+      const res = response as {
+        ok: boolean;
+        result?: { downloaded: boolean; loaded?: boolean; loading?: boolean; downloading?: boolean };
+      };
+      if (res.ok && res.result) {
+        applyModelStatus(res.result);
       } else {
         updateStatusBadge('not-downloaded');
         btnDownload.disabled = false;
@@ -480,6 +522,26 @@ function initLocalOnnxModelUI(): void {
   btnWarmup.addEventListener('click', () => void warmupModel());
   btnClear.addEventListener('click', () => void clearModelCache());
 
+  // M1-59：監聽 offscreen 主動廣播的狀態（背景預熱完成/失敗後即時刷新，
+  // 而不是只在頁面生命週期內查一次）。頁面生命週期只註冊一次，不隨操作重複註冊。
+  chrome.runtime.onMessage.addListener(
+    (message: unknown): boolean => {
+      const msg = message as { type?: string };
+      if (msg.type === 'local-onnx:status') {
+        const statusMsg = msg as {
+          type: string;
+          downloaded: boolean;
+          loaded?: boolean;
+          loading?: boolean;
+          downloading?: boolean;
+        };
+        // 下載完成/清除快取路徑已有專屬監聽器處理進度；這裡只處理被動狀態廣播。
+        applyModelStatus(statusMsg);
+      }
+      return false;
+    }
+  );
+
   // 初始檢查模型狀態。
   void checkModelStatus();
 }
@@ -570,6 +632,26 @@ function initAsrModelUI(): void {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
   }
 
+  /** 依 offscreen 回報的狀態字段更新 badge。 */
+  function applyModelStatus(status: { downloaded: boolean; downloading?: boolean }): void {
+    // M1-59：下載進行中時顯示「下載中...」，Options 頁重開也能看到進行中的下載。
+    if (status.downloading) {
+      updateStatusBadge('downloading');
+      btnDownload.disabled = true;
+      btnClear.disabled = false;
+      return;
+    }
+    if (status.downloaded) {
+      updateStatusBadge('downloaded');
+      btnDownload.disabled = true;
+      btnClear.disabled = false;
+    } else {
+      updateStatusBadge('not-downloaded');
+      btnDownload.disabled = false;
+      btnClear.disabled = true;
+    }
+  }
+
   /** 檢查 ASR 模型狀態。 */
   async function checkModelStatus(): Promise<void> {
     const modelId = getCurrentModelId();
@@ -580,11 +662,12 @@ function initAsrModelUI(): void {
         topic: 'asr-whisper:check-status',
         payload: { modelId },
       });
-      const res = response as { ok: boolean; result?: { downloaded: boolean } };
-      if (res.ok && res.result?.downloaded) {
-        updateStatusBadge('downloaded');
-        btnDownload.disabled = true;
-        btnClear.disabled = false;
+      const res = response as {
+        ok: boolean;
+        result?: { downloaded: boolean; downloading?: boolean };
+      };
+      if (res.ok && res.result) {
+        applyModelStatus(res.result);
       } else {
         updateStatusBadge('not-downloaded');
         btnDownload.disabled = false;
@@ -680,6 +763,23 @@ function initAsrModelUI(): void {
   // 綁定按鈕事件。
   btnDownload.addEventListener('click', () => void downloadModel());
   btnClear.addEventListener('click', () => void clearModelCache());
+
+  // M1-59：監聽 offscreen 主動廣播的 ASR 狀態（下載進行中時重開頁面也能看到）。
+  // 頁面生命週期只註冊一次，不隨操作重複註冊。
+  chrome.runtime.onMessage.addListener(
+    (message: unknown): boolean => {
+      const msg = message as { type?: string };
+      if (msg.type === 'asr-whisper:status') {
+        const statusMsg = msg as {
+          type: string;
+          downloaded: boolean;
+          downloading?: boolean;
+        };
+        applyModelStatus(statusMsg);
+      }
+      return false;
+    }
+  );
 
   // 檔位或自定義模型變更時更新模型名並重新檢查狀態。
   tierSelect.addEventListener('change', () => void checkModelStatus());
