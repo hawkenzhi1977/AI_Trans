@@ -192,6 +192,10 @@ export class LLMTranslationProvider implements TranslationProvider {
   ): Promise<void> {
     const accumulated: SubtitleSegment[] = [];
     for (const chunk of chunkSegments(req.segments)) {
+      // M2-32：每個 chunk 前檢查 abort signal（與 local-onnx 對齊，確保 stop() 後不繼續 fetch）。
+      if (req.signal?.aborted) {
+        throw new DOMException('Translation aborted', 'AbortError');
+      }
       const chunkResult = await this.translateChunkWithRetry(chunk, req);
       accumulated.push(...chunkResult);
       emit({
@@ -264,6 +268,20 @@ export class LLMTranslationProvider implements TranslationProvider {
           }
         }
 
+        // M2-32：語言錯誤偵測與重試——小模型可能輸出非目標語言（如目標 zh-Hant 卻輸出西班牙語/韓語/日語）。
+        const langErrorInfo = this.detectLanguageError(map, req.targetLang);
+        if (langErrorInfo.hasLanguageError) {
+          diagLog('llm', `language error detected (${langErrorInfo.wrongLangCount}/${map.size} values in wrong language), retrying with language warning`);
+          await sleep(INCOMPLETE_RETRY_DELAY_MS);
+          const retryMap = await this.translateChunkOnce(chunk, req, undefined, false, true);
+          const retryLangInfo = this.detectLanguageError(retryMap, req.targetLang);
+          if (!retryLangInfo.hasLanguageError) {
+            map = retryMap;
+          } else {
+            diagLog('llm', `language retry still has ${retryLangInfo.wrongLangCount} wrong-language values, using original result`);
+          }
+        }
+
         llmCache.set(cacheKey, map);
         return chunk.map((s, i) => ({
           ...s,
@@ -315,12 +333,96 @@ export class LLMTranslationProvider implements TranslationProvider {
     return { duplicateCount, hasExcessiveDuplicates };
   }
 
+  /**
+   * M2-32：偵測翻譯結果中的語言錯誤。
+   * 小模型可能輸出非目標語言（如目標 zh-Hant 卻輸出西班牙語/韓語/日語/SVG 亂碼）。
+   * 檢測邏輯：統計非目標語言字符比例，超過 50% 視為語言錯誤。
+   */
+  private detectLanguageError(map: Map<string, string>, targetLang: string): { hasLanguageError: boolean; wrongLangCount: number } {
+    if (map.size === 0) return { hasLanguageError: false, wrongLangCount: 0 };
+
+    let wrongLangCount = 0;
+    const totalChars = { count: 0 };
+
+    for (const value of map.values()) {
+      const chars = [...value];
+      totalChars.count += chars.length;
+
+      // 統計各類字符
+      let targetChars = 0;
+      let otherChars = 0;
+
+      for (const char of chars) {
+        const code = char.charCodeAt(0);
+        // 標點、數字、空格、常見符號不算
+        if (code < 0x30 || (code >= 0x30 && code <= 0x3F) || code === 0x20 || code === 0xA0) continue;
+
+        // 根據目標語言判斷
+        if (targetLang.startsWith('zh')) {
+          // 中文：CJK 統一表意文字 (4E00-9FFF)、擴展區、標點
+          if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) ||
+              (code >= 0x3000 && code <= 0x303F) || (code >= 0xFF00 && code <= 0xFFEF)) {
+            targetChars++;
+          } else if ((code >= 0x0041 && code <= 0x024F) || // 拉丁字母
+                     (code >= 0x0400 && code <= 0x04FF) || // 西里爾字母
+                     (code >= 0x3040 && code <= 0x30FF) || // 日文假名
+                     (code >= 0xAC00 && code <= 0xD7AF)) { // 韓文
+            otherChars++;
+          }
+        } else if (targetLang.startsWith('en')) {
+          // 英文：拉丁字母
+          if ((code >= 0x0041 && code <= 0x024F) || (code >= 0x0020 && code <= 0x007F)) {
+            targetChars++;
+          } else if ((code >= 0x4E00 && code <= 0x9FFF) || // CJK
+                     (code >= 0x0400 && code <= 0x04FF) || // 西里爾
+                     (code >= 0x3040 && code <= 0x30FF) || // 日文
+                     (code >= 0xAC00 && code <= 0xD7AF)) { // 韓文
+            otherChars++;
+          }
+        } else if (targetLang.startsWith('ja')) {
+          // 日文：假名 + CJK
+          if ((code >= 0x3040 && code <= 0x30FF) || (code >= 0x4E00 && code <= 0x9FFF)) {
+            targetChars++;
+          } else if ((code >= 0x0041 && code <= 0x024F) || // 拉丁
+                     (code >= 0x0400 && code <= 0x04FF) || // 西里爾
+                     (code >= 0xAC00 && code <= 0xD7AF)) { // 韓文
+            otherChars++;
+          }
+        } else if (targetLang.startsWith('ko')) {
+          // 韓文
+          if (code >= 0xAC00 && code <= 0xD7AF) {
+            targetChars++;
+          } else if ((code >= 0x0041 && code <= 0x024F) || // 拉丁
+                     (code >= 0x0400 && code <= 0x04FF) || // 西里爾
+                     (code >= 0x4E00 && code <= 0x9FFF) || // CJK
+                     (code >= 0x3040 && code <= 0x30FF)) { // 日文
+            otherChars++;
+          }
+        } else {
+          // 其他語言：暫時不檢測，直接算正確
+          targetChars++;
+        }
+      }
+
+      // 如果非目標語言字符超過 50%，視為語言錯誤
+      const totalMeaningful = targetChars + otherChars;
+      if (totalMeaningful > 0 && otherChars / totalMeaningful > 0.5) {
+        wrongLangCount++;
+      }
+    }
+
+    // 超過 30% 的值是錯誤語言，視為整體語言錯誤
+    const hasLanguageError = wrongLangCount > 0 && (wrongLangCount / map.size) > 0.3;
+    return { hasLanguageError, wrongLangCount };
+  }
+
   /** 塊翻譯一輪：fetch + parse；失敗拋 LLMRequestError（瞬態/永久按語義標記）。 */
   private async translateChunkOnce(
     chunk: SubtitleSegment[],
     req: TranslationRequest,
     missingIndices?: number[],
-    duplicateRetry = false
+    duplicateRetry = false,
+    languageRetry = false
   ): Promise<Map<string, string>> {
     const lines: string[] = chunk.map((s, i) => `${i}\t${s.sourceText}`);
 
@@ -330,6 +432,9 @@ export class LLMTranslationProvider implements TranslationProvider {
     }
     if (duplicateRetry) {
       userContent += `\n\nIMPORTANT: Your previous output had duplicate translations for different indices. Each line MUST have a unique translation matching its source text.`;
+    }
+    if (languageRetry) {
+      userContent += `\n\nCRITICAL: Your previous output contained translations in the WRONG LANGUAGE. You MUST output ALL translations in ${req.targetLang} ONLY. Do NOT use any other language (no Spanish, no Korean, no Japanese, no English unless targetLang is English).`;
     }
 
     const body = {

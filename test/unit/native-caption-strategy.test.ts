@@ -528,7 +528,7 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
     }
   });
 
-  it('ASR 未啟用 + 有 en 字幕 → 選 en（即使音頻是其他語言）', async () => {
+  it('ASR 未啟用 + 有音頻語言 → 仍優選音頻語言（M2-32 移除 ASR 門控）', async () => {
     const tracks = [makeTrack('fr'), makeTrack('en', true), makeTrack('en')];
     const p = makePlatformWithTracks(tracks, 'fr');
     const ctx = makeCtxWithTracks(p, 'none', 'fr');
@@ -538,8 +538,8 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
     const ready = events.find(e => e.type === 'segments-ready');
     expect(ready).toBeDefined();
     if (ready && ready.type === 'segments-ready') {
-      // 應選 en 人工字幕（第三個 track），因為 ASR 未啟用時優選英文
-      expect(ready.segments[0].sourceLang).toBe('en');
+      // M2-32：應選 fr 字幕（第一個 track），因為音頻語言優先（即使 ASR 未啟用）
+      expect(ready.segments[0].sourceLang).toBe('fr');
     }
   });
 

@@ -153,9 +153,10 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
     const captured: RequestInit[] = [];
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       captured.push(init ?? {});
+      // 返回中文翻譯（匹配 targetLang: 'zh-Hant'），避免觸發語言錯誤偵測。
       return new Response(
         JSON.stringify({
-          choices: [{ message: { content: '0\thello world' } }],
+          choices: [{ message: { content: '0\t你好世界' } }],
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
@@ -182,7 +183,7 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
       expect(captured).toHaveLength(1);
       const headers = captured[0]!.headers as Record<string, string>;
       expect(headers.Authorization).toBe('Bearer sk-secret');
-      expect(result?.segments[0]?.translatedText).toBe('hello world');
+      expect(result?.segments[0]?.translatedText).toBe('你好世界');
     } finally {
       vi.unstubAllGlobals();
     }

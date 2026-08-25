@@ -85,4 +85,28 @@ describe('OverlayRenderer 播放狀態驅動渲染（M1-26）', () => {
     r.unmount();
     expect(container.querySelector('.ai-trans-overlay')).toBeNull();
   });
+
+  // M2-32：雙語模式下去重——當 sourceText 與 translatedText 相同時，只顯示一行。
+  it('雙語模式 sourceText === translatedText 時只顯示一行（去重）', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'bilingual' });
+
+    // 創建一個 sourceText === translatedText 的 cue（如 source=en, target=en）
+    const sameCue: RenderableCue = {
+      id: 'same',
+      start: 0,
+      end: 2000,
+      translatedText: 'English text',
+      provisional: false,
+      sourceText: 'English text',
+    };
+    r.render([sameCue], 1000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    // 應該只有一個 span，而不是兩個
+    const spans = root?.querySelectorAll('span');
+    expect(spans?.length).toBe(1);
+    expect(root?.textContent).toBe('English text');
+  });
 });

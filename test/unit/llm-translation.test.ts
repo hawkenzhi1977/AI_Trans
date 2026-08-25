@@ -608,7 +608,11 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
       const provider = makeProvider('gpt-x');
       await provider.translate(req());
-      // 同 provider 但改目標語言。
+      // 同 provider 但改目標語言，使用英文翻譯避免觸發語言錯誤偵測。
+      const enBody = {
+        choices: [{ message: { content: '0\ttranslation-0\n1\ttranslation-1' } }],
+      };
+      fetchMock.mockImplementationOnce(async () => okResponse(enBody));
       await provider.translate({ segments: [seg(0), seg(1)], targetLang: 'en' });
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
@@ -770,6 +774,68 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
       // 不觸發重複重試（僅 1 次初始請求）。
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // M2-32：語言錯誤偵測與重試。
+  describe('M2-32 語言錯誤偵測與重試', () => {
+    it('偵測到非目標語言時觸發額外重試', async () => {
+      // 第一次返回西班牙語（目標是 zh-Hant）。
+      const spanishBody = {
+        choices: [{ message: { content: '0\tHola mundo\n1\tBuenos días\n2\tAdiós' } }],
+      };
+      // 第二次返回中文（正確）。
+      const chineseBody = {
+        choices: [{ message: { content: '0\t你好世界\n1\t早上好\n2\t再見' } }],
+      };
+
+      let callCount = 0;
+      const fetchMock = vi.fn(async () => {
+        callCount++;
+        return okResponse(callCount === 1 ? spanishBody : chineseBody);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const provider = makeProvider();
+      const segments = [seg(0), seg(1), seg(2)];
+      const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+      // 應觸發語言錯誤重試（1 次初始 + 1 次語言重試 = 2 次）。
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // 最終結果應是中文。
+      expect(result.segments[0].translatedText).toBe('你好世界');
+    });
+
+    it('目標語言是英文時英文翻譯不觸發重試', async () => {
+      const englishBody = {
+        choices: [{ message: { content: '0\tHello world\n1\tGood morning' } }],
+      };
+      const fetchMock = vi.fn(async () => okResponse(englishBody));
+      vi.stubGlobal('fetch', fetchMock);
+
+      const provider = makeProvider();
+      const segments = [seg(0), seg(1)];
+      await provider.translate({ segments, targetLang: 'en' });
+
+      // 不觸發語言錯誤重試（僅 1 次初始請求）。
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // M2-32：translateStream abort 檢查。
+  describe('M2-32 translateStream abort 檢查', () => {
+    it('signal aborted 時拋 AbortError', async () => {
+      const fetchMock = vi.fn(async () => okResponse(llmBody));
+      vi.stubGlobal('fetch', fetchMock);
+
+      const provider = makeProvider();
+      const controller = new AbortController();
+      controller.abort(); // 立即 abort
+
+      const segments = Array.from({ length: 30 }, (_, i) => seg(i));
+      await expect(
+        provider.translateStream({ segments, targetLang: 'zh-Hant', signal: controller.signal }, () => {})
+      ).rejects.toThrow('Translation aborted');
     });
   });
 });

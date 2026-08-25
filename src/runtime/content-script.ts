@@ -296,6 +296,8 @@ class SubtitleController {
     // M2-30：停用時不重新啟動管線。
     if (!this.config.enabled) {
       diagLog('content', 'restart() stopped: extension disabled');
+      // M2-32：通知 MAIN world 攔截器停用（restart 路徑也需 dispatch，否則配置變更觸發的停用不會停止抑制）。
+      document.dispatchEvent(new CustomEvent('ai-trans:disable'));
       return;
     }
     await this.start();

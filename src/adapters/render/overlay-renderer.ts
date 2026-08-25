@@ -131,7 +131,8 @@ export class OverlayRenderer implements SubtitleRenderer {
     if (!this.root) return;
     const bilingual = this.style['display-mode'] !== 'mono';
     const parts: string[] = [];
-    if (bilingual && cue.sourceText) {
+    // M2-32：雙語模式下去重——當 sourceText 與 translatedText 相同時（如 source=en, target=en），只顯示一行。
+    if (bilingual && cue.sourceText && cue.sourceText !== cue.translatedText) {
       parts.push(`<span class="ai-trans-src">${escapeHtml(cue.sourceText)}</span>`);
     }
     parts.push(`<span class="ai-trans-dst">${escapeHtml(cue.translatedText)}</span>`);
