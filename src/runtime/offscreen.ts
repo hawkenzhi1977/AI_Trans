@@ -36,6 +36,45 @@ type OffscreenResponse =
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
   | { type: 'asr-whisper:cache-cleared'; ok: boolean };
 
+/**
+ * 代理 Cache 實現：Offscreen/Content-script 受 CORS 限制無法直接 fetch HuggingFace，
+ * 透過 Service Worker 代理 fetch（SW 有 host_permissions 即可跨域）。
+ * 結果存入共享 Cache API（transformers-cache），transformers.js 從 Cache 讀取。
+ *
+ * 實現 transformers.js 的 customCache 接口（match + put）。
+ */
+class ProxyCache {
+  private cacheName = 'transformers-cache';
+
+  async match(request: RequestInfo | URL): Promise<Response | undefined> {
+    const url = typeof request === 'string' ? request : request instanceof URL ? request.href : request.url;
+    const cache = await caches.open(this.cacheName);
+    // 先檢查是否已緩存（可能由其他上下文寫入）。
+    const cached = await cache.match(url);
+    if (cached) return cached;
+    // 未緩存 → 請求 SW 代理 fetch → SW 寫入 Cache → 再讀取。
+    const response = await chrome.runtime.sendMessage({
+      topic: 'sw:proxy-fetch',
+      payload: { url },
+    });
+    const res = response as { ok: boolean; error?: string };
+    if (!res.ok) {
+      throw new Error(`ProxyCache fetch failed: ${res.error ?? 'unknown error'}`);
+    }
+    return cache.match(url);
+  }
+
+  async put(request: RequestInfo | URL, response: Response): Promise<void> {
+    // transformers.js 調用 put 時，數據已由 match 預填充，此處為 no-op。
+    // 保留接口以滿足 customCache 合約。
+    void request;
+    void response;
+  }
+}
+
+/** 全局 ProxyCache 實例（供 loadPipeline 和 ASR 下載共用）。 */
+const proxyCache = new ProxyCache();
+
 let mediaStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let scriptProcessor: ScriptProcessorNode | null = null;
@@ -538,6 +577,12 @@ async function loadPipeline(
   // 詳細日誌：輸出 [ort] 初始化與推理錯誤，便於診斷本地 ONNX 失敗根因（wasm trap / 記憶體 / 算子）。
   // 類型聲明缺失 logLevel，運行時為 transformers.js/ORT 共用 env 的有效字段。
   (env as unknown as { logLevel: string }).logLevel = 'info';
+  // 模型下載鏡像：HuggingFace 在中國大陸可能被牆，改用 hf-mirror.com 加速。
+  (env as unknown as { remoteHost: string }).remoteHost = 'https://hf-mirror.com/';
+  // 代理 Cache：Offscreen 受 CORS 限制無法直接 fetch HuggingFace，
+  // 透過 Service Worker 代理 fetch（SW 有 host_permissions 即可跨域）。
+  (env as unknown as { useCustomCache: boolean }).useCustomCache = true;
+  (env as unknown as { customCache: ProxyCache }).customCache = proxyCache;
   // WASM 本地化：transformers.js v3 默認從 jsdelivr CDN 載入 wasm，
   // 網絡不可達會導致 InferenceSession 初始化失敗。改指向擴充內資源（webgpu 回退時仍需）。
   if (env.backends?.onnx?.wasm) {
@@ -1036,6 +1081,12 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
     const transformers = await import('@huggingface/transformers');
     const { pipeline, env } = transformers;
 
+    // 模型下載鏡像：HuggingFace 在中國大陸可能被牆，改用 hf-mirror.com 加速。
+    (env as unknown as { remoteHost: string }).remoteHost = 'https://hf-mirror.com/';
+    // 代理 Cache：Offscreen 受 CORS 限制無法直接 fetch HuggingFace，
+    // 透過 Service Worker 代理 fetch（SW 有 host_permissions 即可跨域）。
+    (env as unknown as { useCustomCache: boolean }).useCustomCache = true;
+    (env as unknown as { customCache: ProxyCache }).customCache = proxyCache;
     // WASM 本地化（與翻譯模型共享 env 配置，但確保已設置）。
     if (env.backends?.onnx?.wasm) {
       env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');

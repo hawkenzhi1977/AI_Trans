@@ -27,7 +27,8 @@ const ZIP_NAME = `ai-trans-extension-v${version}.zip`;
 
 // 1) 生產構建（typecheck + esbuild + copy-static，生成 dist/，不含 TEST_PROFILE）。
 console.log('[release] building production bundle...');
-execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
+const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+execFileSync(npmCmd, ['run', 'build'], { stdio: 'inherit', shell: true });
 
 // 2) 清空並重建發布目錄。
 rmSync(EXT_DIR, { recursive: true, force: true });
