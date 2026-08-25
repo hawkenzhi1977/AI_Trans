@@ -1165,7 +1165,8 @@ async function clearAsrModelCache(modelId?: string): Promise<OffscreenResponse> 
 async function runInference(
   text: string,
   targetLang: string,
-  _sourceLang: string | undefined
+  _sourceLang: string | undefined,
+  retriedWithWasm = false
 ): Promise<OffscreenResponse> {
   // lazy 恢復：pipeline 未載入但快取存在 → 自動載入（Offscreen 重啟後無需重新下載）。
   if (translationPipeline === null) {
@@ -1272,6 +1273,55 @@ async function runInference(
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
     const error = toReadableError(err);
+    const errorMsg = error.message.toLowerCase();
+    
+    // M2-35：檢測 WebGPU 推論失敗（createBuffer failed / device lost / GPU 錯誤）
+    // 載入成功但推論失敗時 webgpuFailed 未設置，導致後續請求持續使用失敗的 WebGPU。
+    const isWebGpuError = errorMsg.includes('createbuffer') || 
+                          errorMsg.includes('webgpu') || 
+                          errorMsg.includes('device lost') ||
+                          errorMsg.includes('gpu');
+    
+    if (isWebGpuError && !retriedWithWasm) {
+      webgpuFailed = true;
+      console.warn('[AI_Trans] WebGPU 推論失敗，回退 WASM:', error.message);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-webgpu-inference-fallback',
+          recoverable: true,
+          cause: error,
+        },
+      });
+      // 釋放失敗的 WebGPU pipeline，避免記憶體洩漏
+      await disposePipeline(translationPipeline);
+      translationPipeline = null;
+      // 重新載入（preferWebGpu() 現在返回 false → 自動使用 WASM）
+      try {
+        await ensurePipelineLoaded();
+      } catch (loadErr) {
+        // WASM 載入也失敗，返回錯誤
+        const loadError = toReadableError(loadErr);
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'translation',
+            code: 'local-onnx-wasm-fallback-failed',
+            recoverable: false,
+            cause: loadError,
+          },
+        });
+        return {
+          type: 'local-onnx:translate-result',
+          ok: false,
+          error: `WebGPU inference failed and WASM fallback failed: ${loadError.message}`,
+        } satisfies OffscreenResponse;
+      }
+      // 重試推論一次（遞歸調用，帶重試標誌避免無限循環）
+      return runInference(text, targetLang, _sourceLang, true);
+    }
+    
     recordDiagnostic({
       type: 'pipeline-error',
       error: {

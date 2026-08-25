@@ -689,6 +689,60 @@ describe('offscreen local-onnx WebGPU 載入後端（M2-26）', () => {
 
     await expect(_testExports.ensurePipelineLoaded()).rejects.toThrow('all backends failed');
   });
+
+  it('runInference：WebGPU 推論失敗（createBuffer）→ 回退 WASM 重試成功 + webgpuFailed=true', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    vi.stubGlobal('navigator', { gpu: {} });
+    
+    let callCount = 0;
+    transformersMock.pipeline.mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return async () => { throw new Error('createBuffer failed, size (1856) is too large'); };
+      }
+      return async () => [{ generated_text: '1. 測試結果' }];
+    });
+
+    const res = await _testExports.runInference('test input', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    expect((res as { translatedText?: string }).translatedText).toBe('測試結果');
+    expect(_testExports.webgpuFailed).toBe(true);
+    expect(recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'pipeline-error',
+        error: expect.objectContaining({ code: 'local-onnx-webgpu-inference-fallback' }),
+      })
+    );
+    expect(transformersMock.pipeline).toHaveBeenCalledTimes(2);
+    expect(transformersMock.pipeline.mock.calls[0][2]).toMatchObject({ device: 'webgpu' });
+    expect(transformersMock.pipeline.mock.calls[1][2]).toMatchObject({ device: 'wasm' });
+  });
+
+  it('runInference：WebGPU 推論失敗後 WASM 也失敗 → 返回錯誤（不無限重試）', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    vi.stubGlobal('navigator', { gpu: {} });
+    
+    let callCount = 0;
+    transformersMock.pipeline.mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return async () => { throw new Error('WebGPU device lost'); };
+      }
+      throw new Error('WASM fallback also failed');
+    });
+
+    const res = await _testExports.runInference('test', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(false);
+    expect((res as { error?: string }).error).toContain('WASM fallback failed');
+    expect(recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'pipeline-error',
+        error: expect.objectContaining({ code: 'local-onnx-wasm-fallback-failed' }),
+      })
+    );
+  });
 });
 
 // 進度聚合器測試——多檔案下載時計算整體百分比（避免進度條在文件切換時跳回 0%）。
