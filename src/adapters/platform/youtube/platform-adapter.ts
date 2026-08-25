@@ -45,9 +45,9 @@ export interface CaptionCaptureProvider {
   getLatest(): CapturedTimedText | null;
   /**
    * 等待捕獲值就緒（M1-43）。播放器的 timedtext 請求在「視頻已播放」時才發出，
-   * fetchTracks 可能早於播放器請求運行——此時等待播放器發請求並捕獲。
+   * fetchTracks 可能早於播放器請求運行——此時等待播放器發請求並被攔截器捕獲。
    * 超時返回 null（由調用方回退直接 fetch）。
-   * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲，避免複用上一個視頻的 stale 捕獲。
+   * expectedVideoId（M1-45）：僅接受屬於該視頻的捕獲，避免換視頻後複用 stale 捕獲。
    */
   waitForCapture?(timeoutMs: number, expectedVideoId?: string): Promise<CapturedTimedText | null>;
   /**
@@ -61,6 +61,11 @@ export interface CaptionCaptureProvider {
    * 當 DOM stale 且 getCapturedTracks 返回空時，等待播放器發出 timedtext 請求並被攔截器發現。
    */
   waitForCapturedTracks?(timeoutMs: number, expectedVideoId: string): Promise<CapturedTrackInfo[]>;
+  /**
+   * M2-31：獲取偵測到的音頻語言（從 timedtext URL 的 lang 參數提取）。
+   * 作為 videoDetails.audioLocale 的 fallback。
+   */
+  getAudioLanguage?(): string | undefined;
 }
 
 /** 基於 fetch 的默認字幕數據源。 */
@@ -139,6 +144,13 @@ export class FetchCaptionSource implements CaptionSource {
     const playerVid = data.videoDetails?.videoId ?? '';
     // M2-30：提取音頻語言（供字幕軌智能選擇）。
     this.cachedAudioLanguage = data.videoDetails?.audioLocale;
+    // M2-31：若 audioLocale 不可用，嘗試從 bridge 的偵測結果獲取（timedtext URL 的 lang 參數）。
+    if (!this.cachedAudioLanguage && this.captureProvider?.getAudioLanguage) {
+      this.cachedAudioLanguage = this.captureProvider.getAudioLanguage();
+      if (this.cachedAudioLanguage) {
+        diagLog('capture', 'audioLocale not in player response, using interceptor-detected lang:', this.cachedAudioLanguage);
+      }
+    }
     // M2-22 補充：currentVid 為空（非 watch 頁）時直接返回空——無視頻可翻譯。
     if (!currentVid) {
       this.lastTrackDiagnostic = 'not on watch page (no videoId in URL)';

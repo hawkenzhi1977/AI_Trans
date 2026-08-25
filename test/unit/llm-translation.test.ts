@@ -447,8 +447,8 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     expect(result.segments[0].translatedText).toBe('譯文零');
     expect(result.segments[1].translatedText).toBe('line-1');
     expect(result.segments[2].translatedText).toBe('line-2');
-    // 應調用 fetch 3 次（1 次初始 + 2 次 incomplete 重試）
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // 應調用 fetch 4 次（1 次初始 + 3 次 incomplete 重試，M2-31 增加重試次數）
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     // §5.6：不完整輸出最終必須留痕。
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('incomplete translation after')
@@ -720,6 +720,56 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
     it('相同輸入同哈希；不同輸入不同哈希', () => {
       expect(djb2Hash('abc')).toBe(djb2Hash('abc'));
       expect(djb2Hash('abc')).not.toBe(djb2Hash('abd'));
+    });
+  });
+
+  // M2-31：重複翻譯偵測與重試。
+  describe('M2-31 重複翻譯偵測與重試', () => {
+    it('偵測到過度重複（>30%）時觸發額外重試', async () => {
+      // 第一次返回大量重複：5 個唯一值各出現 2 次 = 10 段，加上 5 個唯一值各出現 1 次 = 5 段。
+      // 總計 15 段，5 個重複值 → 5/15 = 33% > 30% 閾值。
+      const duplicateBody = {
+        choices: [{ message: { content: '0\t重複A\n1\t重複A\n2\t重複B\n3\t重複B\n4\t重複C\n5\t重複C\n6\t重複D\n7\t重複D\n8\t重複E\n9\t重複E\n10\t唯一1\n11\t唯一2\n12\t唯一3\n13\t唯一4\n14\t唯一5' } }],
+      };
+      // 第二次返回無重複。
+      const uniqueBody = {
+        choices: [{ message: { content: Array.from({ length: 15 }, (_, i) => `${i}\t譯文${i}`).join('\n') } }],
+      };
+
+      let callCount = 0;
+      const fetchMock = vi.fn(async () => {
+        callCount++;
+        return okResponse(callCount === 1 ? duplicateBody : uniqueBody);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const provider = makeProvider();
+      const segments = Array.from({ length: 15 }, (_, i) => seg(i));
+      const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+      // 應觸發重複重試（1 次初始 + 1 次重複重試 = 2 次）。
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // 最終結果應無重複。
+      const translations = result.segments.map(s => s.translatedText);
+      const uniqueTranslations = new Set(translations);
+      expect(uniqueTranslations.size).toBe(15);
+    });
+
+    it('重複比例未超閾值（≤30%）時不觸發重試', async () => {
+      // 15 段中 2 個唯一值各出現 2 次 = 4 段重複，加上 11 個唯一值 = 11 段。
+      // 總計 15 段，2 個重複值 → 2/15 = 13% < 30% 閾值。
+      const body = {
+        choices: [{ message: { content: '0\t重複A\n1\t重複A\n2\t重複B\n3\t重複B\n4\t唯一1\n5\t唯一2\n6\t唯一3\n7\t唯一4\n8\t唯一5\n9\t唯一6\n10\t唯一7\n11\t唯一8\n12\t唯一9\n13\t唯一10\n14\t唯一11' } }],
+      };
+      const fetchMock = vi.fn(async () => okResponse(body));
+      vi.stubGlobal('fetch', fetchMock);
+
+      const provider = makeProvider();
+      const segments = Array.from({ length: 15 }, (_, i) => seg(i));
+      await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+      // 不觸發重複重試（僅 1 次初始請求）。
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 });

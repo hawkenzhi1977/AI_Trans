@@ -154,8 +154,12 @@ class SubtitleController {
     // M2-30：整體開關守衛——停用時不啟動管線，恢復 YouTube 原生字幕。
     if (!this.config.enabled) {
       diagLog('content', 'start() skipped: extension disabled by user');
+      // M2-31：通知 MAIN world 攔截器停用（即使攔截器已注入，也停止字幕抑制邏輯）。
+      document.dispatchEvent(new CustomEvent('ai-trans:disable'));
       return;
     }
+    // M2-31：通知 MAIN world 攔截器重新啟用。
+    document.dispatchEvent(new CustomEvent('ai-trans:enable'));
 
     // M2-14：讀取 tabCapture 授權狀態（初始值，後續由 storage.onChanged 監聽更新）。
     const authState = await chrome.storage.local.get('tabCaptureAuthorized');

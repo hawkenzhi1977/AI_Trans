@@ -38,6 +38,8 @@ export class TimedTextBridge {
   private latest: TimedTextCapture | null = null;
   /** M2-22 第三層：MAIN world 發現的軌道信息（content script 無法訪問播放器 API 時的 fallback）。 */
   private capturedTracks: CapturedTrackInfo[] | null = null;
+  /** M2-31：偵測到的音頻語言（從 timedtext URL 的 lang 參數提取，作為 audioLocale 的 fallback）。 */
+  private detectedAudioLang: string | undefined;
   private readonly onMessageBound: (event: MessageEvent) => void;
   private injected = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -150,6 +152,8 @@ export class TimedTextBridge {
     const previousVideoId = this.latest?.videoId ?? '(none)';
     diagLog('bridge', 'clearLatest() called, previous videoId:', previousVideoId);
     this.latest = null;
+    // M2-31：重置偵測到的音頻語言（新視頻可能有不同音頻語言）。
+    this.detectedAudioLang = undefined;
     // M2-24 補充修復十四：重置通知去重時間戳，新視頻首個捕獲可正常觸發訂閱者。
     this.lastNotifiedCapturedAt = null;
   }
@@ -280,8 +284,18 @@ export class TimedTextBridge {
       if (!Array.isArray(payload)) return;
       diagLog('bridge', 'received track info:', payload.length, 'tracks');
       this.capturedTracks = payload;
+      // M2-31：提取偵測到的音頻語言（從第一個軌道的 audioLang 字段）。
+      if (!this.detectedAudioLang && payload.length > 0 && payload[0].audioLang) {
+        this.detectedAudioLang = payload[0].audioLang;
+        diagLog('bridge', 'detected audio language from interceptor:', this.detectedAudioLang);
+      }
       this.notifyTrackWaiters();
     }
+  }
+
+  /** M2-31：獲取偵測到的音頻語言（從 timedtext URL 的 lang 參數提取）。 */
+  getAudioLanguage(): string | undefined {
+    return this.detectedAudioLang;
   }
 }
 

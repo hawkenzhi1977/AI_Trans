@@ -49755,6 +49755,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const currentVid = this.currentVideoId();
       const playerVid = data.videoDetails?.videoId ?? "";
       this.cachedAudioLanguage = data.videoDetails?.audioLocale;
+      if (!this.cachedAudioLanguage && this.captureProvider?.getAudioLanguage) {
+        this.cachedAudioLanguage = this.captureProvider.getAudioLanguage();
+        if (this.cachedAudioLanguage) {
+          diagLog("capture", "audioLocale not in player response, using interceptor-detected lang:", this.cachedAudioLanguage);
+        }
+      }
       if (!currentVid) {
         this.lastTrackDiagnostic = "not on watch page (no videoId in URL)";
         diagLog("capture", "fetchTrackList:", this.lastTrackDiagnostic);
@@ -50157,8 +50163,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var CHUNK_SIZE = 15;
   var MAX_RETRIES = 2;
   var RETRY_DELAYS_MS = [500, 1500];
-  var INCOMPLETE_MAX_RETRIES = 2;
+  var INCOMPLETE_MAX_RETRIES = 3;
   var INCOMPLETE_RETRY_DELAY_MS = 300;
+  var DUPLICATE_MAX_RETRIES = 1;
   var BODY_TIMEOUT_MS = 3e5;
   var CACHE_MAX_ENTRIES = 100;
   function djb2Hash(text) {
@@ -50270,7 +50277,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       let lastErr = null;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
-          const map = await this.translateChunkOnce(chunk, req);
+          let map = await this.translateChunkOnce(chunk, req);
           if (map.size < chunk.length) {
             let missing = this.getMissingIndices(chunk, map);
             diagLog("llm", `incomplete translation (${map.size}/${chunk.length}), retrying with missing indices: ${missing.join(",")}`);
@@ -50278,19 +50285,31 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               await sleep(INCOMPLETE_RETRY_DELAY_MS);
               const retryMap = await this.translateChunkOnce(chunk, req, missing);
               if (retryMap.size >= chunk.length) {
-                llmCache.set(cacheKey, retryMap);
-                return chunk.map((s, i) => ({
-                  ...s,
-                  translatedText: retryMap.get(String(i)) ?? s.sourceText,
-                  targetLang: req.targetLang
-                }));
+                map = retryMap;
+                break;
               }
               missing = this.getMissingIndices(chunk, retryMap);
               diagLog("llm", `incomplete retry ${incAttempt + 1} still missing ${missing.length} lines`);
             }
-            console.warn(
-              `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries \u2014 expected ${chunk.length} lines, got ${map.size}. Some segments will show original text as translation.`
-            );
+            if (map.size < chunk.length) {
+              console.warn(
+                `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries \u2014 expected ${chunk.length} lines, got ${map.size}. Some segments will show original text as translation.`
+              );
+            }
+          }
+          const duplicateInfo = this.detectDuplicates(map);
+          if (duplicateInfo.hasExcessiveDuplicates) {
+            diagLog("llm", `excessive duplicates detected (${duplicateInfo.duplicateCount} values repeated), retrying with duplicate warning`);
+            for (let dupAttempt = 0; dupAttempt < DUPLICATE_MAX_RETRIES; dupAttempt++) {
+              await sleep(INCOMPLETE_RETRY_DELAY_MS);
+              const retryMap = await this.translateChunkOnce(chunk, req, void 0, true);
+              const retryDupInfo = this.detectDuplicates(retryMap);
+              if (!retryDupInfo.hasExcessiveDuplicates) {
+                map = retryMap;
+                break;
+              }
+              diagLog("llm", `duplicate retry ${dupAttempt + 1} still has ${retryDupInfo.duplicateCount} duplicates`);
+            }
           }
           llmCache.set(cacheKey, map);
           return chunk.map((s, i) => ({
@@ -50323,14 +50342,33 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       }
       return missing;
     }
+    /**
+     * M2-31：偵測翻譯結果中的重複值。
+     * 返回重複值數量及是否超過閾值（>30% 的值重複視為過度重複）。
+     */
+    detectDuplicates(map) {
+      const valueCounts = /* @__PURE__ */ new Map();
+      for (const v of map.values()) {
+        valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
+      }
+      const duplicates = [...valueCounts.entries()].filter(([, c]) => c > 1);
+      const duplicateCount = duplicates.length;
+      const hasExcessiveDuplicates = duplicateCount > 0 && duplicateCount / map.size > 0.3;
+      return { duplicateCount, hasExcessiveDuplicates };
+    }
     /** 塊翻譯一輪：fetch + parse；失敗拋 LLMRequestError（瞬態/永久按語義標記）。 */
-    async translateChunkOnce(chunk, req, missingIndices) {
+    async translateChunkOnce(chunk, req, missingIndices, duplicateRetry = false) {
       const lines = chunk.map((s, i) => `${i}	${s.sourceText}`);
       let userContent = lines.join("\n");
       if (missingIndices?.length) {
         userContent += `
 
-IMPORTANT: Previous attempt missed indices ${missingIndices.join(", ")}. Translate ALL lines.`;
+CRITICAL: Previous attempt only output ${missingIndices.length}/${chunk.length} lines. You MUST output ALL ${chunk.length} lines with their indices.`;
+      }
+      if (duplicateRetry) {
+        userContent += `
+
+IMPORTANT: Your previous output had duplicate translations for different indices. Each line MUST have a unique translation matching its source text.`;
       }
       const body = {
         model: this.opts.model,
@@ -50339,11 +50377,14 @@ IMPORTANT: Previous attempt missed indices ${missingIndices.join(", ")}. Transla
         messages: [
           {
             role: "system",
-            content: `Translate each numbered line to ${req.targetLang}.
-Rules:
-- Output EVERY line with its index, format: "index\\ttranslation"
-- Translation must be in ${req.targetLang} only, no English
-- Do not skip any line
+            content: `You are a subtitle translator. Translate each numbered line to ${req.targetLang}.
+
+CRITICAL RULES:
+1. Output EXACTLY ${chunk.length} lines (one per input line, no more, no less)
+2. Format: "index\\ttranslation" for each line (e.g., "0\\t\u4F60\u597D")
+3. ALL translations MUST be in ${req.targetLang} only \u2014 do NOT output in any other language
+4. Do NOT copy the same translation for different indices unless the source text is identical
+5. Do NOT skip any line \u2014 every index from 0 to ${chunk.length - 1} must appear
 
 Input example:
 0	Hello world
@@ -51521,6 +51562,8 @@ Output example:
     latest = null;
     /** M2-22 第三層：MAIN world 發現的軌道信息（content script 無法訪問播放器 API 時的 fallback）。 */
     capturedTracks = null;
+    /** M2-31：偵測到的音頻語言（從 timedtext URL 的 lang 參數提取，作為 audioLocale 的 fallback）。 */
+    detectedAudioLang;
     onMessageBound;
     injected = false;
     pollTimer = null;
@@ -51615,6 +51658,7 @@ Output example:
       const previousVideoId = this.latest?.videoId ?? "(none)";
       diagLog("bridge", "clearLatest() called, previous videoId:", previousVideoId);
       this.latest = null;
+      this.detectedAudioLang = void 0;
       this.lastNotifiedCapturedAt = null;
     }
     /**
@@ -51727,8 +51771,16 @@ Output example:
         if (!Array.isArray(payload)) return;
         diagLog("bridge", "received track info:", payload.length, "tracks");
         this.capturedTracks = payload;
+        if (!this.detectedAudioLang && payload.length > 0 && payload[0].audioLang) {
+          this.detectedAudioLang = payload[0].audioLang;
+          diagLog("bridge", "detected audio language from interceptor:", this.detectedAudioLang);
+        }
         this.notifyTrackWaiters();
       }
+    }
+    /** M2-31：獲取偵測到的音頻語言（從 timedtext URL 的 lang 參數提取）。 */
+    getAudioLanguage() {
+      return this.detectedAudioLang;
     }
   };
 
@@ -51852,8 +51904,10 @@ Output example:
     async start() {
       if (!this.config.enabled) {
         diagLog("content", "start() skipped: extension disabled by user");
+        document.dispatchEvent(new CustomEvent("ai-trans:disable"));
         return;
       }
+      document.dispatchEvent(new CustomEvent("ai-trans:enable"));
       const authState = await chrome.storage.local.get("tabCaptureAuthorized");
       this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
       this.applyDebugFlags();

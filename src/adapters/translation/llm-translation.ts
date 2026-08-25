@@ -43,10 +43,13 @@ const MAX_RETRIES = 2;
 const RETRY_DELAYS_MS = [500, 1500];
 
 /** 不完整翻譯重試上限：LLM 返回行數不足時額外重試次數。 */
-const INCOMPLETE_MAX_RETRIES = 2;
+const INCOMPLETE_MAX_RETRIES = 3;
 
 /** 不完整翻譯重試退避間隔（毫秒）。 */
 const INCOMPLETE_RETRY_DELAY_MS = 300;
+
+/** M2-31：重複翻譯重試上限——偵測到大量重複時額外重試次數。 */
+const DUPLICATE_MAX_RETRIES = 1;
 
 /**
  * Body 讀取階段超時（毫秒）：headers 已到達但 body 生成慢（本地 LLM 推理長輸出）時
@@ -218,7 +221,7 @@ export class LLMTranslationProvider implements TranslationProvider {
     let lastErr: LLMRequestError | null = null;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const map = await this.translateChunkOnce(chunk, req);
+        let map = await this.translateChunkOnce(chunk, req);
 
         // 不完整翻譯重試：LLM 返回行數不足時，附带缺失索引重試
         if (map.size < chunk.length) {
@@ -229,22 +232,36 @@ export class LLMTranslationProvider implements TranslationProvider {
             await sleep(INCOMPLETE_RETRY_DELAY_MS);
             const retryMap = await this.translateChunkOnce(chunk, req, missing);
             if (retryMap.size >= chunk.length) {
-              llmCache.set(cacheKey, retryMap);
-              return chunk.map((s, i) => ({
-                ...s,
-                translatedText: retryMap.get(String(i)) ?? s.sourceText,
-                targetLang: req.targetLang,
-              }));
+              map = retryMap;
+              break;
             }
             // 仍不完整，更新 missing indices 繼續重試
             missing = this.getMissingIndices(chunk, retryMap);
             diagLog('llm', `incomplete retry ${incAttempt + 1} still missing ${missing.length} lines`);
           }
-          // 不完整重試耗盡，使用最後一次結果（部分原文兜底）
-          console.warn(
-            `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries — expected ${chunk.length} lines, got ${map.size}. ` +
-            `Some segments will show original text as translation.`
-          );
+          if (map.size < chunk.length) {
+            // 不完整重試耗盡，使用最後一次結果（部分原文兜底）
+            console.warn(
+              `[AI_Trans:diag] LLM: incomplete translation after ${INCOMPLETE_MAX_RETRIES} retries — expected ${chunk.length} lines, got ${map.size}. ` +
+              `Some segments will show original text as translation.`
+            );
+          }
+        }
+
+        // M2-31：重複翻譯偵測與重試——小模型可能在長輸出中「迷失」，對不同 index 輸出相同翻譯。
+        const duplicateInfo = this.detectDuplicates(map);
+        if (duplicateInfo.hasExcessiveDuplicates) {
+          diagLog('llm', `excessive duplicates detected (${duplicateInfo.duplicateCount} values repeated), retrying with duplicate warning`);
+          for (let dupAttempt = 0; dupAttempt < DUPLICATE_MAX_RETRIES; dupAttempt++) {
+            await sleep(INCOMPLETE_RETRY_DELAY_MS);
+            const retryMap = await this.translateChunkOnce(chunk, req, undefined, true);
+            const retryDupInfo = this.detectDuplicates(retryMap);
+            if (!retryDupInfo.hasExcessiveDuplicates) {
+              map = retryMap;
+              break;
+            }
+            diagLog('llm', `duplicate retry ${dupAttempt + 1} still has ${retryDupInfo.duplicateCount} duplicates`);
+          }
         }
 
         llmCache.set(cacheKey, map);
@@ -282,17 +299,37 @@ export class LLMTranslationProvider implements TranslationProvider {
     return missing;
   }
 
+  /**
+   * M2-31：偵測翻譯結果中的重複值。
+   * 返回重複值數量及是否超過閾值（>30% 的值重複視為過度重複）。
+   */
+  private detectDuplicates(map: Map<string, string>): { duplicateCount: number; hasExcessiveDuplicates: boolean } {
+    const valueCounts = new Map<string, number>();
+    for (const v of map.values()) {
+      valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
+    }
+    const duplicates = [...valueCounts.entries()].filter(([, c]) => c > 1);
+    const duplicateCount = duplicates.length;
+    // 超過 30% 的值重複視為過度重複（小模型常見的「迷失」現象）。
+    const hasExcessiveDuplicates = duplicateCount > 0 && (duplicateCount / map.size) > 0.3;
+    return { duplicateCount, hasExcessiveDuplicates };
+  }
+
   /** 塊翻譯一輪：fetch + parse；失敗拋 LLMRequestError（瞬態/永久按語義標記）。 */
   private async translateChunkOnce(
     chunk: SubtitleSegment[],
     req: TranslationRequest,
-    missingIndices?: number[]
+    missingIndices?: number[],
+    duplicateRetry = false
   ): Promise<Map<string, string>> {
     const lines: string[] = chunk.map((s, i) => `${i}\t${s.sourceText}`);
 
     let userContent = lines.join('\n');
     if (missingIndices?.length) {
-      userContent += `\n\nIMPORTANT: Previous attempt missed indices ${missingIndices.join(', ')}. Translate ALL lines.`;
+      userContent += `\n\nCRITICAL: Previous attempt only output ${missingIndices.length}/${chunk.length} lines. You MUST output ALL ${chunk.length} lines with their indices.`;
+    }
+    if (duplicateRetry) {
+      userContent += `\n\nIMPORTANT: Your previous output had duplicate translations for different indices. Each line MUST have a unique translation matching its source text.`;
     }
 
     const body = {
@@ -303,11 +340,13 @@ export class LLMTranslationProvider implements TranslationProvider {
         {
           role: 'system',
           content:
-            `Translate each numbered line to ${req.targetLang}.\n` +
-            `Rules:\n` +
-            `- Output EVERY line with its index, format: "index\\ttranslation"\n` +
-            `- Translation must be in ${req.targetLang} only, no English\n` +
-            `- Do not skip any line\n\n` +
+            `You are a subtitle translator. Translate each numbered line to ${req.targetLang}.\n\n` +
+            `CRITICAL RULES:\n` +
+            `1. Output EXACTLY ${chunk.length} lines (one per input line, no more, no less)\n` +
+            `2. Format: "index\\ttranslation" for each line (e.g., "0\\t你好")\n` +
+            `3. ALL translations MUST be in ${req.targetLang} only — do NOT output in any other language\n` +
+            `4. Do NOT copy the same translation for different indices unless the source text is identical\n` +
+            `5. Do NOT skip any line — every index from 0 to ${chunk.length - 1} must appear\n\n` +
             `Input example:\n` +
             `0\tHello world\n` +
             `1\tGood morning\n\n` +
@@ -382,6 +421,7 @@ export class LLMTranslationProvider implements TranslationProvider {
     diagLog('llm', 'parsed map size =', map.size, ', map =', Object.fromEntries(map));
     // §5.6：LLM 重複翻譯檢測——小模型可能在長輸出中「迷失」，對不同 index 輸出相同翻譯，
     // 導致後續所有翻譯與原文錯位（英中不同步）。必須留痕讓用戶/開發者能定位問題。
+    // M2-31：使用 detectDuplicates 統一偵測邏輯（重複重試在 translateChunkWithRetry 中處理）。
     const valueCounts = new Map<string, number>();
     for (const v of map.values()) {
       valueCounts.set(v, (valueCounts.get(v) ?? 0) + 1);
