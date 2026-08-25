@@ -367,6 +367,106 @@ describe('FetchCaptionSource — §5.6 拉取失敗診斷證據化', () => {
   });
 });
 
+describe('FetchCaptionSource — M2-32 捕獲複用語言驗證', () => {
+  const json3Response = JSON.stringify({
+    events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'hello' }] }],
+  });
+
+  it('捕獲 URL 語言匹配請求語言 → 複用成功', async () => {
+    setPlayerResponse(validPlayerResponse);
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => json3Response,
+    }) as Response);
+    // Mock captureProvider 返回 lang=en 的捕獲
+    const mockCaptureProvider = {
+      getLatest: () => ({
+        url: 'https://www.youtube.com/api/timedtext?lang=en&v=abc',
+        responseText: json3Response,
+        contentType: 'application/json',
+        videoId: 'abc',
+      }),
+      waitForCapture: undefined,
+    };
+    const src = new FetchCaptionSource(document, fetchFn, mockCaptureProvider);
+    const segs = await src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en');
+    // 應該複用捕獲，不調用 fetch
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(segs.length).toBeGreaterThan(0);
+  });
+
+  it('捕獲 URL 語言不匹配請求語言 → 跳過複用，回退直接 fetch', async () => {
+    setPlayerResponse(validPlayerResponse);
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => json3Response,
+    }) as Response);
+    // Mock captureProvider 返回 lang=es 的捕獲，但請求 lang=en
+    const mockCaptureProvider = {
+      getLatest: () => ({
+        url: 'https://www.youtube.com/api/timedtext?lang=es&v=abc',
+        responseText: json3Response,
+        contentType: 'application/json',
+        videoId: 'abc',
+      }),
+      waitForCapture: undefined,
+    };
+    const src = new FetchCaptionSource(document, fetchFn, mockCaptureProvider);
+    await src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en');
+    // 語言不匹配，應跳過複用並調用 fetch
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it('捕獲 URL 語言模糊匹配（en-US 匹配 en）→ 複用成功', async () => {
+    setPlayerResponse(validPlayerResponse);
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => json3Response,
+    }) as Response);
+    // Mock captureProvider 返回 lang=en-US 的捕獲，請求 lang=en
+    const mockCaptureProvider = {
+      getLatest: () => ({
+        url: 'https://www.youtube.com/api/timedtext?lang=en-US&v=abc',
+        responseText: json3Response,
+        contentType: 'application/json',
+        videoId: 'abc',
+      }),
+      waitForCapture: undefined,
+    };
+    const src = new FetchCaptionSource(document, fetchFn, mockCaptureProvider);
+    const segs = await src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en');
+    // 模糊匹配成功，應複用捕獲
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(segs.length).toBeGreaterThan(0);
+  });
+
+  it('waitForCapture 返回的捕獲語言不匹配 → 跳過複用', async () => {
+    setPlayerResponse(validPlayerResponse);
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => json3Response,
+    }) as Response);
+    // Mock captureProvider：getLatest 返回 null，waitForCapture 返回 lang=es 的捕獲
+    const mockCaptureProvider = {
+      getLatest: () => null,
+      waitForCapture: async () => ({
+        url: 'https://www.youtube.com/api/timedtext?lang=es&v=abc',
+        responseText: json3Response,
+        contentType: 'application/json',
+        videoId: 'abc',
+      }),
+    };
+    const src = new FetchCaptionSource(document, fetchFn, mockCaptureProvider);
+    await src.fetchTracks('https://www.youtube.com/api/timedtext?lang=en', 'en');
+    // 語言不匹配，應跳過複用並調用 fetch
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+});
+
 describe('YouTubePlatformAdapter — R4 observePlayback 解除訂閱', () => {
   function mountVideo(): HTMLVideoElement {
     document.body.innerHTML = '<video class="html5-main-video"></video>';

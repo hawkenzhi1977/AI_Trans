@@ -49981,6 +49981,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       * M2-22：恢復 videoId 驗證——攔截器的 `lastCapture` 在 MAIN world，
       * `bridge.clearLatest()` 只清空 isolated world 的緩存，MAIN world 的 `lastCapture`
       * 仍可能保留舊視頻的捕獲（重播機制會持續發送）。必須驗證捕獲的 videoId 與當前視頻匹配。
+      * 
+      * M2-32：新增語言驗證——攔截器可能驅動了不同語言的軌道（如 es-ES），
+      * 但策略選擇了另一語言（如 en）。複用前必須驗證捕獲 URL 的 lang 參數匹配請求語言。
       */
     tryReuseCapture(lang) {
       if (!this.captureProvider) {
@@ -49995,6 +49998,11 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const currentVid = this.currentVideoId();
       if (currentVid && capture.videoId && currentVid !== capture.videoId) {
         diagLog("capture", "tryReuseCapture: videoId mismatch, current:", currentVid, "capture:", capture.videoId, "- skipping stale capture");
+        return void 0;
+      }
+      const captureLang = this.extractLangFromUrl(capture.url);
+      if (captureLang && !this.langMatches(captureLang, lang)) {
+        diagLog("capture", "tryReuseCapture: lang mismatch, capture:", captureLang, "request:", lang, "- skipping");
         return void 0;
       }
       diagLog("capture", "tryReuseCapture: found capture, url:", capture.url.substring(0, 80), "videoId:", capture.videoId);
@@ -50020,6 +50028,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       * 僅當 provider 支持 waitForCapture 時等待；否則立即返回 undefined 走直接 fetch。
       * 
       * M2-22：傳入 expectedVideoId 確保只接受當前視頻的捕獲，避免 SPA 導航後複用 stale 捕獲。
+      * 
+      * M2-32：新增語言驗證——捕獲的 URL 語言必須匹配請求語言，否則跳過複用。
       */
     async waitForCaptureReuse(lang) {
       if (!this.captureProvider?.waitForCapture) {
@@ -50044,6 +50054,11 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         diagLog("capture", "waitForCaptureReuse: timeout, no capture received");
         return void 0;
       }
+      const captureLang = this.extractLangFromUrl(capture.url);
+      if (captureLang && !this.langMatches(captureLang, lang)) {
+        diagLog("capture", "waitForCaptureReuse: lang mismatch, capture:", captureLang, "request:", lang, "- skipping");
+        return void 0;
+      }
       diagLog("capture", "waitForCaptureReuse: capture received, url:", capture.url.substring(0, 80), "videoId:", capture.videoId);
       try {
         const segments = parseTimedText(capture.responseText, lang);
@@ -50060,6 +50075,19 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         diagLog("capture", "waitForCaptureReuse: parse failed:", this.lastTrackDiagnostic);
         return void 0;
       }
+    }
+    /** M2-32：從 timedtext URL 提取 lang 參數。 */
+    extractLangFromUrl(url) {
+      try {
+        return new URL(url).searchParams.get("lang") ?? void 0;
+      } catch {
+        return void 0;
+      }
+    }
+    /** M2-32：模糊匹配語言（en 匹配 en-US、en-GB 等；zh 匹配 zh-Hant、zh-CN 等）。 */
+    langMatches(a, b) {
+      const al2 = a.toLowerCase(), bl2 = b.toLowerCase();
+      return al2 === bl2 || al2.startsWith(bl2 + "-") || bl2.startsWith(al2 + "-");
     }
   };
   var YouTubePlatformAdapter = class {
