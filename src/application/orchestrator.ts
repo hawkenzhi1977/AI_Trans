@@ -164,12 +164,16 @@ export class Orchestrator {
     });
     this.cleanups.push(unsubscribe);
 
+    // M2-30：獲取視頻音頻語言（供字幕軌智能選擇）。
+    const audioLanguage = platform.getAudioLanguage();
+
     const ctx: StrategyContext = {
       platform,
       playback: () => this.lastPlayback,
       config,
       asr: asrProvider,
       translation: translationPipeline,
+      audioLanguage,
     };
 
     this.chain = new CaptionStrategyChain(

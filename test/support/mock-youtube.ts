@@ -9,6 +9,8 @@ interface MockPlatformOpts {
   audioKind?: 'tab-capture' | 'buffered';
   /** 供 realtime-asr 策略消費的音頻分塊腳本。 */
   chunks?: AudioChunk[];
+  /** M2-30：視頻音頻語言（供字幕軌智能選擇測試）。 */
+  audioLanguage?: string;
 }
 
 export class MockYouTubeAdapter implements PlatformAdapter {
@@ -16,6 +18,7 @@ export class MockYouTubeAdapter implements PlatformAdapter {
   private listeners = new Set<(s: PlaybackState) => void>();
   private tracks: CaptionTrack[];
   private audioKind: 'tab-capture' | 'buffered';
+  private audioLanguage: string | undefined;
   readonly mount: HTMLElement;
   state: PlaybackState = {
     currentTime: 0,
@@ -28,6 +31,7 @@ export class MockYouTubeAdapter implements PlatformAdapter {
   constructor(opts: MockPlatformOpts = {}) {
     this.tracks = opts.tracks ?? [];
     this.audioKind = opts.audioKind ?? 'tab-capture';
+    this.audioLanguage = opts.audioLanguage;
     this.mount = document.createElement('div');
     this.mount.id = 'mock-player';
     document.body.appendChild(this.mount);
@@ -55,6 +59,11 @@ export class MockYouTubeAdapter implements PlatformAdapter {
 
   async listCaptionTracks(): Promise<CaptionTrack[]> {
     return this.tracks;
+  }
+
+  /** M2-30：獲取視頻音頻語言（測試用）。 */
+  getAudioLanguage(): string | undefined {
+    return this.audioLanguage;
   }
 
   async getAudioSource(): Promise<AudioSourceHandle> {

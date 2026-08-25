@@ -12,6 +12,7 @@ var DEBUG_LOG_OFF = {
   popup: false
 };
 var DEFAULT_CONFIG = {
+  enabled: true,
   translation: { type: "cloud-llm", fallbackType: "mt" },
   asr: { type: "local-whisper", modelTier: "base" },
   targetLang: "zh-Hant",

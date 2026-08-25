@@ -6,6 +6,10 @@ import { DIAGNOSTIC_KEY } from '../../src/infrastructure/diagnostics';
 // 故測試先用動態 import 載入，再斷言 DOM 結果——驗證「診斷顯示」真實渲染路徑。
 const HTML = `
   <h1>AI_Trans</h1>
+  <div class="line" id="enable-toggle-line" style="display: flex; align-items: center; gap: 8px;">
+    <input type="checkbox" id="enable-toggle" style="width: auto;" />
+    <label for="enable-toggle" style="margin: 0; font-weight: 500;">啟用翻譯字幕</label>
+  </div>
   <div class="line" id="status-translation">翻譯: —</div>
   <div class="line" id="status-asr">ASR: —</div>
   <div class="line" id="status-lang">目標語言: —</div>

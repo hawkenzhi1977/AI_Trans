@@ -5,6 +5,7 @@ import type { EngineConfig } from '../../src/domain/models/config';
 // options.ts 在 import 時即執行 void init()。測試用動態 import 載入後斷言 DOM。
 const HTML = `
   <h1>AI_Trans 設定</h1>
+  <input type="checkbox" id="enable-toggle" />
   <select id="translation-type"><option value="mt">傳統 MT</option><option value="cloud-llm">雲端 LLM</option><option value="local">本地</option><option value="local-onnx">本地 ONNX</option></select>
   <input id="translation-model" />
   <input id="translation-endpoint" />
@@ -63,6 +64,7 @@ const HTML = `
 `;
 
 const SAVED_CONFIG: EngineConfig = {
+  enabled: true,
   translation: { type: 'mt', model: undefined, endpoint: undefined, fallbackType: 'mt' },
   asr: { type: 'cloud', modelTier: 'base' },
   targetLang: 'zh-Hant',
@@ -78,6 +80,7 @@ const SAVED_CONFIG: EngineConfig = {
     bridge: false,
     interceptor: false,
     'local-onnx': false,
+    popup: false,
   },
 };
 

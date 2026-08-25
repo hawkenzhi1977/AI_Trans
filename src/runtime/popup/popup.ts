@@ -125,6 +125,9 @@ async function init(): Promise<void> {
     popupDiag(`store-get error: ${err instanceof Error ? err.message : String(err)}`);
     $('status-diagnostic').textContent = `最近失敗: 錯誤: 配置讀取失敗: ${err instanceof Error ? err.message : String(err)}`;
     $('status-diagnostic').classList.add('warn');
+    // M2-30：配置讀取失敗時仍初始化 toggle（用默認值 true）。
+    const toggle = $('enable-toggle') as HTMLInputElement;
+    toggle.checked = true;
     bindActions(configFallback());
     stopInitWatchdog(); // M2-26：早退也視為完成，停止 slow/timeout 計時
     return;
@@ -133,6 +136,16 @@ async function init(): Promise<void> {
   $('status-translation').textContent = describeTranslation(config);
   $('status-asr').textContent = describeAsr(config);
   $('status-lang').textContent = `目標語言: ${config.targetLang} · ${config.displayMode === 'mono' ? '僅譯文' : '雙語'}`;
+
+  // M2-30：初始化 enable toggle 狀態。
+  const toggle = $('enable-toggle') as HTMLInputElement;
+  toggle.checked = config.enabled;
+  document.body.classList.toggle('disabled', !config.enabled);
+  if (!config.enabled) {
+    $('status-translation').textContent = '翻譯: 已停用';
+    $('status-asr').textContent = 'ASR: 已停用';
+    $('status-lang').textContent = '目標語言: —';
+  }
 
   // 最近一次失敗診斷：僅顯示用戶可操作的錯誤（actionable !== false）。
   // DevTools 仍保留所有記錄，popup 過濾內部調測信息。
@@ -185,6 +198,33 @@ async function updateAsrButton(): Promise<void> {
 /** 綁定 popup 按鈕事件（config 讀取失敗時以默認值佔位，不影響手動操作）。 */
 function bindActions(config: EngineConfig): void {
   // btn-options 的 handler 已在 init() 最開始立即綁定（不依賴 async 數據），此處不再重複。
+
+  // M2-30：enable toggle 事件綁定——即時切換擴充整體開關。
+  const toggle = $('enable-toggle') as HTMLInputElement;
+  toggle.addEventListener('change', async () => {
+    const connEl = $('status-connection');
+    connEl.textContent = '切換中…';
+    connEl.classList.remove('warn', 'ok');
+    try {
+      await store.set({ enabled: toggle.checked });
+      connEl.textContent = toggle.checked ? '連接測試: 已啟用' : '連接測試: 已停用';
+      connEl.classList.add('ok');
+      document.body.classList.toggle('disabled', !toggle.checked);
+      if (!toggle.checked) {
+        $('status-translation').textContent = '翻譯: 已停用';
+        $('status-asr').textContent = 'ASR: 已停用';
+        $('status-lang').textContent = '目標語言: —';
+      } else {
+        $('status-translation').textContent = describeTranslation(config);
+        $('status-asr').textContent = describeAsr(config);
+        $('status-lang').textContent = `目標語言: ${config.targetLang} · ${config.displayMode === 'mono' ? '僅譯文' : '雙語'}`;
+      }
+    } catch (err) {
+      connEl.textContent = `切換失敗: ${err instanceof Error ? err.message : String(err)}`;
+      connEl.classList.add('warn');
+      toggle.checked = !toggle.checked;
+    }
+  });
 
   // 測試連接：直接向配置端點發最小請求，驗證端點可達 + 模型存在 + 響應有效。
   $('btn-test').addEventListener('click', async () => {

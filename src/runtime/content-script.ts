@@ -151,6 +151,12 @@ class SubtitleController {
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
   async start(): Promise<void> {
+    // M2-30：整體開關守衛——停用時不啟動管線，恢復 YouTube 原生字幕。
+    if (!this.config.enabled) {
+      diagLog('content', 'start() skipped: extension disabled by user');
+      return;
+    }
+
     // M2-14：讀取 tabCapture 授權狀態（初始值，後續由 storage.onChanged 監聽更新）。
     const authState = await chrome.storage.local.get('tabCaptureAuthorized');
     this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
@@ -283,6 +289,11 @@ class SubtitleController {
     this.stop();
     diagLog('content', 'restart() stop() completed');
     this.config = await store.get();
+    // M2-30：停用時不重新啟動管線。
+    if (!this.config.enabled) {
+      diagLog('content', 'restart() stopped: extension disabled');
+      return;
+    }
     await this.start();
     diagLog('content', 'restart() start() completed');
   }

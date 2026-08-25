@@ -11,10 +11,16 @@
     .actions { margin-top: 12px; display: flex; gap: 8px; }
     button { flex: 1; padding: 7px 10px; font-size: 12px; cursor: pointer; }
     .diag { margin-top: 8px; font-size: 10px; font-family: monospace; color: #555; white-space: pre-wrap; max-height: 80px; overflow-y: auto; border-top: 1px solid #eee; padding-top: 4px; }
+    body.disabled .line:not(#enable-toggle-line) { opacity: 0.5; }
+    body.disabled .actions button { pointer-events: none; opacity: 0.5; }
   </style>
 </head>
 <body>
   <h1>AI_Trans</h1>
+  <div class="line" id="enable-toggle-line" style="display: flex; align-items: center; gap: 8px;">
+    <input type="checkbox" id="enable-toggle" style="width: auto;" />
+    <label for="enable-toggle" style="margin: 0; font-weight: 500;">啟用翻譯字幕</label>
+  </div>
   <div class="line" id="status-translation">翻譯: —</div>
   <div class="line" id="status-asr">ASR: —</div>
   <div class="line" id="status-lang">目標語言: —</div>

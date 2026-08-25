@@ -29,6 +29,7 @@
     }
   };
   var DEFAULT_CONFIG = {
+    enabled: true,
     translation: { type: "cloud-llm", fallbackType: "mt" },
     asr: { type: "local-whisper", modelTier: "base" },
     targetLang: "zh-Hant",
@@ -158,6 +159,7 @@
       bgColor = BG_PRESETS[preset] ?? "transparent";
     }
     const config = {
+      enabled: $("enable-toggle").checked,
       translation: {
         type: translationType,
         model: $("translation-model").value || void 0,
@@ -191,6 +193,7 @@
     return config;
   }
   function fillForm(config) {
+    $("enable-toggle").checked = config.enabled;
     $("translation-type").value = config.translation.type;
     $("translation-model").value = config.translation.model ?? "";
     $("translation-endpoint").value = config.translation.endpoint ?? "";

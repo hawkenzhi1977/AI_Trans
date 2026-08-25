@@ -63,6 +63,8 @@ export const DEBUG_LOG_OFF: DebugLogConfig = {
 
 /** 引擎整體配置（單一配置實體）。 */
 export interface EngineConfig {
+  /** 整體功能開關（false = 完全停用字幕翻譯，恢復 YouTube 原生字幕）。 */
+  enabled: boolean;
   translation: TranslationConfig;
   asr: ASRConfig;
   targetLang: string;
@@ -94,6 +96,7 @@ export const PROFILE_DEFAULTS: Record<
 
 /** 默認配置。 */
 export const DEFAULT_CONFIG: EngineConfig = {
+  enabled: true,
   translation: { type: 'cloud-llm', fallbackType: 'mt' },
   asr: { type: 'local-whisper', modelTier: 'base' },
   targetLang: 'zh-Hant',

@@ -14,6 +14,7 @@
     popup: false
   };
   var DEFAULT_CONFIG = {
+    enabled: true,
     translation: { type: "cloud-llm", fallbackType: "mt" },
     asr: { type: "local-whisper", modelTier: "base" },
     targetLang: "zh-Hant",
@@ -326,6 +327,8 @@ ${line}` : line;
       popupDiag(`store-get error: ${err instanceof Error ? err.message : String(err)}`);
       $("status-diagnostic").textContent = `\u6700\u8FD1\u5931\u6557: \u932F\u8AA4: \u914D\u7F6E\u8B80\u53D6\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
       $("status-diagnostic").classList.add("warn");
+      const toggle2 = $("enable-toggle");
+      toggle2.checked = true;
       bindActions(configFallback());
       stopInitWatchdog();
       return;
@@ -333,6 +336,14 @@ ${line}` : line;
     $("status-translation").textContent = describeTranslation(config);
     $("status-asr").textContent = describeAsr(config);
     $("status-lang").textContent = `\u76EE\u6A19\u8A9E\u8A00: ${config.targetLang} \xB7 ${config.displayMode === "mono" ? "\u50C5\u8B6F\u6587" : "\u96D9\u8A9E"}`;
+    const toggle = $("enable-toggle");
+    toggle.checked = config.enabled;
+    document.body.classList.toggle("disabled", !config.enabled);
+    if (!config.enabled) {
+      $("status-translation").textContent = "\u7FFB\u8B6F: \u5DF2\u505C\u7528";
+      $("status-asr").textContent = "ASR: \u5DF2\u505C\u7528";
+      $("status-lang").textContent = "\u76EE\u6A19\u8A9E\u8A00: \u2014";
+    }
     let diagText;
     console.log("[AI_Trans:popup] diag-read-start | elapsed=%dms", performance.now() - t0);
     try {
@@ -377,6 +388,31 @@ ${line}` : line;
     }
   }
   function bindActions(config) {
+    const toggle = $("enable-toggle");
+    toggle.addEventListener("change", async () => {
+      const connEl = $("status-connection");
+      connEl.textContent = "\u5207\u63DB\u4E2D\u2026";
+      connEl.classList.remove("warn", "ok");
+      try {
+        await store.set({ enabled: toggle.checked });
+        connEl.textContent = toggle.checked ? "\u9023\u63A5\u6E2C\u8A66: \u5DF2\u555F\u7528" : "\u9023\u63A5\u6E2C\u8A66: \u5DF2\u505C\u7528";
+        connEl.classList.add("ok");
+        document.body.classList.toggle("disabled", !toggle.checked);
+        if (!toggle.checked) {
+          $("status-translation").textContent = "\u7FFB\u8B6F: \u5DF2\u505C\u7528";
+          $("status-asr").textContent = "ASR: \u5DF2\u505C\u7528";
+          $("status-lang").textContent = "\u76EE\u6A19\u8A9E\u8A00: \u2014";
+        } else {
+          $("status-translation").textContent = describeTranslation(config);
+          $("status-asr").textContent = describeAsr(config);
+          $("status-lang").textContent = `\u76EE\u6A19\u8A9E\u8A00: ${config.targetLang} \xB7 ${config.displayMode === "mono" ? "\u50C5\u8B6F\u6587" : "\u96D9\u8A9E"}`;
+        }
+      } catch (err) {
+        connEl.textContent = `\u5207\u63DB\u5931\u6557: ${err instanceof Error ? err.message : String(err)}`;
+        connEl.classList.add("warn");
+        toggle.checked = !toggle.checked;
+      }
+    });
     $("btn-test").addEventListener("click", async () => {
       const connEl = $("status-connection");
       connEl.textContent = "\u9023\u63A5\u6E2C\u8A66: \u6E2C\u8A66\u4E2D\u2026";

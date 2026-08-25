@@ -93,6 +93,7 @@ function readForm(): EngineConfig {
 
   // 性能檔位會覆蓋 asr/displayMode 默認（見 PROFILE_DEFAULTS），但保留用戶手動微調。
   const config: EngineConfig = {
+    enabled: $<HTMLInputElement>('enable-toggle').checked,
     translation: {
       type: translationType,
       model: $<HTMLInputElement>('translation-model').value || undefined,
@@ -129,6 +130,7 @@ function readForm(): EngineConfig {
 }
 
 function fillForm(config: EngineConfig): void {
+  $<HTMLInputElement>('enable-toggle').checked = config.enabled;
   $<HTMLSelectElement>('translation-type').value = config.translation.type;
   $<HTMLInputElement>('translation-model').value = config.translation.model ?? '';
   $<HTMLInputElement>('translation-endpoint').value = config.translation.endpoint ?? '';
