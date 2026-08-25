@@ -171,7 +171,29 @@
   }
 
   // src/runtime/popup/connection-test.ts
-  async function testConnection(config, apiKey, fetchFn = globalThis.fetch.bind(globalThis), timeoutMs = 1e4) {
+  function createSwProxyFetch() {
+    return async (input, init2) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const response = await chrome.runtime.sendMessage({
+        topic: "sw:proxy-fetch-llm",
+        payload: {
+          url,
+          method: init2?.method ?? "POST",
+          headers: init2?.headers,
+          body: init2?.body
+        }
+      });
+      const res = response;
+      if (res.error && !res.status) {
+        throw new Error(res.error);
+      }
+      return new Response(res.body ?? "", {
+        status: res.status ?? 200,
+        statusText: res.ok ? "OK" : "Error"
+      });
+    };
+  }
+  async function testConnection(config, apiKey, fetchFn = createSwProxyFetch(), timeoutMs = 1e4) {
     const tc = config.translation;
     if (tc.type !== "cloud-llm" && tc.type !== "local") {
       return { ok: false, error: "\u7576\u524D\u5F15\u64CE\u985E\u578B\u4E0D\u9700\u7DB2\u7D61\u9023\u7DDA\uFF08MT \u5B57\u5178 / \u672C\u5730 ONNX\uFF09\u3002\u8ACB\u9078\u96F2\u7AEF LLM \u6216\u672C\u5730\u6A21\u578B\u3002" };

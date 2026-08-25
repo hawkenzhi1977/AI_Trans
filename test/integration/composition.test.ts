@@ -46,15 +46,20 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
   });
 
   it('local 端點自動補全：填 Base URL /v1 時實際請求發往 /v1/chat/completions', async () => {
-    const captured: Array<RequestInfo | URL> = [];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      captured.push(input);
-      return new Response(JSON.stringify({ choices: [{ message: { content: '0\t你好' } }] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+    const captured: Array<{ url: string; method?: string; headers?: Record<string, string>; body?: string }> = [];
+    const sendMessageMock = vi.fn(async (msg: { topic: string; payload?: unknown }) => {
+      if (msg.topic === 'sw:proxy-fetch-llm') {
+        const payload = msg.payload as { url: string; method?: string; headers?: Record<string, string>; body?: string };
+        captured.push(payload);
+        return { ok: true, status: 200, body: JSON.stringify({ choices: [{ message: { content: '0\t你好' } }] }) };
+      }
+      return undefined;
     });
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('chrome', {
+      runtime: {
+        sendMessage: sendMessageMock,
+      },
+    });
     try {
       const registry = await buildDefaultRegistry(
         CONFIG({ translation: { type: 'local', model: 'qwen-mlx', endpoint: 'http://127.0.0.1:8000/v1' } }),
@@ -64,7 +69,7 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
         segments: [{ id: '0', start: 0, end: 1000, sourceText: 'hi', origin: 'native', provisional: false, revision: 0 }],
         targetLang: 'zh-Hant',
       });
-      expect(String(captured[0])).toBe('http://127.0.0.1:8000/v1/chat/completions');
+      expect(captured[0]?.url).toBe('http://127.0.0.1:8000/v1/chat/completions');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -150,18 +155,27 @@ describe('buildDefaultRegistry 配置注入（M1-25）', () => {
 
   it('LLM 翻譯請求實際攜帶從安全存儲解析的 Authorization', async () => {
     // 捕獲發往 LLM 端點的請求頭。
-    const captured: RequestInit[] = [];
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      captured.push(init ?? {});
-      // 返回中文翻譯（匹配 targetLang: 'zh-Hant'），避免觸發語言錯誤偵測。
-      return new Response(
-        JSON.stringify({
-          choices: [{ message: { content: '0\t你好世界' } }],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
+    const captured: Array<{ url: string; method?: string; headers?: Record<string, string>; body?: string }> = [];
+    const sendMessageMock = vi.fn(async (msg: { topic: string; payload?: unknown }) => {
+      if (msg.topic === 'sw:proxy-fetch-llm') {
+        const payload = msg.payload as { url: string; method?: string; headers?: Record<string, string>; body?: string };
+        captured.push(payload);
+        // 返回中文翻譯（匹配 targetLang: 'zh-Hant'），避免觸發語言錯誤偵測。
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            choices: [{ message: { content: '0\t你好世界' } }],
+          }),
+        };
+      }
+      return undefined;
     });
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('chrome', {
+      runtime: {
+        sendMessage: sendMessageMock,
+      },
+    });
     try {
       const registry: Registry = await buildDefaultRegistry(
         CONFIG({

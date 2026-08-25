@@ -77,13 +77,12 @@ describe('popup 診斷顯示', () => {
   });
 
   it('點擊「測試連接」顯示結果（成功標綠）', async () => {
-    // 用假 fetch 直接返回成功響應。
-    globalThis.fetch = vi.fn(async () =>
-      new Response(JSON.stringify({ choices: [{ message: { content: 'ping' } }] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    ) as unknown as typeof fetch;
+    // 用假 sendMessage 直接返回成功響應。
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      body: JSON.stringify({ choices: [{ message: { content: 'ping' } }] }),
+    });
 
     await loadPopup();
     document.getElementById('btn-test')!.click();
