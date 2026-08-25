@@ -798,8 +798,8 @@ describe('yt-timedtext-interceptor — 字幕模組驅動（M1-47）', () => {
     await loadInterceptor();
     vi.advanceTimersByTime(1_000);
     
-    // 應從 DOM 提取軌並選人工軌（kind !== 'asr'）。
-    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'zh-Hant' });
+    // 應從 DOM 提取軌並選英文軌（M2-34：英文優先）。
+    expect(setOption).toHaveBeenCalledWith('captions', 'track', { languageCode: 'en', kind: 'asr' });
     expect(Reflect.get(globalThis, '__aiTransCaptionTracks')).toBe(2);
     window.history.replaceState({}, '', '/');
   });

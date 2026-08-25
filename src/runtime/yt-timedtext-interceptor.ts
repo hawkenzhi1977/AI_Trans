@@ -290,10 +290,18 @@ interface YtCaptionTrack {
  * 從播放器字幕軌列表挑選要載入的軌（M1-47）。
  * 注意：翻譯「目標語言」（如 zh-Hant）與字幕「來源語言」（視頻原文，常為英文）不同，
  * 故不以翻譯目標匹配軌。偏好人工軌（kind !== 'asr'）以取得質量更佳的原文字幕；
- * 無人工軌時退化為第一軌（通常為自動字幕）。content-script 側最終按需選軌翻譯，
- * 此處只需逼播放器發出**某一軌**帶 pot 的請求供攔截。
+ * M2-34：選擇英文軌道（與策略 selectBestTrack 優先級對齊）。
+ * 優先級：英文人工 > 英文自動 > 第一個非 ASR > 第一個。
+ * 確保攔截器驅動的軌道與策略選擇的軌道一致，避免語言不匹配導致字幕無法顯示。
  */
 function pickTargetTrack(tracklist: YtCaptionTrack[]): YtCaptionTrack {
+  // 1. 英文人工字幕
+  const enManual = tracklist.find((t) => t.languageCode?.toLowerCase().startsWith('en') && t.kind !== 'asr');
+  if (enManual) return enManual;
+  // 2. 英文自動字幕
+  const enAuto = tracklist.find((t) => t.languageCode?.toLowerCase().startsWith('en') && t.kind === 'asr');
+  if (enAuto) return enAuto;
+  // 3. 第一個非 ASR 軌道
   const manual = tracklist.find((t) => t.kind !== 'asr');
   return manual ?? tracklist[0];
 }

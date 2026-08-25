@@ -86,4 +86,22 @@ describe('ChromeStorageConfigStore', () => {
     expect(config.debugLog).toEqual(DEFAULT_CONFIG.debugLog);
     expect(config.targetLang).toBe('en');
   });
+
+  it('M2-34：部分 patch（如 enabled 切換）不覆蓋已保存的 debugLog', async () => {
+    const store = new ChromeStorageConfigStore();
+    // 先保存帶有自定義 debugLog 的配置
+    await store.set({ debugLog: { ...DEFAULT_CONFIG.debugLog, llm: true, overlay: true } });
+    let config = await store.get();
+    expect(config.debugLog.llm).toBe(true);
+    expect(config.debugLog.overlay).toBe(true);
+    
+    // 模擬 Popup 切換 enabled（只傳入部分 patch）
+    await store.set({ enabled: false });
+    config = await store.get();
+    
+    // debugLog 應該保留，不被重置為默認值
+    expect(config.enabled).toBe(false);
+    expect(config.debugLog.llm).toBe(true);
+    expect(config.debugLog.overlay).toBe(true);
+  });
 });

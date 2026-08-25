@@ -514,7 +514,7 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
     }
   });
 
-  it('ASR 啟用 + 音頻 zh + 有 zh 自動字幕 → 選 zh 自動', async () => {
+  it('ASR 啟用 + 音頻 zh + 有 en 和 zh 字幕 → 選 en（M2-34 英文優先）', async () => {
     const tracks = [makeTrack('en'), makeTrack('zh', true)];
     const p = makePlatformWithTracks(tracks, 'zh-Hant');
     const ctx = makeCtxWithTracks(p, 'local-whisper', 'zh-Hant');
@@ -524,11 +524,12 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
     const ready = events.find(e => e.type === 'segments-ready');
     expect(ready).toBeDefined();
     if (ready && ready.type === 'segments-ready') {
-      expect(ready.segments[0].sourceLang).toBe('zh');
+      // M2-34：英文優先於音頻語言，所以選 en
+      expect(ready.segments[0].sourceLang).toBe('en');
     }
   });
 
-  it('ASR 未啟用 + 有音頻語言 → 仍優選音頻語言（M2-32 移除 ASR 門控）', async () => {
+  it('ASR 未啟用 + 有音頻語言 fr + 有 en 字幕 → 選 en（M2-34 英文優先）', async () => {
     const tracks = [makeTrack('fr'), makeTrack('en', true), makeTrack('en')];
     const p = makePlatformWithTracks(tracks, 'fr');
     const ctx = makeCtxWithTracks(p, 'none', 'fr');
@@ -538,8 +539,8 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
     const ready = events.find(e => e.type === 'segments-ready');
     expect(ready).toBeDefined();
     if (ready && ready.type === 'segments-ready') {
-      // M2-32：應選 fr 字幕（第一個 track），因為音頻語言優先（即使 ASR 未啟用）
-      expect(ready.segments[0].sourceLang).toBe('fr');
+      // M2-34：英文優先於音頻語言，所以選 en（第三個 track，英文人工字幕）
+      expect(ready.segments[0].sourceLang).toBe('en');
     }
   });
 

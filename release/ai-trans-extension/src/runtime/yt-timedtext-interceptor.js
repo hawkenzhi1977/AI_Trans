@@ -182,6 +182,10 @@
   }
   var targetLang = null;
   function pickTargetTrack(tracklist) {
+    const enManual = tracklist.find((t) => t.languageCode?.toLowerCase().startsWith("en") && t.kind !== "asr");
+    if (enManual) return enManual;
+    const enAuto = tracklist.find((t) => t.languageCode?.toLowerCase().startsWith("en") && t.kind === "asr");
+    if (enAuto) return enAuto;
     const manual = tracklist.find((t) => t.kind !== "asr");
     return manual ?? tracklist[0];
   }

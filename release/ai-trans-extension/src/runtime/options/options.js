@@ -82,8 +82,9 @@
         ...patch,
         translation: { ...base.translation, ...patch.translation ?? {} },
         asr: { ...base.asr, ...patch.asr ?? {} },
-        // M1-51：debugLog 深合併——舊配置缺 debugLog 時補全鍵，避免 undefined 崩壞。
-        debugLog: { ...DEFAULT_CONFIG.debugLog, ...patch.debugLog ?? {} }
+        // M2-34：debugLog 深合併——使用 base.debugLog 而非 DEFAULT_CONFIG.debugLog，
+        // 避免部分 patch（如 Popup 切換 enabled）覆蓋已保存的調試設置。
+        debugLog: { ...base.debugLog, ...patch.debugLog ?? {} }
       };
     }
   };
