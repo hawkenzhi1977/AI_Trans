@@ -932,6 +932,8 @@ jobs:
 | TC-M2-32 | M2-32 真實環境修復四項：①停用時完整中止翻譯管線（restart() 補 dispatch ai-trans:disable + translateStream abort 檢查）②字幕軌選擇優先級調整（移除 ASR 門控，音頻語言優先）③雙語字幕去重（sourceText === translatedText 時只顯示一行）④LLM 翻譯語言錯誤偵測（detectLanguageError + 額外重試） | 單元（已實裝：llm-translation +3 語言錯誤偵測/英文目標不觸發/abort 檢查）+ 集成（已實裝：overlay-renderer +1 雙語去重）+ 單元測試更新（native-caption-strategy 1 個） |
 | TC-M2-33 | M2-33 捕獲複用語言驗證：`tryReuseCapture()` 和 `waitForCaptureReuse()` 新增語言驗證——從捕獲 URL 提取 `lang` 參數，與請求語言模糊匹配（en 匹配 en-US、en-GB）。不匹配時跳過複用，回退直接 fetch。修復攔截器驅動 es-ES 軌道但策略選擇 en 軌道時複用錯誤語言字幕的問題 | 集成（已實裝：platform-adapter +4 捕獲語言匹配複用/語言不匹配跳過/模糊匹配成功/waitForCapture 語言不匹配） |
 | TC-M2-34 | M2-34 字幕選擇策略簡化 + 調試設置持久化修復：①`selectBestTrack()` 和 `pickTargetTrack()` 優先級改為英文>音頻語言>第一個；②`ChromeStorageConfigStore.merge()` 的 `debugLog` 合併邏輯修復（使用 `base.debugLog` 而非 `DEFAULT_CONFIG.debugLog`，避免部分 patch 覆蓋已保存的調試設置） | 單元（已實裝：config-store +1 部分 patch 不覆蓋 debugLog）+ 單元測試更新（native-caption-strategy 2 個、yt-timedtext-interceptor 1 個） |
+| TC-M2-35 | M2-35 WebGPU 推論失敗回退 WASM：`runInference()` catch 區塊檢測 WebGPU 推論錯誤（`createBuffer`/`WebGPU`/`device lost`/`gpu`），設置 `webgpuFailed=true`、釋放失敗的 pipeline、以 WASM 後端重新載入並重試推論一次。新增診斷碼 `local-onnx-webgpu-inference-fallback` 與 `local-onnx-wasm-fallback-failed` | 集成（已實裝：offscreen-local-onnx +2 WebGPU 推論失敗→WASM 回退成功/WASM 也失敗→返回錯誤） |
+| TC-M2-36 | M2-36 虛假 Seek 偵測防護：視頻從非零位置開始播放時，初始化階段可能觸發虛假 `onSeek(0)`。`NativeCaptionStrategy.onSeek()` 新增防護：若 `seekTime === 0` 但當前播放位置 > `falseSeekThresholdMs`（可配置，預設 10000ms），忽略此次 seek。`EngineConfig` 新增 `falseSeekThresholdMs` 字段 | 單元（已實裝：native-caption-strategy +3 虛假 seek 被忽略/真實 seek 被接受/非零 seek 無論位置都接受） |
 | TC-F08 | F-08 | 集成/E2E |
 | TC-F09 | F-09 | E2E |
 | TC-DEGRADE | 架構§10 | 單元/集成 |

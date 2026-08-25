@@ -30,6 +30,8 @@ export class NativeCaptionStrategy implements CaptionStrategy {
   private abortController: AbortController | null = null;
   private hasSeek = false;
   private seekTime = 0;
+  /** M2-36：存儲 ctx 供 onSeek() 訪問當前播放位置（虛假 seek 防護）。 */
+  private ctx: StrategyContext | null = null;
 
   /**
    * 判斷是否有原生字幕軌可用。
@@ -57,6 +59,8 @@ export class NativeCaptionStrategy implements CaptionStrategy {
     emit: (e: PipelineEvent) => void
   ): Promise<void> {
     this.stopped = false;
+    // M2-36：存儲 ctx 供 onSeek() 訪問（虛假 seek 防護需要當前播放位置）。
+    this.ctx = ctx;
     const tracks = await ctx.platform.listCaptionTracks();
     // M2-30：智能選擇字幕軌（替代 tracks[0]）。
     const track = this.selectBestTrack(tracks, ctx);
@@ -237,6 +241,13 @@ export class NativeCaptionStrategy implements CaptionStrategy {
 
   /** Seek 時由 Orchestrator 調用：中斷當前翻譯，記錄新位置。 */
   onSeek(currentTimeMs: number): void {
+    // M2-36：虛假 seek 防護——若 seekTime=0 但當前播放位置 > 閾值，忽略此次 seek。
+    // 場景：視頻從非零位置（如 &t=289s）開始播放時，初始化階段可能觸發虛假 onSeek(0)。
+    const threshold = this.ctx?.config.falseSeekThresholdMs ?? 10000;
+    if (currentTimeMs === 0 && this.ctx && this.ctx.playback().currentTime > threshold) {
+      diagLog('strategy', 'ignoring false seek to 0ms, actual position:', this.ctx.playback().currentTime, 'threshold:', threshold);
+      return;
+    }
     this.hasSeek = true;
     this.seekTime = currentTimeMs;
     // 中斷當前翻譯（下一輪 while 循環會重新優先化）
@@ -304,6 +315,8 @@ export class NativeCaptionStrategy implements CaptionStrategy {
   stop(): void {
     this.stopped = true;
     this.abortController?.abort();
+    // M2-36：清除 ctx 引用，避免記憶體洩漏。
+    this.ctx = null;
   }
 }
 

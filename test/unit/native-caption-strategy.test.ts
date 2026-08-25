@@ -277,6 +277,90 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
     expect(aborted).toBe(true);
   });
 
+  it('M2-36: onSeek(0) 但當前位置 > 閾值 → 忽略虛假 seek', () => {
+    const s = new NativeCaptionStrategy();
+    // 手動設置 ctx（模擬 run() 已執行）
+    const ctx = {
+      platform: {} as PlatformAdapter,
+      playback: () => ({ currentTime: 298000, playing: true, rate: 1, duration: 60000, buffered: [] }),
+      config: {
+        translation: { type: 'local', model: 'm', endpoint: 'http://x/v1', fallbackType: 'mt' },
+        asr: { type: 'local-whisper', modelTier: 'base' },
+        targetLang: 'zh-Hant',
+        displayMode: 'bilingual',
+        performanceProfile: 'balanced',
+        falseSeekThresholdMs: 10000,
+      },
+      asr: {} as any,
+      translation: {} as TranslationProvider,
+      diagnostics: [],
+    } as StrategyContext;
+    
+    // 手動設置 ctx（模擬 run() 已執行）
+    (s as any).ctx = ctx;
+    
+    // 模擬虛假 seek 到 0ms
+    s.onSeek(0);
+    
+    // 驗證：虛假 seek 被忽略，hasSeek 未設置
+    expect(s['hasSeek']).toBe(false);
+  });
+
+  it('M2-36: onSeek(0) 且當前位置 < 閾值 → 接受 seek', () => {
+    const s = new NativeCaptionStrategy();
+    const ctx = {
+      platform: {} as PlatformAdapter,
+      playback: () => ({ currentTime: 5000, playing: true, rate: 1, duration: 60000, buffered: [] }),
+      config: {
+        translation: { type: 'local', model: 'm', endpoint: 'http://x/v1', fallbackType: 'mt' },
+        asr: { type: 'local-whisper', modelTier: 'base' },
+        targetLang: 'zh-Hant',
+        displayMode: 'bilingual',
+        performanceProfile: 'balanced',
+        falseSeekThresholdMs: 10000,
+      },
+      asr: {} as any,
+      translation: {} as TranslationProvider,
+      diagnostics: [],
+    } as StrategyContext;
+    
+    (s as any).ctx = ctx;
+    
+    // 模擬 seek 到 0ms（此時當前位置 5s < 閾值 10s，應接受）
+    s.onSeek(0);
+    
+    // 驗證：seek 被接受，hasSeek 被設置
+    expect(s['hasSeek']).toBe(true);
+    expect(s['seekTime']).toBe(0);
+  });
+
+  it('M2-36: onSeek(非0) → 無論當前位置都接受', () => {
+    const s = new NativeCaptionStrategy();
+    const ctx = {
+      platform: {} as PlatformAdapter,
+      playback: () => ({ currentTime: 298000, playing: true, rate: 1, duration: 60000, buffered: [] }),
+      config: {
+        translation: { type: 'local', model: 'm', endpoint: 'http://x/v1', fallbackType: 'mt' },
+        asr: { type: 'local-whisper', modelTier: 'base' },
+        targetLang: 'zh-Hant',
+        displayMode: 'bilingual',
+        performanceProfile: 'balanced',
+        falseSeekThresholdMs: 10000,
+      },
+      asr: {} as any,
+      translation: {} as TranslationProvider,
+      diagnostics: [],
+    } as StrategyContext;
+    
+    (s as any).ctx = ctx;
+    
+    // 模擬真實 seek 到 30s（非 0，應接受）
+    s.onSeek(30000);
+    
+    expect(s['hasSeek']).toBe(true);
+    expect(s['seekTime']).toBe(30000);
+  });
+
   it('[M1-59] run()：ONNX 兜底配置 → 翻譯請求起點 = currentTime+5s', async () => {
     const segments = multiSegmentTrack(); // 10 段，每段 5s（start: 0,5000,...,45000）
     const s = new NativeCaptionStrategy();

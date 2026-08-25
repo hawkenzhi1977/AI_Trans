@@ -73,6 +73,8 @@ export interface EngineConfig {
   subtitleStyle?: Record<string, string>;
   /** 調試日誌分類開關（M1-51；缺省全關）。 */
   debugLog: DebugLogConfig;
+  /** M2-36：虛假 seek 防護閾值（毫秒）。若 seekTime=0 但當前播放位置 > 此值，忽略此次 seek。預設 10000ms。 */
+  falseSeekThresholdMs?: number;
 }
 
 /** 預設配置檔位。 */
@@ -108,4 +110,5 @@ export const DEFAULT_CONFIG: EngineConfig = {
     'background-color': 'rgba(32, 32, 32, 0.7)',
   },
   debugLog: DEBUG_LOG_OFF,
+  falseSeekThresholdMs: 10000,
 };
