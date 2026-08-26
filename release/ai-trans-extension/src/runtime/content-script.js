@@ -83,7 +83,13 @@
   };
 
   // src/domain/models/config.ts
-  var DEFAULT_LOCAL_TRANSLATION_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
+  var LOCAL_TRANSLATION_MODELS = {
+    /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
+    small: "Xenova/opus-mt-en-zh",
+    /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
+    large: "onnx-community/Qwen2.5-0.5B-Instruct"
+  };
+  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
   var DEBUG_LOG_OFF = {
     overlay: false,
     llm: false,
@@ -2397,7 +2403,17 @@ Output example:
             }
           };
           port.onMessage.addListener(listener);
-          port.postMessage({ ...request, messageId });
+          try {
+            port.postMessage({ ...request, messageId });
+          } catch (err) {
+            port.onMessage.removeListener(listener);
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (errMsg.includes("disconnected port")) {
+              this.port = null;
+            }
+            reject(err instanceof Error ? err : new Error(errMsg));
+            return;
+          }
           setTimeout(() => {
             port.onMessage.removeListener(listener);
             reject(new Error("Offscreen Document response timeout"));

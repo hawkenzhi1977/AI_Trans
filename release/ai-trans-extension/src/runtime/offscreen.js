@@ -48527,7 +48527,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   };
 
   // src/domain/models/config.ts
-  var DEFAULT_LOCAL_TRANSLATION_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
+  var LOCAL_TRANSLATION_MODELS = {
+    /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
+    small: "Xenova/opus-mt-en-zh",
+    /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
+    large: "onnx-community/Qwen2.5-0.5B-Instruct"
+  };
+  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
 
   // src/runtime/offscreen.ts
   var ProxyCache = class {
@@ -48723,6 +48729,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       case "local-onnx:clear-cache":
         void clearModelCache().then(respond);
         return true;
+      case "local-onnx:set-model-tier": {
+        const tierMsg = message;
+        const result = setModelTier(tierMsg.tier ?? "small");
+        respond({ type: "local-onnx:status", downloaded: false, modelName: result.modelName });
+        return true;
+      }
       case "local-onnx:translate": {
         if (onnxPortConnected) {
           busyCount = Math.max(0, busyCount - 1);
@@ -48792,6 +48804,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             result = await clearModelCache();
             broadcastToAll(result);
             break;
+          case "local-onnx:set-model-tier": {
+            const tier = msg.payload?.tier;
+            const tierResult = setModelTier(tier ?? "small");
+            result = { tier: tierResult.tier, modelName: tierResult.modelName };
+            broadcastToAll({ type: "local-onnx:status", downloaded: false, modelName: tierResult.modelName });
+            break;
+          }
           case "local-onnx:translate":
             result = await runInference(
               msg.payload?.text ?? msg.text ?? "",
@@ -48854,7 +48873,26 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var loadPromise = null;
   var loadPromiseHasProgress = false;
   var cacheGeneration = 0;
-  var LOCAL_MODEL_NAME = DEFAULT_LOCAL_TRANSLATION_MODEL;
+  var currentModelTier = "small";
+  var currentModelName = LOCAL_TRANSLATION_MODELS.small;
+  function isSmallModel() {
+    return currentModelTier === "small";
+  }
+  function setModelTier(tier) {
+    if (tier !== currentModelTier) {
+      console.log(`[AI_Trans] \u5207\u63DB\u6A21\u578B\u6A94\u4F4D: ${currentModelTier} \u2192 ${tier}`);
+      currentModelTier = tier;
+      currentModelName = LOCAL_TRANSLATION_MODELS[tier];
+      if (translationPipeline !== null) {
+        void disposePipeline(translationPipeline).then(() => {
+          translationPipeline = null;
+          loadPromise = null;
+          loadPromiseHasProgress = false;
+        });
+      }
+    }
+    return { tier: currentModelTier, modelName: currentModelName };
+  }
   var webgpuFailed = false;
   function preferWebGpu() {
     if (webgpuFailed) return false;
@@ -48904,31 +48942,62 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     if (env3.backends?.onnx?.wasm) {
       env3.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("src/runtime/ort/");
     }
+    const modelName = currentModelName;
     const device = preferWebGpu() ? "webgpu" : "wasm";
-    try {
-      return await pipeline("text-generation", LOCAL_MODEL_NAME, {
-        dtype: "q4",
-        device,
-        ...progressCallback ? { progress_callback: progressCallback } : {}
-      });
-    } catch (err) {
-      if (device !== "webgpu") throw err;
-      webgpuFailed = true;
-      console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
-      recordDiagnostic({
-        type: "pipeline-error",
-        error: {
-          port: "translation",
-          code: "local-onnx-webgpu-fallback",
-          recoverable: true,
-          cause: err instanceof Error ? err : new Error(String(err))
-        }
-      });
-      return await pipeline("text-generation", LOCAL_MODEL_NAME, {
-        dtype: "q4",
-        device: "wasm",
-        ...progressCallback ? { progress_callback: progressCallback } : {}
-      });
+    if (isSmallModel()) {
+      console.log(`[AI_Trans] \u8F09\u5165\u5C0F\u578B\u7FFB\u8B6F\u6A21\u578B: ${modelName}`);
+      try {
+        return await pipeline("translation", modelName, {
+          dtype: "q8",
+          device,
+          ...progressCallback ? { progress_callback: progressCallback } : {}
+        });
+      } catch (err) {
+        if (device !== "webgpu") throw err;
+        webgpuFailed = true;
+        console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-webgpu-fallback",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
+        return await pipeline("translation", modelName, {
+          dtype: "q8",
+          device: "wasm",
+          ...progressCallback ? { progress_callback: progressCallback } : {}
+        });
+      }
+    } else {
+      console.log(`[AI_Trans] \u8F09\u5165\u5927\u578B LLM \u6A21\u578B: ${modelName}`);
+      try {
+        return await pipeline("text-generation", modelName, {
+          dtype: "q4",
+          device,
+          ...progressCallback ? { progress_callback: progressCallback } : {}
+        });
+      } catch (err) {
+        if (device !== "webgpu") throw err;
+        webgpuFailed = true;
+        console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-webgpu-fallback",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
+        return await pipeline("text-generation", modelName, {
+          dtype: "q4",
+          device: "wasm",
+          ...progressCallback ? { progress_callback: progressCallback } : {}
+        });
+      }
     }
   }
   function logJsHeapBreadcrumb(label) {
@@ -49027,7 +49096,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           broadcastToAll({
             type: "local-onnx:status",
             downloaded,
-            modelName: LOCAL_MODEL_NAME,
+            modelName: currentModelName,
             loaded: true,
             loading: false,
             downloading: false
@@ -49049,7 +49118,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       return {
         type: "local-onnx:status",
         downloaded,
-        modelName: LOCAL_MODEL_NAME,
+        modelName: currentModelName,
         loaded,
         loading,
         downloading: false
@@ -49067,7 +49136,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       return {
         type: "local-onnx:status",
         downloaded: false,
-        modelName: LOCAL_MODEL_NAME
+        modelName: currentModelName
       };
     }
   }
@@ -49082,7 +49151,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       if (!target) return false;
       const cache = await cachesApi.open(target);
       const requests = await cache.keys();
-      return requests.some((r) => r.url.includes(".onnx") || r.url.includes(LOCAL_MODEL_NAME));
+      return requests.some((r) => r.url.includes(".onnx") || r.url.includes(currentModelName));
     } catch {
       return false;
     }
@@ -49512,48 +49581,62 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       }
     }
     try {
-      const sourceLines = text.split("\n");
-      const prompt = buildPrompt(text, targetLang);
-      const pipelineFn = translationPipeline;
       const inferStartedAt = performance.now();
-      const result = await pipelineFn(prompt, {
-        max_new_tokens: 256,
-        do_sample: false,
-        repetition_penalty: 1.1,
-        return_full_text: false
-      });
-      const generatedText = result[0]?.generated_text ?? "";
-      console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
-      console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
-      const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
-      if (echoed) {
-        console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
-        console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
-        console.log("[AI_Trans:local-onnx] parsedCount:", parsedCount);
-        console.log("[AI_Trans:local-onnx] sourceLines (first 3):", JSON.stringify(sourceLines.slice(0, 3)));
-        console.log("[AI_Trans:local-onnx] translatedLines (first 3):", JSON.stringify(translatedLines.slice(0, 3)));
-        console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
+      if (isSmallModel()) {
+        const pipelineFn = translationPipeline;
+        const result = await pipelineFn(text, {});
+        const translatedText = result[0]?.translation_text ?? "";
         const elapsedMs = Math.round(performance.now() - inferStartedAt);
-        recordDiagnostic({
-          type: "pipeline-error",
-          error: {
-            port: "translation",
-            code: "local-onnx-echo-output",
-            recoverable: true,
-            cause: new Error(
-              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
-                generatedText.slice(0, 200)
-              )}`
-            )
-          }
+        console.log(`[AI_Trans:local-onnx-small] \u7FFB\u8B6F\u5B8C\u6210 (${elapsedMs}ms):`, translatedText.slice(0, 100));
+        return {
+          type: "local-onnx:translate-result",
+          ok: true,
+          translatedText,
+          echoed: false
+        };
+      } else {
+        const sourceLines = text.split("\n");
+        const prompt = buildPrompt(text, targetLang);
+        const pipelineFn = translationPipeline;
+        const result = await pipelineFn(prompt, {
+          max_new_tokens: 256,
+          do_sample: false,
+          repetition_penalty: 1.1,
+          return_full_text: false
         });
+        const generatedText = result[0]?.generated_text ?? "";
+        console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
+        console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
+        const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
+        if (echoed) {
+          console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
+          console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
+          console.log("[AI_Trans:local-onnx] parsedCount:", parsedCount);
+          console.log("[AI_Trans:local-onnx] sourceLines (first 3):", JSON.stringify(sourceLines.slice(0, 3)));
+          console.log("[AI_Trans:local-onnx] translatedLines (first 3):", JSON.stringify(translatedLines.slice(0, 3)));
+          console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
+          const elapsedMs = Math.round(performance.now() - inferStartedAt);
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "translation",
+              code: "local-onnx-echo-output",
+              recoverable: true,
+              cause: new Error(
+                `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+                  generatedText.slice(0, 200)
+                )}`
+              )
+            }
+          });
+        }
+        return {
+          type: "local-onnx:translate-result",
+          ok: true,
+          translatedText: translatedLines.join("\n"),
+          echoed
+        };
       }
-      return {
-        type: "local-onnx:translate-result",
-        ok: true,
-        translatedText: translatedLines.join("\n"),
-        echoed
-      };
     } catch (err) {
       const error = toReadableError(err);
       const errorMsg = error.message.toLowerCase();
@@ -49745,6 +49828,8 @@ ${numbered}
     webgpuFailed = false;
     asrDownloadInProgress = false;
     asrPipeline = null;
+    currentModelTier = "small";
+    currentModelName = LOCAL_TRANSLATION_MODELS.small;
   }
   var _testExports = {
     hasModelInCache,
@@ -49757,6 +49842,7 @@ ${numbered}
     parseNumberedOutput,
     warmupModel,
     shutdownForIdle,
+    setModelTier,
     // M1-59：ASR 狀態檢查/下載（供測試驗證 downloading 旗標與狀態字段）。
     checkAsrModelStatus,
     downloadAsrModel,
@@ -49769,6 +49855,10 @@ ${numbered}
     // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。
     get webgpuFailed() {
       return webgpuFailed;
+    },
+    // 當前模型檔位（getter；供測試斷言）
+    get currentModelTier() {
+      return currentModelTier;
     },
     // 進度聚合器（供測試驗證多檔案下載進度計算）。
     DownloadProgressAggregator
