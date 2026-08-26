@@ -223,4 +223,20 @@ describe('LocalONNXTranslationProvider', () => {
 
     await expect(provider.warmup()).rejects.toThrow('Extension context invalidated');
   });
+
+  it('port 斷開時 postMessage 拋錯應被正確捕獲並清除 port 引用', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+    });
+
+    // 模擬 port 斷開：postMessage 拋出 "disconnected port" 錯誤
+    mockPort.postMessage.mockImplementation(() => {
+      throw new Error('Attempting to use a disconnected port object');
+    });
+
+    await expect(provider.translate(req())).rejects.toThrow('disconnected port');
+
+    // 驗證 port 引用被清除（下次請求會重新建立連接）
+    expect((provider as unknown as { port: unknown }).port).toBeNull();
+  });
 });

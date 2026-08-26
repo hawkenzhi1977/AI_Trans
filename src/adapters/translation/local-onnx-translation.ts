@@ -193,7 +193,20 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         };
 
         port.onMessage.addListener(listener);
-        port.postMessage({ ...request, messageId });
+
+        // port 斷開時 postMessage 會拋出 "Attempting to use a disconnected port object"
+        try {
+          port.postMessage({ ...request, messageId });
+        } catch (err) {
+          port.onMessage.removeListener(listener);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          // port 已斷開，清除引用以便下次重連
+          if (errMsg.includes('disconnected port')) {
+            this.port = null;
+          }
+          reject(err instanceof Error ? err : new Error(errMsg));
+          return;
+        }
 
         // 超時處理（120 秒）
         setTimeout(() => {
