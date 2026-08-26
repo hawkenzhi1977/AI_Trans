@@ -68,7 +68,24 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: false, error: 'model not downloaded' } });
 
     const asr = new LocalWhisperASR({ modelTier: 'base' });
-    await expect(asr.warmup(mockConfig)).rejects.toThrow('warmup failed');
+    await expect(asr.warmup(mockConfig)).rejects.toThrow('ASR warmup failed');
+  });
+
+  it('warmup 網絡失敗時顯示網絡錯誤提示', async () => {
+    mockSendMessage.mockResolvedValueOnce({
+      ok: true,
+      result: { ok: false, error: 'Failed to fetch' },
+    });
+
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    try {
+      await asr.warmup(mockConfig);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain('network error');
+      expect((err as Error).message).toContain('選項頁面');
+    }
   });
 
   it('transcribe 轉發 asr-whisper:transcribe 消息給 Offscreen', async () => {

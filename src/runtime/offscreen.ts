@@ -1256,7 +1256,8 @@ async function warmupAsrPipeline(modelId: string): Promise<OffscreenResponse> {
       return {
         type: 'asr-whisper:warmup-complete',
         ok: false,
-        error: 'ASR model not downloaded',
+        error:
+          'ASR model not downloaded. Please download it from the Options page first. / 請先在選項頁面下載 ASR 模型',
       } satisfies OffscreenResponse;
     }
 
@@ -1289,10 +1290,13 @@ async function warmupAsrPipeline(modelId: string): Promise<OffscreenResponse> {
         cause: error,
       },
     });
+    const isNetwork = /Failed to fetch|NetworkError|network/i.test(error.message);
     return {
       type: 'asr-whisper:warmup-complete',
       ok: false,
-      error: error.message,
+      error: isNetwork
+        ? `ASR warmup failed (network error). Check your connection and download the ASR model from Options. / ASR 預熱失敗（網絡錯誤），請檢查網絡並從選項頁面下載模型: ${error.message}`
+        : `ASR warmup failed: ${error.message}`,
     } satisfies OffscreenResponse;
   }
 }

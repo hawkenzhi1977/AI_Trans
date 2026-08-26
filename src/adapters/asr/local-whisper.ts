@@ -75,9 +75,12 @@ export class LocalWhisperASR implements ASRProvider {
 
       this.warmedUp = true;
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isNetwork = /Failed to fetch|NetworkError|network/i.test(msg);
       const error = new Error(
-        `LocalWhisperASR warmup failed: ${err instanceof Error ? err.message : String(err)}. ` +
-          `Please ensure the ASR model is downloaded first.`
+        isNetwork
+          ? `ASR warmup failed (network error). Check your connection and download the ASR model from Options. / ASR 預熱失敗（網絡錯誤），請檢查網絡並從選項頁面下載模型: ${msg}`
+          : `ASR warmup failed: ${msg}. Download the ASR model from Options. / 請從選項頁面下載 ASR 模型`
       );
       recordDiagnostic({
         type: 'pipeline-error',
