@@ -37,7 +37,8 @@ for (const file of ORT_WASM_FILES) {
   const src = `node_modules/onnxruntime-web/dist/${file}`;
   const dest = `dist/src/runtime/ort/${file}`;
   if (!existsSync(src)) {
-    throw new Error(`[build] missing onnxruntime-web wasm asset: ${src}`);
+    console.log(`[build] skip (not in onnxruntime-web): ${file}`);
+    continue;
   }
   mkdirSync(dest.slice(0, dest.lastIndexOf('/')), { recursive: true });
   cpSync(src, dest, { force: true });

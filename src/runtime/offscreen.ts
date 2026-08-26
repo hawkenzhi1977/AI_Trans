@@ -17,7 +17,9 @@ type OffscreenRequest =
   | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string }
   | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
-  | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } };
+  | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } }
+  | { type: 'asr-whisper:warmup'; payload: { modelId: string } }
+  | { type: 'asr-whisper:transcribe'; payload: { pcm: Float32Array; sampleRate: number; hintLang?: string } };
 
 /** Offscreen Document 發送的響應類型。 */
 type OffscreenResponse =
@@ -34,7 +36,9 @@ type OffscreenResponse =
   | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
   | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
-  | { type: 'asr-whisper:cache-cleared'; ok: boolean };
+  | { type: 'asr-whisper:cache-cleared'; ok: boolean }
+  | { type: 'asr-whisper:warmup-complete'; ok: boolean; error?: string }
+  | { type: 'asr-whisper:transcribe-result'; ok: boolean; text?: string; chunks?: Array<{ text: string; timestamp?: [number, number] }>; error?: string; rtf?: number };
 
 /**
  * 代理 Cache 實現：Offscreen/Content-script 受 CORS 限制無法直接 fetch HuggingFace，
@@ -346,6 +350,20 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
     case 'asr-whisper:clear-cache':
       void clearAsrModelCache(msg.payload?.modelId).then(respond);
       return true;
+    case 'asr-whisper:warmup': {
+      const warmupMsg = message as { topic?: string; payload?: { modelId?: string } };
+      void warmupAsrPipeline(warmupMsg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
+      return true;
+    }
+    case 'asr-whisper:transcribe': {
+      const transcribeMsg = message as { topic?: string; payload?: { pcm?: Float32Array; sampleRate?: number; hintLang?: string } };
+      void runAsrInference(
+        transcribeMsg.payload?.pcm ?? new Float32Array(0),
+        transcribeMsg.payload?.sampleRate ?? 16000,
+        transcribeMsg.payload?.hintLang
+      ).then(respond);
+      return true;
+    }
   }
   return false;
 });
@@ -364,7 +382,7 @@ function connectToServiceWorker(): void {
       topic?: string;
       type?: string;
       messageId?: string;
-      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string };
+      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string };
       text?: string;
       targetLang?: string;
       sourceLang?: string;
@@ -420,6 +438,20 @@ function connectToServiceWorker(): void {
           result = await clearAsrModelCache(msg.payload?.modelId);
           broadcastToAll(result as OffscreenResponse);
           break;
+        case 'asr-whisper:warmup':
+          result = await warmupAsrPipeline(msg.payload?.modelId ?? 'Xenova/whisper-base.en');
+          broadcastToAll(result as OffscreenResponse);
+          break;
+        case 'asr-whisper:transcribe': {
+          const pcmData = msg.payload?.pcm as Float32Array | undefined;
+          result = await runAsrInference(
+            pcmData ?? new Float32Array(0),
+            (msg.payload?.sampleRate as number) ?? 16000,
+            msg.payload?.hintLang as string | undefined
+          );
+          broadcastToAll(result as OffscreenResponse);
+          break;
+        }
         default:
           error = `Unknown message type: ${type}`;
       }
@@ -1210,6 +1242,150 @@ async function clearAsrModelCache(modelId?: string): Promise<OffscreenResponse> 
 }
 
 /**
+ * M2-37：預加載 ASR Whisper 模型到記憶體（供推理使用）。
+ * 與 downloadAsrModel 不同：本函數保留 pipeline 實例供後續推理使用，
+ * 而非下載後立即 dispose。
+ */
+async function warmupAsrPipeline(modelId: string): Promise<OffscreenResponse> {
+  if (asrPipeline !== null) {
+    return { type: 'asr-whisper:warmup-complete', ok: true } satisfies OffscreenResponse;
+  }
+  try {
+    // 先檢查是否已緩存，未緩存時返回錯誤（不觸發下載）。
+    if (!(await hasAsrModelInCache(modelId))) {
+      return {
+        type: 'asr-whisper:warmup-complete',
+        ok: false,
+        error: 'ASR model not downloaded',
+      } satisfies OffscreenResponse;
+    }
+
+    const transformers = await import('@huggingface/transformers');
+    const { pipeline, env } = transformers;
+
+    // env 配置與 downloadAsrModel 一致。
+    (env as unknown as { remoteHost: string }).remoteHost = 'https://hf-mirror.com/';
+    (env as unknown as { useCustomCache: boolean }).useCustomCache = true;
+    (env as unknown as { customCache: ProxyCache }).customCache = proxyCache;
+    if (env.backends?.onnx?.wasm) {
+      env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('src/runtime/ort/');
+    }
+
+    asrPipeline = await pipeline('automatic-speech-recognition', modelId, {
+      device: 'wasm',
+      dtype: 'q8',
+    });
+
+    console.warn('[AI_Trans] ASR Whisper pipeline loaded for inference');
+    return { type: 'asr-whisper:warmup-complete', ok: true } satisfies OffscreenResponse;
+  } catch (err) {
+    const error = toReadableError(err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'asr',
+        code: 'asr-whisper-warmup-failed',
+        recoverable: true,
+        cause: error,
+      },
+    });
+    return {
+      type: 'asr-whisper:warmup-complete',
+      ok: false,
+      error: error.message,
+    } satisfies OffscreenResponse;
+  }
+}
+
+/**
+ * M2-37：執行 ASR 推理——使用本地 Whisper 模型識別音頻。
+ * 接收 PCM 音頻數據，返回識別結果。
+ */
+async function runAsrInference(
+  pcm: Float32Array,
+  sampleRate: number,
+  hintLang?: string
+): Promise<OffscreenResponse> {
+  const startTime = performance.now();
+
+  // lazy 恢復：pipeline 未載入但快取存在 → 自動載入。
+  if (asrPipeline === null) {
+    try {
+      // 嘗試使用默認模型 ID 載入。
+      const defaultModelId = 'Xenova/whisper-base.en';
+      if (await hasAsrModelInCache(defaultModelId)) {
+        await warmupAsrPipeline(defaultModelId);
+      }
+    } catch (err) {
+      const error = toReadableError(err);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'asr',
+          code: 'asr-whisper-pipeline-load-failed',
+          recoverable: true,
+          cause: error,
+        },
+      });
+      return {
+        type: 'asr-whisper:transcribe-result',
+        ok: false,
+        error: error.message,
+      } satisfies OffscreenResponse;
+    }
+  }
+
+  if (asrPipeline === null) {
+    return {
+      type: 'asr-whisper:transcribe-result',
+      ok: false,
+      error: 'ASR pipeline not loaded',
+    } satisfies OffscreenResponse;
+  }
+
+  try {
+    const pipelineFn = asrPipeline as (
+      audio: Float32Array,
+      options?: { language?: string; task?: string; return_timestamps?: boolean }
+    ) => Promise<{ text?: string; chunks?: Array<{ text: string; timestamp?: [number, number] }> }>;
+
+    const result = await pipelineFn(pcm, {
+      language: hintLang,
+      task: 'transcribe',
+      return_timestamps: true,
+    });
+
+    const durationMs = performance.now() - startTime;
+    const audioDurationMs = (pcm.length / sampleRate) * 1000;
+    const rtf = durationMs / audioDurationMs;
+
+    return {
+      type: 'asr-whisper:transcribe-result',
+      ok: true,
+      text: result.text ?? '',
+      chunks: result.chunks,
+      rtf,
+    } satisfies OffscreenResponse;
+  } catch (err) {
+    const error = toReadableError(err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'asr',
+        code: 'asr-whisper-inference-failed',
+        recoverable: true,
+        cause: error,
+      },
+    });
+    return {
+      type: 'asr-whisper:transcribe-result',
+      ok: false,
+      error: error.message,
+    } satisfies OffscreenResponse;
+  }
+}
+
+/**
  * 執行翻譯推理——使用本地 ONNX 模型翻譯文本。
  * 構造 Qwen2.5 Prompt 並解析生成結果。
  */
@@ -1576,6 +1752,8 @@ export function resetLocalOnnxModuleForTest(): void {
   webgpuFailed = false;
   // M1-59：重置 ASR 下載進行中旗標（避免測試間互相污染）。
   asrDownloadInProgress = false;
+  // M2-37：重置 ASR pipeline（避免測試間互相污染）。
+  asrPipeline = null;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -1594,6 +1772,9 @@ export const _testExports = {
   checkAsrModelStatus,
   downloadAsrModel,
   hasAsrModelInCache,
+  // M2-37：ASR 推理（供測試驗證 warmup/transcribe 消息處理）。
+  warmupAsrPipeline,
+  runAsrInference,
   // M2-26：WebGPU 設備決策（供測試驗證 webgpu/wasm 選擇與回退）。
   preferWebGpu,
   // M2-26：webgpuFailed 記憶旗標（getter；供測試斷言回退後不再嘗試 webgpu）。
