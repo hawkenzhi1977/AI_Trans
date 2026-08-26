@@ -227,10 +227,18 @@
       });
       if (!res.ok) {
         let serverMsg = "";
+        let hasErrorBody = false;
         try {
           const body = await res.json();
           serverMsg = body.error?.message ?? "";
+          hasErrorBody = true;
         } catch {
+        }
+        if (res.status === 403 && !hasErrorBody) {
+          return {
+            ok: false,
+            error: "HTTP 403 \u2014 \u670D\u52D9\u7AEF\u62D2\u7D55\u8ACB\u6C42\u4E14\u672A\u8FD4\u56DE\u932F\u8AA4\u8A73\u60C5\uFF08\u5E38\u898B\u65BC\u672C\u5730 LLM \u670D\u52D9\u7684 Origin \u6AA2\u67E5\uFF0C\u8ACB\u53C3\u8003\u6587\u6A94\u914D\u7F6E\u5141\u8A31\u7684\u4F86\u6E90\uFF09"
+          };
         }
         return {
           ok: false,

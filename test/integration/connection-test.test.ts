@@ -84,4 +84,16 @@ describe('testConnection 連接測試', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain('choices');
   });
+
+  it('403 空 body（本地 LLM Origin 檢查）→ ok=false 且提示配置允許來源', async () => {
+    const fetchMock = async (): Promise<Response> =>
+      new Response('', { status: 403 }); // Ollama Origin 檢查返回空 body
+    const r = await testConnection(localConfig('http://127.0.0.1:11434/v1', 'm'), '', fetchMock);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain('403');
+      expect(r.error).toContain('Origin');
+      expect(r.error).toContain('允許的來源');
+    }
+  });
 });

@@ -622,6 +622,16 @@
 - **開發者響應**: 檢查 HTTP 狀態碼和服務器消息
 - **代碼落點**: src/runtime/popup/connection-test.ts:61-73
 
+### 5.4.1 連接測試:HTTP 403 空響應體（Origin 檢查）
+
+- **診斷碼**: HTTP 403 — 服務端拒絕請求且未返回錯誤詳情（常見於本地 LLM 服務的 Origin 檢查，請參考文檔配置允許的來源）
+- **用戶可見消息**: 連接測試: HTTP 403 — 服務端拒絕請求且未返回錯誤詳情（常見於本地 LLM 服務的 Origin 檢查，請參考文檔配置允許的來源）
+- **觸發條件**: 測試請求返回 403 且響應體為空或非 JSON
+- **根因**: 本地 LLM 服務（如 Ollama）的 Origin 白名單不包含 Chrome 擴展的 `chrome-extension://` 來源
+- **用戶響應**: 配置本地 LLM 服務的 Origin 白名單（如 Ollama 設置 `OLLAMA_ORIGINS=chrome-extension://*` 或 `OLLAMA_ORIGINS=.`）
+- **開發者響應**: 確認 Chrome 擴展 SW fetch 會自動攜帶 `chrome-extension://` Origin；無法通過代碼剝離
+- **代碼落點**: src/runtime/popup/connection-test.ts:89-97
+
 ### 5.5 連接測試:響應結構異常
 
 - **診斷碼**: 響應結構異常:無 choices 數組

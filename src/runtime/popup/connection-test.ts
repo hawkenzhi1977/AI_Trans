@@ -89,12 +89,23 @@ export async function testConnection(
     if (!res.ok) {
       // 伺服器有回應但拒絕——最常見是模型名 404。嘗試解析錯誤體取具體原因。
       let serverMsg = '';
+      let hasErrorBody = false;
       try {
         const body = (await res.json()) as { error?: { message?: string } };
         serverMsg = body.error?.message ?? '';
+        hasErrorBody = true;
       } catch {
         // 非 JSON 錯誤體，忽略。
       }
+      
+      // 403 空 body 特殊處理：常見於本地 LLM 服務的 Origin 檢查
+      if (res.status === 403 && !hasErrorBody) {
+        return {
+          ok: false,
+          error: 'HTTP 403 — 服務端拒絕請求且未返回錯誤詳情（常見於本地 LLM 服務的 Origin 檢查，請參考文檔配置允許的來源）',
+        };
+      }
+      
       return {
         ok: false,
         error: `HTTP ${res.status}${serverMsg ? ` — ${serverMsg}` : ''}`,
