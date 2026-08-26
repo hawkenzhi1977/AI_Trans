@@ -25,7 +25,8 @@
       color: "#ffffff",
       "background-color": "rgba(32, 32, 32, 0.7)"
     },
-    debugLog: DEBUG_LOG_OFF
+    debugLog: DEBUG_LOG_OFF,
+    falseSeekThresholdMs: 1e4
   };
 
   // src/infrastructure/chrome-config-store.ts
