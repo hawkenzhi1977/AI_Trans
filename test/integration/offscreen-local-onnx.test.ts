@@ -76,6 +76,8 @@ describe('offscreen local-onnx 模型載入彈性化', () => {
     vi.clearAllMocks();
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
+    // 這些測試使用 Qwen2.5 模型（large 檔位）
+    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {
@@ -231,6 +233,8 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     vi.clearAllMocks();
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
+    // 這些測試使用 Qwen2.5 模型（large 檔位）
+    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {
@@ -598,6 +602,8 @@ describe('offscreen local-onnx WebGPU 載入後端（M2-26）', () => {
     vi.clearAllMocks();
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
+    // 這些測試使用 Qwen2.5 模型（large 檔位）
+    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {

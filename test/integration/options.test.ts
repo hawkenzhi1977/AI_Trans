@@ -10,6 +10,18 @@ const HTML = `
   <input id="translation-model" />
   <input id="translation-endpoint" />
   <select id="translation-fallback"><option value="mt">MT</option><option value="local-onnx">本地 ONNX</option><option value="none">無</option></select>
+  <select id="local-model-tier"><option value="small">小型翻譯模型</option><option value="large">大型 LLM 模型</option></select>
+  <input id="local-model-name" disabled />
+  <span id="local-model-size-info">約 150 MB</span>
+  <span id="local-model-status-badge">檢測中...</span>
+  <div id="local-model-progress-container" style="display:none;">
+    <progress id="local-model-progress-bar" value="0" max="100"></progress>
+    <span id="local-model-progress-text">0%</span>
+    <p id="local-model-progress-detail"></p>
+  </div>
+  <button id="btn-download-model">下載模型</button>
+  <button id="btn-warmup-model">預加載模型</button>
+  <button id="btn-clear-model">清除快取</button>
   <select id="asr-type"><option value="cloud">雲端</option><option value="local-whisper">本地 Whisper</option></select>
   <select id="asr-tier"><option value="tiny">tiny</option><option value="base">base</option><option value="small">small</option></select>
   <input id="asr-endpoint" />
@@ -47,16 +59,6 @@ const HTML = `
   <input type="checkbox" id="dbg-popup" />
   <input id="translation-api-key" />
   <input id="asr-api-key" />
-  <input id="local-model-name" disabled />
-  <span id="local-model-status-badge">檢測中...</span>
-  <div id="local-model-progress-container" style="display:none;">
-    <progress id="local-model-progress-bar" value="0" max="100"></progress>
-    <span id="local-model-progress-text">0%</span>
-    <p id="local-model-progress-detail"></p>
-  </div>
-  <button id="btn-download-model">下載模型</button>
-  <button id="btn-warmup-model">預加載模型</button>
-  <button id="btn-clear-model">清除快取</button>
   <span id="status"></span>
   <button id="btn-save">保存</button>
   <button id="btn-reset">重置</button>

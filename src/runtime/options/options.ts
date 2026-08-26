@@ -2,8 +2,8 @@
 // 擴充頁面環境：直接使用 chrome.storage，不經消息總線。
 // 同時負責本地 ONNX 翻譯模型的狀態顯示、下載和快取管理。
 import { ChromeStorageConfigStore } from '../../infrastructure/chrome-config-store';
-import type { EngineConfig, DebugLogCategory } from '../../domain/models/config';
-import { DEFAULT_CONFIG, PROFILE_DEFAULTS, DEBUG_LOG_OFF, DEFAULT_LOCAL_TRANSLATION_MODEL } from '../../domain/models/config';
+import type { EngineConfig, DebugLogCategory, LocalModelTier } from '../../domain/models/config';
+import { DEFAULT_CONFIG, PROFILE_DEFAULTS, DEBUG_LOG_OFF, LOCAL_TRANSLATION_MODELS } from '../../domain/models/config';
 
 const store = new ChromeStorageConfigStore();
 
@@ -99,7 +99,8 @@ function readForm(): EngineConfig {
       model: $<HTMLInputElement>('translation-model').value || undefined,
       endpoint: $<HTMLInputElement>('translation-endpoint').value || undefined,
       fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'none') || undefined,
-      localModelName: DEFAULT_LOCAL_TRANSLATION_MODEL,
+      localModelTier: ($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'small',
+      localModelName: LOCAL_TRANSLATION_MODELS[($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'small'],
     },
     asr: {
       type: asrType,
@@ -135,6 +136,10 @@ function fillForm(config: EngineConfig): void {
   $<HTMLInputElement>('translation-model').value = config.translation.model ?? '';
   $<HTMLInputElement>('translation-endpoint').value = config.translation.endpoint ?? '';
   $<HTMLSelectElement>('translation-fallback').value = config.translation.fallbackType ?? 'mt';
+  // 本地模型檔位
+  const localTier = config.translation.localModelTier ?? 'small';
+  $<HTMLSelectElement>('local-model-tier').value = localTier;
+  $<HTMLInputElement>('local-model-name').value = LOCAL_TRANSLATION_MODELS[localTier];
   $<HTMLSelectElement>('asr-type').value = config.asr.type;
   $<HTMLSelectElement>('asr-tier').value = config.asr.modelTier ?? 'base';
   $<HTMLInputElement>('asr-endpoint').value = config.asr.endpoint ?? '';
@@ -179,6 +184,18 @@ async function save(): Promise<void> {
     await store.set(config);
     await store.setApiKey('llm', $<HTMLInputElement>('translation-api-key').value.trim());
     await store.setApiKey('asr', $<HTMLInputElement>('asr-api-key').value.trim());
+    
+    // 通知 Offscreen Document 切換模型檔位（如果已載入）
+    const localTier = config.translation.localModelTier ?? 'small';
+    try {
+      await chrome.runtime.sendMessage({
+        topic: 'local-onnx:set-model-tier',
+        tier: localTier,
+      });
+    } catch {
+      // Offscreen 可能未啟動，忽略錯誤
+    }
+    
     showStatus('配置已保存');
   } catch (err) {
     console.warn('[AI_Trans] config save failed:', err);
@@ -304,6 +321,27 @@ function initLocalOnnxModelUI(): void {
   const btnDownload = $<HTMLButtonElement>('btn-download-model');
   const btnWarmup = $<HTMLButtonElement>('btn-warmup-model');
   const btnClear = $<HTMLButtonElement>('btn-clear-model');
+  const tierSelect = $<HTMLSelectElement>('local-model-tier');
+  const modelNameInput = $<HTMLInputElement>('local-model-name');
+  const sizeInfo = $<HTMLSpanElement>('local-model-size-info');
+
+  /** 模型大小映射（根據檔位）。 */
+  const MODEL_SIZES: Record<LocalModelTier, string> = {
+    small: '約 150 MB',
+    large: '約 750 MB',
+  };
+
+  /** 更新模型名稱和大小顯示。 */
+  function updateModelInfo(): void {
+    const tier = tierSelect.value as LocalModelTier;
+    modelNameInput.value = LOCAL_TRANSLATION_MODELS[tier];
+    sizeInfo.textContent = MODEL_SIZES[tier];
+  }
+
+  // 監聽檔位變化，更新模型信息
+  tierSelect.addEventListener('change', updateModelInfo);
+  // 初始化時設置正確的模型信息
+  updateModelInfo();
 
   /** 更新狀態標籤樣式與文字。 */
   function updateStatusBadge(status: LocalModelStatus, message?: string): void {

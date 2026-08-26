@@ -61,9 +61,16 @@
   <h2>本地兜底模型（Local ONNX Fallback）</h2>
   <fieldset id="local-onnx-section">
     <p class="hint">當雲端 API 失敗或無網路時自動切換至此本地模型進行翻譯。模型下載後會快取在瀏覽器中，無需重複下載。</p>
-    <label for="local-model-name">模型名稱（唯讀）</label>
-    <input id="local-model-name" type="text" value="onnx-community/Qwen2.5-0.5B-Instruct" disabled />
-    <p class="hint">目前為固定兜底模型，暫不支援修改。</p>
+    
+    <label for="local-model-tier">模型檔位</label>
+    <select id="local-model-tier">
+      <option value="small">小型翻譯模型（~150MB，速度快，僅支援英→中）</option>
+      <option value="large">大型 LLM 模型（~750MB，高質量，支援多語言）</option>
+    </select>
+    <p class="hint" id="local-model-tier-hint">推薦低配置機器使用小型模型，高配置機器可選擇大型模型獲得更好翻譯質量。</p>
+    
+    <label for="local-model-name">當前模型名稱</label>
+    <input id="local-model-name" type="text" disabled />
 
     <div style="margin-top: 12px;">
       <label>模型狀態</label>
