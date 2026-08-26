@@ -24,11 +24,14 @@ for (const html of [
 // 注意：onnxruntime-web v1.22 初始化 wasm backend 時 dynamic import 的是 **jsep** 變體
 // （ort-wasm-simd-threaded.jsep.mjs/.wasm）——缺 jsep 文件即報 "no available backend found /
 // Failed to fetch dynamically imported module"，因此 jsep 與非 jsep 一併打包。
+// v1.23 新增 asyncify 變體（用於某些特殊算子），一併打包以備後端選擇。
 const ORT_WASM_FILES = [
   'ort-wasm-simd-threaded.wasm',
   'ort-wasm-simd-threaded.mjs',
   'ort-wasm-simd-threaded.jsep.wasm',
   'ort-wasm-simd-threaded.jsep.mjs',
+  'ort-wasm-simd-threaded.asyncify.wasm',
+  'ort-wasm-simd-threaded.asyncify.mjs',
 ];
 for (const file of ORT_WASM_FILES) {
   const src = `node_modules/onnxruntime-web/dist/${file}`;

@@ -245,6 +245,78 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // 代理 fetch：Offscreen/Content-script 受 CORS 限制無法直接 fetch HuggingFace，
+  // 由 SW 代理（SW 有 host_permissions 即可跨域 fetch）。結果存入共享 Cache API，
+  // 調用方從 Cache 讀取。
+  if (msg.topic === 'sw:proxy-fetch') {
+    const payload = msg.payload as { url: string };
+    const url = payload?.url;
+    if (!url) {
+      sendResponse({ ok: false, error: 'sw:proxy-fetch: missing url' });
+      return false;
+    }
+    void (async () => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          sendResponse({
+            ok: false,
+            error: `sw:proxy-fetch: HTTP ${response.status} ${response.statusText}`,
+          });
+          return;
+        }
+        // 存入共享 Cache API（transformers-cache），供 Offscreen 的 customCache 讀取。
+        const cache = await caches.open('transformers-cache');
+        await cache.put(new Request(url), response.clone());
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          error: `sw:proxy-fetch: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    })();
+    return true;
+  }
+
+  // 代理 LLM fetch：Popup/Content-script 受 CORS 限制無法直接 fetch Ollama 等本地 LLM，
+  // 由 SW 代理 POST 請求（SW 有 host_permissions 即可跨域 fetch）。
+  // 與 sw:proxy-fetch 不同，LLM 請求需要傳遞 headers/body 並返回響應內容（不存 Cache）。
+  if (msg.topic === 'sw:proxy-fetch-llm') {
+    const payload = msg.payload as {
+      url: string;
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+    };
+    const url = payload?.url;
+    if (!url) {
+      sendResponse({ ok: false, error: 'sw:proxy-fetch-llm: missing url' });
+      return false;
+    }
+    void (async () => {
+      try {
+        const response = await fetch(url, {
+          method: payload.method ?? 'POST',
+          headers: payload.headers,
+          body: payload.body,
+        });
+        const text = await response.text();
+        sendResponse({
+          ok: response.ok,
+          status: response.status,
+          body: text,
+        });
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          error: `sw:proxy-fetch-llm: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    })();
+    return true;
+  }
+
   return false;
 });
 

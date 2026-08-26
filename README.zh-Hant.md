@@ -134,6 +134,8 @@ API Key 寫入獨立安全存儲槽，絕不嵌入明文配置對象。
 > - **通義千問小參數模型**——`Qwen2.5-3B-Instruct` / `Qwen2.5-7B-Instruct`：通用但體積小，翻譯品質與速度均衡；追求低延遲用 3B，重視品質用 7B。
 > 模型 ID 需與伺服器實際名稱完全一致。**避免填 ASR/語音轉文字模型**（如 VibeVoice-ASR）——它們走 `/v1/audio/transcriptions` 而非 `/v1/chat/completions`，連接測試會回 HTTP 400。
 
+> **Ollama 用戶注意**：Chrome 擴充發送的請求帶有 `Origin: chrome-extension://<id>`，Ollama 0.32+ 默認拒絕此來源（返回 HTTP 403 空響應體）。解決方法：啟動 Ollama 前設置環境變量 `OLLAMA_ORIGINS=chrome-extension://*` 或 `OLLAMA_ORIGINS=.`（允許所有來源）。
+
 > **該選哪個引擎？** — **雲端 LLM**（品質最佳，需要 API Key + 網路）→ **本地 LLM 伺服器**（mlx / omlx / LM Studio / Ollama——自備硬體、品質好、隱私且無費用）→ **本地 ONNX**（完全離線、免費、隱私，但只是 0.5B 小模型——品質與速度都比大型 LLM 差）→ **MT**（即時可用、零設定，但品質最低；適合當最後兜底）。實時字幕建議選快速、翻譯導向（MT）或小型 instruct 模型，避免大型通用模型；本地伺服器勿用 ASR 模型（它們走 `/v1/audio/transcriptions`，不是 `/chat/completions`）。
 
 > **本地 ONNX — 時延與記憶體限制**：本地模型（`onnx-community/Qwen2.5-0.5B-Instruct`，INT4 ONNX，**約 750MB**）完全在瀏覽器內執行。首次使用需下載約 750MB；下載後**首次翻譯可能耗時 30–60 秒**（載入模型到記憶體）——在設定頁點**「預加載模型」**（或仰賴背景自動預熱），首響應延遲即可接近即時。翻譯以**每 5 段一個 chunk** 處理，影片很長時完整翻譯需較久；單次翻譯會話硬性上限**10 分鐘**，以維持擴充穩定。記憶體佔用：WASM 模式（預設）約 **~500MB JS 堆**；有 WebGPU 時約 **~50–100MB JS 堆 + GPU VRAM**（權重移入 VRAM）。低記憶體機器建議改用雲端或本地 LLM 引擎。

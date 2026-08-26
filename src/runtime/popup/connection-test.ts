@@ -12,6 +12,34 @@ export type ConnectionStatus =
   | { ok: false; error: string };
 
 /**
+ * 創建通過 Service Worker 代理的 fetch 函數。
+ * Popup/Content-script 受 CORS 限制無法直接 fetch Ollama 等本地 LLM，
+ * 由 SW 代理 POST 請求（SW 有 host_permissions 即可跨域 fetch）。
+ */
+export function createSwProxyFetch(): typeof fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const response = await chrome.runtime.sendMessage({
+      topic: 'sw:proxy-fetch-llm',
+      payload: {
+        url,
+        method: init?.method ?? 'POST',
+        headers: init?.headers as Record<string, string> | undefined,
+        body: init?.body as string | undefined,
+      },
+    });
+    const res = response as { ok: boolean; status?: number; body?: string; error?: string };
+    if (res.error && !res.status) {
+      throw new Error(res.error);
+    }
+    return new Response(res.body ?? '', {
+      status: res.status ?? 200,
+      statusText: res.ok ? 'OK' : 'Error',
+    });
+  };
+}
+
+/**
  * 用當前配置測試 LLM 端點連通性。
  * @param config 當前引擎配置
  * @param apiKey 從 ApiKeyStore 解析的密鑰（可能為空）
@@ -20,7 +48,7 @@ export type ConnectionStatus =
 export async function testConnection(
   config: EngineConfig,
   apiKey: string,
-  fetchFn: typeof fetch = globalThis.fetch.bind(globalThis),
+  fetchFn: typeof fetch = createSwProxyFetch(),
   timeoutMs = 10_000
 ): Promise<ConnectionStatus> {
   const tc = config.translation;
@@ -61,12 +89,23 @@ export async function testConnection(
     if (!res.ok) {
       // 伺服器有回應但拒絕——最常見是模型名 404。嘗試解析錯誤體取具體原因。
       let serverMsg = '';
+      let hasErrorBody = false;
       try {
         const body = (await res.json()) as { error?: { message?: string } };
         serverMsg = body.error?.message ?? '';
+        hasErrorBody = true;
       } catch {
         // 非 JSON 錯誤體，忽略。
       }
+      
+      // 403 空 body 特殊處理：常見於本地 LLM 服務的 Origin 檢查
+      if (res.status === 403 && !hasErrorBody) {
+        return {
+          ok: false,
+          error: 'HTTP 403 — 服務端拒絕請求且未返回錯誤詳情（常見於本地 LLM 服務的 Origin 檢查，請參考文檔配置允許的來源）',
+        };
+      }
+      
       return {
         ok: false,
         error: `HTTP ${res.status}${serverMsg ? ` — ${serverMsg}` : ''}`,

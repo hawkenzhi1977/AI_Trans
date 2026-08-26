@@ -142,10 +142,10 @@ export function llmCacheSize(): number {
 
 export class LLMTranslationProvider implements TranslationProvider {
   readonly location = 'cloud' as const;
-  /** Headers 階段超時（等待響應頭到達）。 */
+  /** 整體請求超時（SW 代理模式：等待完整響應）。 */
   private readonly timeoutMs: number;
-  /** Body 讀取階段超時（headers 到達後等待 body 生成完成）。 */
-  private readonly bodyTimeoutMs: number;
+  /** 可注入的 fetch 函數（測試用）。默認使用 SW 代理。 */
+  private readonly fetchFn?: typeof fetch;
 
   constructor(
     private readonly opts: {
@@ -153,14 +153,17 @@ export class LLMTranslationProvider implements TranslationProvider {
       endpoint: string;
       model: string;
       apiKey: string;
-      /** Headers 超時（毫秒）。等待響應頭到達；抓 connection lost / 服務無響應。 */
+      /** 超時（毫秒）。等待完整響應；本地 LLM 長輸出需足夠窗口。 */
       timeoutMs?: number;
-      /** Body 超時（毫秒）。headers 到達後等待 body 生成；本地 LLM 長輸出需足夠窗口。 */
+      /** @deprecated 保留用於向後兼容，實際使用 timeoutMs。 */
       bodyTimeoutMs?: number;
+      /** 可注入的 fetch 函數（測試用）。不提供時使用 SW 代理。 */
+      fetchFn?: typeof fetch;
     }
   ) {
-    this.timeoutMs = opts.timeoutMs ?? 30_000;
-    this.bodyTimeoutMs = opts.bodyTimeoutMs ?? BODY_TIMEOUT_MS;
+    // 使用 bodyTimeoutMs（如果提供）作為整體超時，兼容舊配置。
+    this.timeoutMs = opts.bodyTimeoutMs ?? opts.timeoutMs ?? 30_000;
+    this.fetchFn = opts.fetchFn;
   }
 
   get engineId(): string {
@@ -547,57 +550,75 @@ export class LLMTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 直接 fetch 翻譯端點。
-   * content script 在 ISOLATED world 有 host_permissions（manifest.json），
-   * 可以直接 fetch localhost，不受 CORS 限制。
-   * M1-52：AbortController 覆蓋 fetch+body 讀取全程——原實現收到響應頭後即
-   * clearTimeout，body 流掛死時超時永遠不觸發（M1-47 用戶反饋的 connection lost 場景）。
-   * M1-53：改為兩階段超時——headers 階段（timeoutMs，默認 30s）抓 connection lost；
-   * fetch resolve 後進入 body 階段（bodyTimeoutMs，默認 300s），本地 LLM 長輸出
-   * （單塊 60 段）不再被 30s 誤殺。兩階段共用同一 AbortController，均為瞬態錯誤。
+   * Fetch 翻譯端點。
+   * - 測試模式（提供 fetchFn）：直接調用注入的 fetch 函數。
+   * - 生產模式：通過 Service Worker 代理（繞過 CORS 限制）。
+   *   Content-script 受 CORS 限制無法直接 fetch Ollama 等本地 LLM，
+   *   由 SW 代理 POST 請求（SW 有 host_permissions 即可跨域 fetch）。
    */
   private async fetchDirectly(request: {
     endpoint: string;
     headers: Record<string, string>;
     body: string;
   }): Promise<{ ok: boolean; status: number; body: string }> {
-    diagLog('llm', 'fetching directly to', request.endpoint);
     const startTime = Date.now();
     const controller = new AbortController();
-    // Phase 1：headers 超時——等響應頭到達（connection lost 場景在此被抓）。
-    const headerTimer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const res = await globalThis.fetch(request.endpoint, {
-        method: 'POST',
-        headers: request.headers,
-        body: request.body,
-        signal: controller.signal,
-      });
+      // 測試模式：使用注入的 fetch 函數。
+      if (this.fetchFn) {
+        diagLog('llm', 'fetching directly to', request.endpoint);
+        const res = await this.fetchFn(request.endpoint, {
+          method: 'POST',
+          headers: request.headers,
+          body: request.body,
+          signal: controller.signal,
+        });
+        const elapsed = Date.now() - startTime;
+        diagLog('llm', 'fetch completed in', elapsed, 'ms, status =', res.status);
+        const text = await res.text();
+        return { ok: res.ok, status: res.status, body: text };
+      }
+
+      // 生產模式：通過 Service Worker 代理（繞過 CORS 限制）。
+      diagLog('llm', 'fetching via SW proxy to', request.endpoint);
+      const response = await Promise.race([
+        chrome.runtime.sendMessage({
+          topic: 'sw:proxy-fetch-llm',
+          payload: {
+            url: request.endpoint,
+            method: 'POST',
+            headers: request.headers,
+            body: request.body,
+          },
+        }) as Promise<{ ok: boolean; status?: number; body?: string; error?: string }>,
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        }),
+      ]);
       const elapsed = Date.now() - startTime;
-      diagLog('llm', 'fetch completed in', elapsed, 'ms, status =', res.status);
 
-      // headers 已到達 → 進入 Phase 2：body 超時（給本地 LLM 長輸出足夠窗口）。
-      clearTimeout(headerTimer);
-      const bodyTimer = setTimeout(() => controller.abort(), this.bodyTimeoutMs);
-
-      let text: string;
-      try {
-        text = await res.text();
-      } catch (err) {
-        // body 讀取失敗（連接中斷/body 超時中止）歸為瞬態錯誤供重試。
+      if (response.error && !response.status) {
+        diagLog('llm', 'SW proxy fetch failed in', elapsed, 'ms, error:', response.error);
         throw new LLMRequestError(
-          `response body read failed: ${err instanceof Error ? err.message : String(err)}`,
-          res.status,
+          `LLM network error: ${response.error}`,
+          null,
           true
         );
-      } finally {
-        clearTimeout(bodyTimer);
       }
-      return { ok: res.ok, status: res.status, body: text };
+
+      diagLog('llm', 'SW proxy fetch completed in', elapsed, 'ms, status =', response.status);
+      return {
+        ok: response.ok,
+        status: response.status ?? 200,
+        body: response.body ?? '',
+      };
     } catch (err) {
       if (err instanceof LLMRequestError) throw err;
-      // AbortError：headers 或 body 階段超時中斷——瞬態（重試可能恢復）。
+      // AbortError：超時中斷——瞬態（重試可能恢復）。
       const isAbort =
         err instanceof DOMException
           ? err.name === 'AbortError'
@@ -611,9 +632,7 @@ export class LLMTranslationProvider implements TranslationProvider {
         true
       );
     } finally {
-      // M1-52/53：headers 定時器在整個流程完成（或拋錯）後統一清理，
-      // 兩個階段共用 controller，無重複 abort（abort 後再 abort 是 no-op）。
-      clearTimeout(headerTimer);
+      clearTimeout(timer);
     }
   }
 }

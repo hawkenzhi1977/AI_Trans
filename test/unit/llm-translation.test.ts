@@ -58,13 +58,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
   it('[R1] 默認 fetch 綁定 globalThis：以 window/global 為接收者調用不拋 Illegal invocation', async () => {
     // Mock globalThis.fetch
     const fetchMock = vi.fn(async () => okResponse(llmBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk-test',
+      fetchFn: fetchMock,
     });
 
     const result = await provider.translate(req());
@@ -76,13 +76,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
 
   it('端點與 Authorization 正確', async () => {
     const fetchMock = vi.fn(async () => okResponse(llmBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk-secret',
+      fetchFn: fetchMock,
     });
 
     await provider.translate(req());
@@ -96,13 +96,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
 
   it('請求 body 包含 max_tokens=4096（避免 LLM 輸出截斷）', async () => {
     const fetchMock = vi.fn(async () => okResponse(llmBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     await provider.translate(req());
@@ -116,13 +116,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
     // 不再直接拋錯（塊級兜底不中斷其餘塊）。用 fake timers 跳過退避延遲。
     vi.useFakeTimers();
     const fetchMock = vi.fn(async () => ({ ok: false, status: 500, text: async () => 'error' }) as Response);
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -137,13 +137,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
 
   it('[M1-52] HTTP 4xx（非 429）屬永久失敗：立即拋錯不重試（走管線降級）', async () => {
     const fetchMock = vi.fn(async () => ({ ok: false, status: 400, text: async () => 'bad request' }) as Response);
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     await expect(provider.translate(req())).rejects.toThrow('HTTP 400');
     // 永久失敗不重試：僅 1 次請求。
@@ -158,13 +158,13 @@ describe('LLMTranslationProvider — fetch 綁定與調用', () => {
       if (call === 1) return { ok: false, status: 429, text: async () => 'rate limited' } as Response;
       return okResponse(llmBody);
     });
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -186,13 +186,13 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
     const fetchMock = vi.fn(async () => okResponse({
       choices: [{ message: { content: reasoningContent } }],
     }));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     const result = await provider.translate(req());
@@ -211,7 +211,6 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
           });
         })
     );
-    vi.stubGlobal('fetch', fetchMock);
     vi.useFakeTimers();
 
     const provider = new LLMTranslationProvider({
@@ -220,6 +219,7 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
       model: 'gpt-x',
       apiKey: 'sk',
       timeoutMs: 5,
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -246,7 +246,6 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
             }),
         } as unknown as Response)
     );
-    vi.stubGlobal('fetch', fetchMock);
     vi.useFakeTimers();
 
     const provider = new LLMTranslationProvider({
@@ -256,6 +255,7 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
       apiKey: 'sk',
       timeoutMs: 30_000, // headers 階段足夠寬（不觸發）
       bodyTimeoutMs: 5, // body 階段短超時，斷言 body 掛死也會被中斷
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -280,7 +280,6 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
             }),
         } as unknown as Response)
     );
-    vi.stubGlobal('fetch', fetchMock);
     vi.useFakeTimers();
 
     const provider = new LLMTranslationProvider({
@@ -290,6 +289,7 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
       apiKey: 'sk',
       timeoutMs: 5, // headers 階段極短：只要 headers 已到就 clearTimeout，不會誤殺 body
       // bodyTimeoutMs 用默認 300s
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -307,7 +307,6 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
 
   it('正常請求完成時不會殘留未清理的定時器', async () => {
     const fetchMock = vi.fn(async () => okResponse(llmBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
@@ -315,6 +314,7 @@ describe('LLMTranslationProvider — reasoning 剝離與超時降級', () => {
       model: 'gpt-x',
       apiKey: 'sk',
       timeoutMs: 30_000,
+      fetchFn: fetchMock,
     });
     await provider.translate(req());
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -343,13 +343,13 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
       status: 200,
       text: async () => '<html>Error</html>',
     }) as Response);
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -373,13 +373,13 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
         throw new TypeError('Failed to fetch');
       },
     }) as Response);
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     const promise = provider.translate(req());
     await vi.runAllTimersAsync();
@@ -391,13 +391,13 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
 
   it('HTTP 200 但 choices 缺失（限流返回 {error}）→ 拋錯走降級而非靜默回退原文', async () => {
     const fetchMock = vi.fn(async () => okResponse({ error: { message: 'rate limited' } }));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     // 必須 reject（觸發 pipeline fallback/降級事件），不許帶 degraded=false 回退原文。
     await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
@@ -405,13 +405,13 @@ describe('LLMTranslationProvider — §5.6 響應結構診斷（不靜默回退�
 
   it('HTTP 200 但 choices[0].message.content 非字符串 → 拋錯不靜默', async () => {
     const fetchMock = vi.fn(async () => okResponse({ choices: [{ message: { content: 42 } }] }));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
     await expect(provider.translate(req())).rejects.toThrow(/no valid choices/);
   });
@@ -429,13 +429,13 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     };
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fetchMock = vi.fn(async () => okResponse(incompleteBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     const result = await provider.translate({
@@ -470,13 +470,13 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
       callCount++;
       return callCount === 1 ? okResponse(incompleteBody) : okResponse(completeBody);
     });
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     const result = await provider.translate({
@@ -498,13 +498,13 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     };
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fetchMock = vi.fn(async () => okResponse(completeBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     await provider.translate(req());
@@ -521,13 +521,13 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
     };
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fetchMock = vi.fn(async () => okResponse(duplicateBody));
-    vi.stubGlobal('fetch', fetchMock);
 
     const provider = new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model: 'gpt-x',
       apiKey: 'sk',
+      fetchFn: fetchMock,
     });
 
     await provider.translate({
@@ -549,12 +549,13 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
     vi.unstubAllGlobals();
   });
 
-  function makeProvider(model = 'gpt-x'): LLMTranslationProvider {
+  function makeProvider(model = 'gpt-x', fetchFn?: typeof fetch): LLMTranslationProvider {
     return new LLMTranslationProvider({
       engineId: 'llm',
       endpoint: 'https://api.example.com/v1/chat/completions',
       model,
       apiKey: 'sk',
+      fetchFn,
     });
   }
 
@@ -591,9 +592,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   describe('LRU 快取', () => {
     it('相同請求第二次命中快取：不再請求 LLM', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const r1 = await provider.translate(req());
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const r2 = await provider.translate(req());
@@ -604,9 +604,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('換模型/換目標語言 → 快取 miss（key 含 model|targetLang|hash）', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider('gpt-x');
+      const provider = makeProvider('gpt-x', fetchMock);
       await provider.translate(req());
       // 同 provider 但改目標語言，使用英文翻譯避免觸發語言錯誤偵測。
       const enBody = {
@@ -619,9 +618,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('超過 100 條時逐出最舊條目（LRU）', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       // 塞入 110 個不同塊 → 緩存 110 條；超過上限後最早被逐出。
       for (let i = 0; i < 110; i++) {
         await provider.translate({
@@ -641,9 +639,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('invalidateLlmCache() 全量清空快取', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       await provider.translate(req());
       expect(llmCacheSize()).toBe(1);
       invalidateLlmCache();
@@ -654,9 +651,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('快取命中的結果標記 targetLang', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const r1 = await provider.translate(req());
       const r2 = await provider.translate(req());
       expect(r1.segments[0].targetLang).toBe('zh-Hant');
@@ -673,9 +669,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   describe('分塊請求與流式漸進', () => {
     it('130 段分 9 塊：translate 發起 9 次請求並合併', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const many = Array.from({ length: 130 }, (_, i) => seg(i));
       const result = await provider.translate({ segments: many, targetLang: 'zh-Hant' });
       expect(fetchMock).toHaveBeenCalledTimes(9);
@@ -690,9 +685,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('translateStream 每次 emit 都是累計全量（首塊後續漸進）', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const many = Array.from({ length: 130 }, (_, i) => seg(i));
       const emitted: TranslationResult[] = [];
       await provider.translateStream({ segments: many, targetLang: 'zh-Hant' }, (r) =>
@@ -708,9 +702,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
 
     it('translateStream 塊間快取共享：重播時不重新請求', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const many = Array.from({ length: 130 }, (_, i) => seg(i));
       await provider.translateStream({ segments: many, targetLang: 'zh-Hant' }, () => {});
       expect(fetchMock).toHaveBeenCalledTimes(9);
@@ -745,9 +738,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
         callCount++;
         return okResponse(callCount === 1 ? duplicateBody : uniqueBody);
       });
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const segments = Array.from({ length: 15 }, (_, i) => seg(i));
       const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
 
@@ -766,9 +758,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
         choices: [{ message: { content: '0\t重複A\n1\t重複A\n2\t重複B\n3\t重複B\n4\t唯一1\n5\t唯一2\n6\t唯一3\n7\t唯一4\n8\t唯一5\n9\t唯一6\n10\t唯一7\n11\t唯一8\n12\t唯一9\n13\t唯一10\n14\t唯一11' } }],
       };
       const fetchMock = vi.fn(async () => okResponse(body));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const segments = Array.from({ length: 15 }, (_, i) => seg(i));
       await provider.translate({ segments, targetLang: 'zh-Hant' });
 
@@ -794,9 +785,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
         callCount++;
         return okResponse(callCount === 1 ? spanishBody : chineseBody);
       });
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const segments = [seg(0), seg(1), seg(2)];
       const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
 
@@ -811,9 +801,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
         choices: [{ message: { content: '0\tHello world\n1\tGood morning' } }],
       };
       const fetchMock = vi.fn(async () => okResponse(englishBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const segments = [seg(0), seg(1)];
       await provider.translate({ segments, targetLang: 'en' });
 
@@ -826,9 +815,8 @@ describe('LLMTranslationProvider — M1-52 分塊 / 快取 / 流式', () => {
   describe('M2-32 translateStream abort 檢查', () => {
     it('signal aborted 時拋 AbortError', async () => {
       const fetchMock = vi.fn(async () => okResponse(llmBody));
-      vi.stubGlobal('fetch', fetchMock);
 
-      const provider = makeProvider();
+      const provider = makeProvider('gpt-x', fetchMock);
       const controller = new AbortController();
       controller.abort(); // 立即 abort
 

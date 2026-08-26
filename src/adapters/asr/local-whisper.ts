@@ -7,6 +7,45 @@ import type { ASRRequest, ASRResult } from '../../domain/models/asr';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
 
+/**
+ * 代理 Cache 實現：Content-script 受 CORS 限制無法直接 fetch HuggingFace，
+ * 透過 Service Worker 代理 fetch（SW 有 host_permissions 即可跨域）。
+ * 結果存入共享 Cache API（transformers-cache），transformers.js 從 Cache 讀取。
+ *
+ * 實現 transformers.js 的 customCache 接口（match + put）。
+ */
+class ContentScriptProxyCache {
+  private cacheName = 'transformers-cache';
+
+  async match(request: RequestInfo | URL): Promise<Response | undefined> {
+    const url = typeof request === 'string' ? request : request instanceof URL ? request.href : request.url;
+    const cache = await caches.open(this.cacheName);
+    // 先檢查是否已緩存（可能由其他上下文寫入）。
+    const cached = await cache.match(url);
+    if (cached) return cached;
+    // 未緩存 → 請求 SW 代理 fetch → SW 寫入 Cache → 再讀取。
+    const response = await chrome.runtime.sendMessage({
+      topic: 'sw:proxy-fetch',
+      payload: { url },
+    });
+    const res = response as { ok: boolean; error?: string };
+    if (!res.ok) {
+      throw new Error(`ContentScriptProxyCache fetch failed: ${res.error ?? 'unknown error'}`);
+    }
+    return cache.match(url);
+  }
+
+  async put(request: RequestInfo | URL, response: Response): Promise<void> {
+    // transformers.js 調用 put 時，數據已由 match 預填充，此處為 no-op。
+    // 保留接口以滿足 customCache 合約。
+    void request;
+    void response;
+  }
+}
+
+/** 全局 ProxyCache 實例（供 warmup 使用）。 */
+const contentScriptProxyCache = new ContentScriptProxyCache();
+
 /** Whisper 模型檔位映射（HuggingFace Hub 模型 ID）。 */
 const WHISPER_MODELS: Record<string, string> = {
   tiny: 'Xenova/whisper-tiny.en',
@@ -54,6 +93,12 @@ export class LocalWhisperASR implements ASRProvider {
       // 以避免 Chrome 擴展 CSP 禁止 unsafe-eval）。
       const transformers = await import('@huggingface/transformers');
       const { pipeline, env } = transformers;
+      // 模型下載鏡像：HuggingFace 在中國大陸可能被牆，改用 hf-mirror.com 加速。
+      (env as unknown as { remoteHost: string }).remoteHost = 'https://hf-mirror.com/';
+      // 代理 Cache：Content-script 受 CORS 限制無法直接 fetch HuggingFace，
+      // 透過 Service Worker 代理 fetch（SW 有 host_permissions 即可跨域）。
+      (env as unknown as { useCustomCache: boolean }).useCustomCache = true;
+      (env as unknown as { customCache: ContentScriptProxyCache }).customCache = contentScriptProxyCache;
       // M2-24 補充修復七：WASM 本地化——content-script 中 transformers.js 默認從 CDN
       // 載入 onnxruntime wasm，YouTube 頁面 CSP 會阻擋 CDN 請求（warmup 失敗）。
       // 改指向擴充內打包的 wasm（copy-static.mjs 拷貝至 src/runtime/ort/）。
