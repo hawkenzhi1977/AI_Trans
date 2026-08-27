@@ -1,13 +1,4 @@
 // src/domain/models/config.ts
-var LOCAL_TRANSLATION_MODELS = {
-  /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
-  small: "Xenova/opus-mt-en-zh",
-  /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
-  medium: "onnx-community/SmolLM2-360M-Instruct",
-  /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
-  large: "onnx-community/Qwen2.5-0.5B-Instruct"
-};
-var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
 var DEBUG_LOG_OFF = {
   overlay: false,
   llm: false,
@@ -330,8 +321,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           });
           return;
         }
+        const contentLength = Number(response.headers.get("content-length")) || 0;
+        const reader = response.body?.getReader();
+        const chunks = [];
+        let loaded = 0;
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              chunks.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+              loaded += value.length;
+              chrome.runtime.sendMessage({
+                type: "sw:download-progress",
+                url,
+                loaded,
+                total: contentLength
+              }).catch(() => {
+              });
+            }
+          }
+        }
+        const blob = new Blob(chunks);
+        const headers = new Headers(response.headers);
+        const cachedResponse = new Response(blob, {
+          status: response.status,
+          statusText: response.statusText,
+          headers
+        });
         const cache = await caches.open("transformers-cache");
-        await cache.put(new Request(url), response.clone());
+        await cache.put(new Request(url), cachedResponse);
         sendResponse({ ok: true });
       } catch (err) {
         sendResponse({

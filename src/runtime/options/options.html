@@ -62,22 +62,22 @@
   <fieldset id="local-onnx-section">
     <p class="hint">當雲端 API 失敗或無網路時自動切換至此本地模型進行翻譯。模型下載後會快取在瀏覽器中，無需重複下載。</p>
     
-    <label for="local-model-tier">模型檔位</label>
-    <select id="local-model-tier">
-      <option value="small">小型翻譯模型（~150MB，⚠ 質量不穩定，僅支援英→中）</option>
-      <option value="medium">中型 LLM 模型（~200MB，平衡質量與性能）</option>
-      <option value="large" selected>大型 LLM 模型（~750MB，高質量，支援多語言）</option>
-    </select>
-    <p class="hint" id="local-model-tier-hint">推薦使用大型模型獲得最佳翻譯質量。低配置機器可嘗試中型模型。小型模型在部分設備上可能產生亂碼。</p>
+    <label>模型名稱</label>
+    <p id="local-model-name" style="margin: 4px 0 12px 0; font-family: monospace; font-size: 13px; color: #333;">onnx-community/Qwen2.5-0.5B-Instruct</p>
     
-    <label for="local-model-name">當前模型名稱</label>
-    <input id="local-model-name" type="text" disabled />
+    <label for="local-onnx-chunk-size">Chunk Size（單次推理行數）</label>
+    <select id="local-onnx-chunk-size">
+      <option value="3">3（低記憶體，適合低配置機器）</option>
+      <option value="4">4（平衡）</option>
+      <option value="5" selected>5（高質量，默認）</option>
+    </select>
+    <p class="hint">值越小，單次推理的記憶體峰值越低，但翻譯速度可能稍慢。值越大，翻譯質量越好，但需要更多記憶體。</p>
 
     <div style="margin-top: 12px;">
       <label>模型狀態</label>
       <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
         <span id="local-model-status-badge" style="padding: 4px 10px; border-radius: 12px; font-size: 12px; background: #eee; color: #666;">檢測中...</span>
-        <span id="local-model-size-info" style="font-size: 12px; color: #888;">約 350 MB</span>
+        <span id="local-model-size-info" style="font-size: 12px; color: #888;">約 750 MB</span>
       </div>
     </div>
 

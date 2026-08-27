@@ -83,15 +83,8 @@
   };
 
   // src/domain/models/config.ts
-  var LOCAL_TRANSLATION_MODELS = {
-    /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
-    small: "Xenova/opus-mt-en-zh",
-    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
-    medium: "onnx-community/SmolLM2-360M-Instruct",
-    /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
-    large: "onnx-community/Qwen2.5-0.5B-Instruct"
-  };
-  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
+  var LOCAL_ONNX_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
+  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_ONNX_MODEL;
   var DEBUG_LOG_OFF = {
     overlay: false,
     llm: false,
@@ -2285,7 +2278,7 @@ Output example:
 
   // src/adapters/translation/local-onnx-translation.ts
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
-  var smallModelStats = {
+  var modelStats = {
     totalChunks: 0,
     mergedChunks: 0,
     // 輸出行數 < 輸入行數的 chunks
@@ -2294,24 +2287,12 @@ Output example:
     totalFallbacks: 0
     // 回退原文的行數
   };
-  var consecutiveDegenerateCount = 0;
-  var LocalONNXTranslationProvider = class _LocalONNXTranslationProvider {
+  var LocalONNXTranslationProvider = class {
     engineId = "local-onnx";
     location = "local";
-    /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
-    static CHUNK_SIZE_LARGE = 5;
-    /** Medium model (SmolLM2-360M) 的 chunk size：4 行。
-      * 比 Large 稍小，避免中等模型上下文過長導致注意力退化。
-      */
-    static CHUNK_SIZE_MEDIUM = 4;
-    /** Small model (MarianMT/opus-mt) 的 chunk size：3 行。
-      * MarianMT 傾向將多行合併為 1 行輸出，但速度從 0.10 seg/s 提升到 ~0.25 seg/s。
-      * 配合 splitBySentenceBoundary 嘗試分割，不足的行回退原文。
-      */
-    static CHUNK_SIZE_SMALL = 3;
     defaultTargetLang;
     isPrimary;
-    modelTier;
+    _chunkSize;
     /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
     port = null;
     messageIdCounter = 0;
@@ -2319,18 +2300,11 @@ Output example:
       void config.modelName;
       this.defaultTargetLang = config.targetLang ?? "zh-Hant";
       this.isPrimary = config.isPrimary ?? false;
-      this.modelTier = config.modelTier ?? "large";
+      this._chunkSize = config.chunkSize ?? 5;
     }
-    /** 根據模型檔位返回 chunk size：small 3 行，medium 4 行，large 5 行。 */
+    /** 返回配置的 chunk size。 */
     get chunkSize() {
-      switch (this.modelTier) {
-        case "small":
-          return _LocalONNXTranslationProvider.CHUNK_SIZE_SMALL;
-        case "medium":
-          return _LocalONNXTranslationProvider.CHUNK_SIZE_MEDIUM;
-        case "large":
-          return _LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
-      }
+      return this._chunkSize;
     }
     /**
      * 建立與 Service Worker 的 port 長連接。
@@ -2405,55 +2379,30 @@ Output example:
     /**
      * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
      * 將 Offscreen 返回的單一結果拆分回各 segment。
-     * Small model (MarianMT) 可能輸出少於輸入行數，需要智能分割。
-     */
+     * 模型依行號解析，少於輸入行數時缺行回退原文。
+      */
     async translateChunk(chunk, targetLang) {
       const combinedText = chunk.map((s) => s.sourceText).join("\n");
-      diagLog("local-onnx", `translateChunk: modelTier=${this.modelTier}, chunkSize=${chunk.length}, targetLang=${targetLang}`);
+      diagLog("local-onnx", `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
       const request = {
         topic: "local-onnx:translate",
         payload: {
           text: combinedText,
-          targetLang,
-          modelTier: this.modelTier
+          targetLang
         }
       };
       diagLog("local-onnx", `requestTranslate: sending request`);
       const res = await this.requestTranslate(request);
-      if (res.degenerate) {
-        consecutiveDegenerateCount++;
-        const segments2 = chunk.map((seg) => ({
-          ...seg,
-          translatedText: seg.sourceText
-        }));
-        recordDiagnostic({
-          type: "pipeline-error",
-          error: {
-            port: "translation",
-            code: "small-model-degenerate",
-            recoverable: true,
-            cause: new Error(`Small model repetition loop detected (consecutive: ${consecutiveDegenerateCount})`)
-          }
-        });
-        if (consecutiveDegenerateCount === 1) {
-          diagLog(
-            "local-onnx",
-            "small-model-degenerate: Small model \u7522\u751F\u4E0D\u53EF\u9760\u7FFB\u8B6F\uFF0C\u5DF2\u986F\u793A\u539F\u6587\u3002\u5EFA\u8B70\u5728 Options \u4E2D\u5207\u63DB\u5230 Large model \u4EE5\u7372\u5F97\u66F4\u597D\u54C1\u8CEA\u3002"
-          );
-        }
-        return { segments: segments2, echoed: false };
-      }
-      consecutiveDegenerateCount = 0;
       const rawOutput = res.translatedText ?? "";
       let translatedTexts;
       const outputLines = rawOutput.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
       diagLog("local-onnx", `translateChunk: received response, rawOutput length=${rawOutput.length}, outputLines=${outputLines.length}`);
       if (outputLines.length === chunk.length) {
         translatedTexts = outputLines;
-      } else if (outputLines.length < chunk.length && this.modelTier === "small") {
+      } else if (outputLines.length < chunk.length) {
         diagLog(
           "local-onnx",
-          `small-model-merge-detected: input=${chunk.length} lines, rawOutput=${outputLines.length} lines, inputText="${combinedText.slice(0, 100)}...", rawOutput="${rawOutput.slice(0, 200)}..."`
+          `model-merge-detected: input=${chunk.length} lines, rawOutput=${outputLines.length} lines, inputText="${combinedText.slice(0, 100)}...", rawOutput="${rawOutput.slice(0, 200)}..."`
         );
         translatedTexts = this.splitBySentenceBoundary(rawOutput, chunk.length);
         if (translatedTexts.length < chunk.length) {
@@ -2470,17 +2419,15 @@ Output example:
         // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
         translatedText: translatedTexts[j]?.trim() || seg.sourceText
       }));
-      if (this.modelTier === "small") {
-        smallModelStats.totalChunks++;
-        if (outputLines.length < chunk.length) {
-          smallModelStats.mergedChunks++;
-          smallModelStats.totalFallbacks += chunk.length - translatedTexts.length;
-        } else if (outputLines.length === chunk.length) {
-          smallModelStats.perfectChunks++;
-        }
-        if (smallModelStats.totalChunks % 10 === 0) {
-          diagLog("local-onnx", `small-model-stats: chunks=${smallModelStats.totalChunks}, merged=${smallModelStats.mergedChunks}, perfect=${smallModelStats.perfectChunks}, fallbacks=${smallModelStats.totalFallbacks}`);
-        }
+      modelStats.totalChunks++;
+      if (outputLines.length < chunk.length) {
+        modelStats.mergedChunks++;
+        modelStats.totalFallbacks += chunk.length - translatedTexts.length;
+      } else if (outputLines.length === chunk.length) {
+        modelStats.perfectChunks++;
+      }
+      if (modelStats.totalChunks % 10 === 0) {
+        diagLog("local-onnx", `model-stats: chunks=${modelStats.totalChunks}, merged=${modelStats.mergedChunks}, perfect=${modelStats.perfectChunks}, fallbacks=${modelStats.totalFallbacks}`);
       }
       return { segments, echoed: res.echoed === true };
     }
@@ -2539,7 +2486,7 @@ Output example:
             reject(new Error("Offscreen Document response timeout"));
           }, 12e4);
         });
-        if (!response.ok && !response.degenerate) {
+        if (!response.ok) {
           const error = new Error(response.error ?? "local-onnx translation failed");
           recordDiagnostic({
             type: "pipeline-error",
@@ -3372,7 +3319,7 @@ Output example:
         modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
         targetLang: config.targetLang,
         isPrimary: tc.type === "local-onnx",
-        modelTier: tc.localModelTier ?? "large"
+        chunkSize: tc.localOnnxChunkSize ?? 5
       });
       providers.set(localOnnx.engineId, localOnnx);
     }

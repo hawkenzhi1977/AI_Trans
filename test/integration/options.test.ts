@@ -10,8 +10,8 @@ const HTML = `
   <input id="translation-model" />
   <input id="translation-endpoint" />
   <select id="translation-fallback"><option value="mt">MT</option><option value="local-onnx">本地 ONNX</option><option value="none">無</option></select>
-  <select id="local-model-tier"><option value="small">小型翻譯模型</option><option value="large">大型 LLM 模型</option></select>
-  <input id="local-model-name" disabled />
+  <select id="local-onnx-chunk-size"><option value="3">3</option><option value="4">4</option><option value="5" selected>5</option></select>
+  <p id="local-model-name">onnx-community/Qwen2.5-0.5B-Instruct</p>
   <span id="local-model-size-info">約 150 MB</span>
   <span id="local-model-status-badge">檢測中...</span>
   <div id="local-model-progress-container" style="display:none;">

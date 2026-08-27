@@ -126,7 +126,7 @@ async function buildTranslationProviders(
       modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
       targetLang: config.targetLang,
       isPrimary: tc.type === 'local-onnx',
-      modelTier: tc.localModelTier ?? 'large',
+      chunkSize: tc.localOnnxChunkSize ?? 5,
     });
     providers.set(localOnnx.engineId, localOnnx);
   }

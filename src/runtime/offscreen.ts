@@ -4,10 +4,10 @@
 // 同時負責本地 ONNX 翻譯模型的推理（Transformers.js + ONNX Runtime Web）。
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { IdleTimeout } from '../infrastructure/idle-timeout';
-import { LOCAL_TRANSLATION_MODELS, type LocalModelTier } from '../domain/models/config';
+import { LOCAL_ONNX_MODEL } from '../domain/models/config';
 import OpenCC from 'opencc-js';
 
-/** 簡體→繁體轉換器（opus-mt-en-zh 模型輸出簡體，zh-Hant 目標需要轉換）。 */
+/** 簡體→繁體轉換器（部分模型仍可能輸出簡體，zh-Hant 目標統一轉繁體安全網）。 */
 const s2tConverter = OpenCC.Converter({ from: 'cn', to: 't' });
 
 /** Offscreen Document 接收的消息類型（ASR + 本地 ONNX 翻譯）。 */
@@ -18,8 +18,7 @@ type OffscreenRequest =
   | { type: 'local-onnx:warmup' }
   | { type: 'local-onnx:download' }
   | { type: 'local-onnx:clear-cache' }
-  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string; modelTier?: LocalModelTier }
-  | { type: 'local-onnx:set-model-tier'; tier: LocalModelTier }
+  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string }
   | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
   | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } }
@@ -37,7 +36,7 @@ type OffscreenResponse =
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
-  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean; degenerate?: boolean }
+  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
   | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
   | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
@@ -83,6 +82,45 @@ class ProxyCache {
 
 /** 全局 ProxyCache 實例（供 loadPipeline 和 ASR 下載共用）。 */
 const proxyCache = new ProxyCache();
+
+/**
+ * 全局下載進度聚合器（供 SW 進度廣播使用）。
+ * SW 串流下載時廣播 `sw:download-progress`，Offscreen 監聽並轉發給 UI。
+ */
+let globalDownloadAggregator: DownloadProgressAggregator | null = null;
+
+/**
+ * 監聽 SW 的串流下載進度廣播，轉發給 UI。
+ * SW 的 `sw:proxy-fetch` 分塊讀取響應並廣播進度，此處接收並轉換為 UI 可消費的格式。
+ */
+chrome.runtime.onMessage.addListener((message: unknown): boolean => {
+  const msg = message as { type?: string; url?: string; loaded?: number; total?: number };
+  if (msg.type === 'sw:download-progress' && globalDownloadAggregator) {
+    const url = msg.url ?? '';
+    const loaded = msg.loaded ?? 0;
+    const total = msg.total ?? 0;
+    // 從 URL 提取檔案名作為 key（與 transformers.js progress.file 格式一致）。
+    const fileKey = url.split('/').pop() ?? url;
+    const agg = globalDownloadAggregator.update(fileKey, loaded, total);
+    // 根據當前下載類型廣播對應的進度消息。
+    if (asrDownloadInProgress) {
+      broadcastToAll({
+        type: 'asr-whisper:download-progress',
+        progress: agg.progress,
+        loaded: agg.loaded,
+        total: agg.total,
+      });
+    } else if (localOnnxDownloadInProgress) {
+      broadcastToAll({
+        type: 'local-onnx:download-progress',
+        progress: agg.progress,
+        loaded: agg.loaded,
+        total: agg.total,
+      });
+    }
+  }
+  return false;
+});
 
 let mediaStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
@@ -292,8 +330,12 @@ chrome.runtime.onConnect.addListener((port) => {
 /**
  * 處理來自 Service Worker 轉發的 local-onnx / asr-whisper 消息（通過 port 連接）。
  * 進度/狀態消息透過 chrome.runtime.sendMessage 廣播給所有 extension contexts（含 Options 頁面）。
+ * 
+ * 注意：此監聽器不调用 sendResponse()，只廣播結果。
+ * 直接回應由 SW 透過 port 轉發並包裝為 { ok: true, result } 格式，確保 Options 頁面收到正確格式。
+ * 若此處直接回應，會與 SW 的回應競爭，導致 Options 頁面收到未包裝的原始格式（Bug 2 根因）。
  */
-chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: unknown, _sender) => {
   const msg = message as { topic?: string; type?: string; payload?: { modelId?: string } };
   const type = msg.topic ?? msg.type;
   if (!type?.startsWith('local-onnx:') && !type?.startsWith('asr-whisper:')) return false;
@@ -303,36 +345,27 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
 
   // in-flight 守衛：處理期間 busyCount 遞增，防止空閒關閉打斷（§5.5）。
   busyCount += 1;
-  const respond = (result: OffscreenResponse): void => {
+  const broadcast = (result: OffscreenResponse): void => {
     busyCount = Math.max(0, busyCount - 1);
-    sendResponse(result);
     broadcastToAll(result);
   };
 
   switch (type) {
     case 'local-onnx:check-status':
-      void checkModelStatus().then(respond);
-      return true;
+      void checkModelStatus().then(broadcast);
+      return false;
     case 'local-onnx:warmup':
       // M2-24 補充修復十三：手動/自動預加載——模型快取存在時載入記憶體，
       // 消除首次翻譯的 30-60s 載入延遲（此前首塊 request 超時被 SW 拒絕）。
-      void warmupModel().then(respond);
-      return true;
-    case 'local-onnx:download':
-      // 下載模型（進度廣播完成消息給所有 extension contexts——Options 頁面監聽）。
-      void downloadModel().then(respond);
-      return true;
-    case 'local-onnx:clear-cache':
-      void clearModelCache().then(respond);
-      return true;
-    case 'local-onnx:set-model-tier': {
-      const tierMsg = message as { topic?: string; tier?: LocalModelTier };
-      void setModelTier(tierMsg.tier ?? 'large').then(async (result) => {
-        const downloaded = await hasModelInCache();
-        respond({ type: 'local-onnx:status', downloaded, modelName: result.modelName });
-      });
-      return true;
+      void warmupModel().then(broadcast);
+      return false;
+    case 'local-onnx:download': {
+      void downloadModel().then(broadcast);
+      return false;
     }
+    case 'local-onnx:clear-cache':
+      void clearModelCache().then(broadcast);
+      return false;
     case 'local-onnx:translate': {
       // 若 SW 轉發 port 通道已建立，本入口跳過——由 port 路徑處理，避免雙重推理
       // （chrome.runtime.sendMessage 會同時廣播給 SW 與 offscreen）。
@@ -342,35 +375,31 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
       }
       const translateMsg = message as {
         topic: string;
-        payload?: { text?: string; targetLang?: string; sourceLang?: string; modelTier?: LocalModelTier };
+        payload?: { text?: string; targetLang?: string; sourceLang?: string };
         text?: string;
         targetLang?: string;
         sourceLang?: string;
-        modelTier?: LocalModelTier;
       };
-      const requestedTier = translateMsg.payload?.modelTier ?? translateMsg.modelTier;
       void runInference(
         translateMsg.payload?.text ?? translateMsg.text ?? '',
         translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? '',
-        translateMsg.payload?.sourceLang ?? translateMsg.sourceLang,
-        false,
-        requestedTier
-      ).then(respond);
-      return true;
+        translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
+      ).then(broadcast);
+      return false;
     }
     case 'asr-whisper:check-status':
-      void checkAsrModelStatus(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
-      return true;
+      void checkAsrModelStatus(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(broadcast);
+      return false;
     case 'asr-whisper:download':
-      void downloadAsrModel(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
-      return true;
+      void downloadAsrModel(msg.payload?.modelId ?? 'Xenova/whisper-base.en').then(broadcast);
+      return false;
     case 'asr-whisper:clear-cache':
-      void clearAsrModelCache(msg.payload?.modelId).then(respond);
-      return true;
+      void clearAsrModelCache(msg.payload?.modelId).then(broadcast);
+      return false;
     case 'asr-whisper:warmup': {
       const warmupMsg = message as { topic?: string; payload?: { modelId?: string } };
-      void warmupAsrPipeline(warmupMsg.payload?.modelId ?? 'Xenova/whisper-base.en').then(respond);
-      return true;
+      void warmupAsrPipeline(warmupMsg.payload?.modelId ?? 'Xenova/whisper-base.en').then(broadcast);
+      return false;
     }
     case 'asr-whisper:transcribe': {
       const transcribeMsg = message as { topic?: string; payload?: { pcm?: Float32Array; sampleRate?: number; hintLang?: string } };
@@ -378,8 +407,8 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
         transcribeMsg.payload?.pcm ?? new Float32Array(0),
         transcribeMsg.payload?.sampleRate ?? 16000,
         transcribeMsg.payload?.hintLang
-      ).then(respond);
-      return true;
+      ).then(broadcast);
+      return false;
     }
   }
   return false;
@@ -399,7 +428,7 @@ function connectToServiceWorker(): void {
       topic?: string;
       type?: string;
       messageId?: string;
-      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string; tier?: LocalModelTier; modelTier?: 'small' | 'large' };
+      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string };
       text?: string;
       targetLang?: string;
       sourceLang?: string;
@@ -426,32 +455,21 @@ function connectToServiceWorker(): void {
           result = await warmupModel();
           broadcastToAll(result as OffscreenResponse);
           break;
-        case 'local-onnx:download':
+        case 'local-onnx:download': {
           result = await downloadModel();
           broadcastToAll(result as OffscreenResponse);
           break;
+        }
         case 'local-onnx:clear-cache':
           result = await clearModelCache();
           broadcastToAll(result as OffscreenResponse);
           break;
-        case 'local-onnx:set-model-tier': {
-          const tier = msg.payload?.tier as LocalModelTier | undefined;
-          const tierResult = await setModelTier(tier ?? 'large');
-          const downloaded = await hasModelInCache();
-          result = { tier: tierResult.tier, modelName: tierResult.modelName };
-          broadcastToAll({ type: 'local-onnx:status', downloaded, modelName: tierResult.modelName });
-          break;
-        }
         case 'local-onnx:translate': {
           // 統一消息形狀：優先 payload（provider 用 { payload: { text } }），兼容舊頂層 text。
-          // 接收請求中的 modelTier，確保 offscreen 使用正確的推理路徑。
-          const requestedTier = msg.payload?.modelTier as LocalModelTier | undefined;
           result = await runInference(
             msg.payload?.text ?? msg.text ?? '',
             msg.payload?.targetLang ?? msg.targetLang ?? '',
-            msg.payload?.sourceLang ?? msg.sourceLang,
-            false,
-            requestedTier
+            msg.payload?.sourceLang ?? msg.sourceLang
           );
           broadcastToAll(result as OffscreenResponse);
           break;
@@ -538,76 +556,8 @@ let loadPromiseHasProgress = false;
  */
 let cacheGeneration = 0;
 
-/**
- * 待處理的 dispose Promise——setModelTier 啟動，ensurePipelineLoaded/runInference await。
- * 避免 dispose 與新 pipeline 載入的 WASM 狀態衝突。
- */
-let disposePromise: Promise<void> | null = null;
-
-/**
- * 模型檔位世代計數器——每次 setModelTier 實際切換時遞增。
- * 使 in-flight 載入在 tier 切換後自動作廢（類似 cacheGeneration 機制）。
- */
-let tierGeneration = 0;
-
-/** 當前使用的模型檔位（可從 Options 切換，預設為 large）。 */
-let currentModelTier: LocalModelTier = 'large';
-
-/** 當前載入的模型名稱（根據 currentModelTier 動態決定）。 */
-let currentModelName: string = LOCAL_TRANSLATION_MODELS.large;
-
-/** 判斷當前是否使用小型翻譯模型（MarianMT）。 */
-function isSmallModel(): boolean {
-  return currentModelTier === 'small';
-}
-
-/**
- * 設置模型檔位——切換後需要釋放當前 pipeline 以便下次載入使用新模型。
- * 返回當前檔位和模型名稱。
- * 
- * 競態安全修復：
- * ① 捕獲舊 pipeline 引用（非模組級變量），避免 .then() 誤殺新載入的 pipeline
- * ② 立即清空模組級狀態（translationPipeline/loadPromise），防止新請求誤用舊 pipeline
- * ③ dispose 失敗不阻塞狀態重置（.catch() 兜底）
- * ④ 遞增 tierGeneration，使 in-flight 載入自動作廢
- */
-async function setModelTier(tier: LocalModelTier): Promise<{ tier: LocalModelTier; modelName: string }> {
-  if (tier !== currentModelTier) {
-    const oldModelName = currentModelName;
-    console.log(`[AI_Trans] 切換模型檔位: ${currentModelTier} → ${tier}`);
-    currentModelTier = tier;
-    currentModelName = LOCAL_TRANSLATION_MODELS[tier];
-    tierGeneration++;
-    
-    // 捕獲舊 pipeline 引用（非模組級變量），避免 .then() 誤殺新 pipeline
-    const oldPipeline = translationPipeline;
-    
-    // 立即清空模組級狀態
-    translationPipeline = null;
-    loadPromise = null;
-    loadPromiseHasProgress = false;
-    
-    // 異步 dispose 舊 pipeline + 清除舊檔位快取（釋放儲存空間）
-    if (oldPipeline !== null) {
-      disposePromise = disposePipeline(oldPipeline)
-        .then(() => clearCacheForModel(oldModelName))
-        .catch((err) => {
-          console.warn('[AI_Trans] setModelTier dispose/clear error:', err instanceof Error ? err.message : String(err));
-        }).finally(() => {
-          disposePromise = null;
-        });
-    } else {
-      // 無內存 pipeline 時仍需清除舊檔位快取
-      disposePromise = clearCacheForModel(oldModelName)
-        .catch((err) => {
-          console.warn('[AI_Trans] setModelTier clear error:', err instanceof Error ? err.message : String(err));
-        }).finally(() => {
-          disposePromise = null;
-        });
-    }
-  }
-  return { tier: currentModelTier, modelName: currentModelName };
-}
+/** 當前載入的模型名稱（固定為 Qwen2.5-0.5B-Instruct）。 */
+let currentModelName: string = LOCAL_ONNX_MODEL;
 
 /**
  * WebGPU 載入後端一次性失敗記憶（M2-26）——首次 webgpu 嘗試失敗後置 true，
@@ -615,13 +565,6 @@ async function setModelTier(tier: LocalModelTier): Promise<{ tier: LocalModelTie
  * 僅影響本 Offscreen Document 生命週期；Document 重建後重置。
  */
 let webgpuFailed = false;
-
-/**
- * Small model (MarianMT) WASM 不相容標記——首次 WASM 錯誤重試失敗後置 true，
- * 後續請求直接返回錯誤，避免重複嘗試不可用的模型。
- * 某些機器的 WASM runtime 與 MarianMT 模型存在根本性不相容（如 unaligned accesses）。
- */
-let smallModelBroken = false;
 
 /**
  * 決定模型載入後端設備——WebGPU 優先（權重進 GPU VRAM，不佔 extension 渲染進程
@@ -643,6 +586,9 @@ let asrPipeline: unknown = null;
 
 /** ASR Whisper 模型下載進行中旗標（M1-59）——供 check-status 讓 Options 頁顯示「下載中」。 */
 let asrDownloadInProgress = false;
+
+/** 本地 ONNX 翻譯模型下載進行中旗標——供 SW 進度廣播區分下載類型。 */
+let localOnnxDownloadInProgress = false;
 
 /** transformers.js 進度回調結構。 */
 interface TransformersProgress {
@@ -703,9 +649,9 @@ function toReadableError(err: unknown): Error {
  * download / check-status 預熱 / runInference lazy 載入三處複用；
  * env 配置統一在此設置，避免各調用點不一致導致行為漂移。
  * 
- * 雙模型支援：
- * - small (MarianMT/opus-mt): translation pipeline，記憶體小、速度快
- * - large (Qwen2.5): text-generation pipeline，高質量但記憶體大
+ * 所有模型統一使用 text-generation pipeline + INT4 量化（dtype: 'q4'）。
+ * - small (Qwen2-0.5B): ~750MB, chunk size=3
+ * - large (Qwen2.5-0.5B): ~750MB, chunk size=5
  */
 async function loadPipeline(
   progressCallback?: (p: TransformersProgress) => void
@@ -732,70 +678,36 @@ async function loadPipeline(
     // 避免手動設 4 與 threaded wasm 初始化衝突（wasm trap 頭號嫌疑）。
   }
 
-  // 根據模型檔位選擇不同的 pipeline 類型和參數。
+  // 所有模型統一使用 text-generation pipeline + INT4 量化
   const modelName = currentModelName;
   const device: 'webgpu' | 'wasm' = preferWebGpu() ? 'webgpu' : 'wasm';
   
-  if (isSmallModel()) {
-    // 小型翻譯模型 (MarianMT/opus-mt)：使用 translation pipeline
-    // 記憶體約 150MB，推理速度快，專為翻譯設計
-    console.log(`[AI_Trans] 載入小型翻譯模型: ${modelName}`);
-    try {
-      return await pipeline('translation' as any, modelName, {
-        dtype: 'q8',
-        device,
-        ...(progressCallback ? { progress_callback: progressCallback } : {}),
-      });
-    } catch (err) {
-      if (device !== 'webgpu') throw err;
-      // WebGPU 嘗試失敗 → 回退 WASM
-      webgpuFailed = true;
-      console.warn('[AI_Trans] WebGPU 載入失敗，回退 WASM:', err);
-      recordDiagnostic({
-        type: 'pipeline-error',
-        error: {
-          port: 'translation',
-          code: 'local-onnx-webgpu-fallback',
-          recoverable: true,
-          cause: err instanceof Error ? err : new Error(String(err)),
-        },
-      });
-      return await pipeline('translation' as any, modelName, {
-        dtype: 'q8',
-        device: 'wasm',
-        ...(progressCallback ? { progress_callback: progressCallback } : {}),
-      });
-    }
-  } else {
-    // 中型/大型 LLM 模型：使用 text-generation pipeline
-    // Medium (SmolLM2-360M): ~200MB, Large (Qwen2.5-0.5B): ~750MB
-    console.log(`[AI_Trans] 載入 ${currentModelTier} LLM 模型: ${modelName}`);
-    try {
-      return await pipeline('text-generation', modelName, {
-        dtype: 'q4',
-        device,
-        ...(progressCallback ? { progress_callback: progressCallback } : {}),
-      });
-    } catch (err) {
-      if (device !== 'webgpu') throw err;
-      // WebGPU 嘗試失敗 → 回退 WASM
-      webgpuFailed = true;
-      console.warn('[AI_Trans] WebGPU 載入失敗，回退 WASM:', err);
-      recordDiagnostic({
-        type: 'pipeline-error',
-        error: {
-          port: 'translation',
-          code: 'local-onnx-webgpu-fallback',
-          recoverable: true,
-          cause: err instanceof Error ? err : new Error(String(err)),
-        },
-      });
-      return await pipeline('text-generation', modelName, {
-        dtype: 'q4',
-        device: 'wasm',
-        ...(progressCallback ? { progress_callback: progressCallback } : {}),
-      });
-    }
+  console.log(`[AI_Trans] 載入 LLM 模型: ${modelName}`);
+  try {
+    return await pipeline('text-generation', modelName, {
+      dtype: 'q4',
+      device,
+      ...(progressCallback ? { progress_callback: progressCallback } : {}),
+    });
+  } catch (err) {
+    if (device !== 'webgpu') throw err;
+    // WebGPU 嘗試失敗 → 回退 WASM
+    webgpuFailed = true;
+    console.warn('[AI_Trans] WebGPU 載入失敗，回退 WASM:', err);
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-webgpu-fallback',
+        recoverable: true,
+        cause: err instanceof Error ? err : new Error(String(err)),
+      },
+    });
+    return await pipeline('text-generation', modelName, {
+      dtype: 'q4',
+      device: 'wasm',
+      ...(progressCallback ? { progress_callback: progressCallback } : {}),
+    });
   }
 }
 
@@ -845,29 +757,21 @@ async function disposePipeline(pipeline: unknown): Promise<void> {
 /**
  * 確保 pipeline 已載入——已載入直接返回；否則觸發載入（並發安全）。
  * 用於 runInference 的 lazy 恢復、check-status 預熱與 downloadModel。
- *
- * 補充修復十五（世代失效 + 進度防護）：
- * ① 世代失效——載入期間若快取被清除（cacheGeneration 遞增），載入結果立即 dispose
- *    且不落地 translationPipeline，並拋 ModelCacheClearedError，杜絕「清快取後
- *    重新下載複用陳舊載入」導致的 wasm trap（如 [non-Error number] 1025635888）。
- * ② 進度防護——已存在「無進度回調」的載入（如 check-status 預熱）時，若本次調用
- *    需要進度回調，等待其結束後以帶進度的新鮮載入承接，避免下載無進度可看。
- * ③ tier 世代失效——載入期間若模型檔位切換（tierGeneration 遞增），載入結果立即
- *    dispose 且不落地，避免載入錯誤的模型。
- * ④ dispose 等待——載入前先等待 pending dispose 完成，避免 WASM 狀態衝突。
- */
+  *
+  * 補充修復十五（世代失效 + 進度防護）：
+  * ① 世代失效——載入期間若快取被清除（cacheGeneration 遞增），載入結果立即 dispose
+  *    且不落地 translationPipeline，並拋 ModelCacheClearedError，杜絕「清快取後
+  *    重新下載複用陳舊載入」導致的 wasm trap（如 [non-Error number] 1025635888）。
+  * ② 進度防護——已存在「無進度回調」的載入（如 check-status 預熱）時，若本次調用
+  *    需要進度回調，等待其結束後以帶進度的新鮮載入承接，避免下載無進度可看。
+  * ③ dispose 等待——載入前先等待 pending dispose 完成，避免 WASM 狀態衝突。
+  */
 async function ensurePipelineLoaded(
   progressCallback?: (p: TransformersProgress) => void
 ): Promise<unknown> {
-  // 等待 pending dispose 完成（避免 WASM 狀態衝突）
-  if (disposePromise) {
-    await disposePromise;
-  }
-  
   if (translationPipeline !== null) return translationPipeline;
 
   const gen = cacheGeneration;
-  const tierGen = tierGeneration;
 
   // 進度防護：既有載入無進度回調，但本次需要 → 等它結束再以帶進度的載入承接。
   if (loadPromise && !loadPromiseHasProgress && progressCallback) {
@@ -890,11 +794,6 @@ async function ensurePipelineLoaded(
         if (gen !== cacheGeneration) {
           await disposePipeline(p);
           throw new ModelCacheClearedError();
-        }
-        // 載入期間模型檔位切換 → 作廢：dispose 且不落地。
-        if (tierGen !== tierGeneration) {
-          await disposePipeline(p);
-          throw new Error('Model tier changed during load');
         }
         translationPipeline = p;
         // 麵包屑：模型載入完成後的 JS 堆記憶體（驗證 WebGPU 前後差異）。
@@ -1074,17 +973,23 @@ async function hasModelInCache(): Promise<boolean> {
 /**
  * 下載模型——使用 transformers.js pipeline 加載模型到 IndexedDB。
  * 透過 progress_callback 實時回報下載進度。
+ * SW 串流下載時廣播 `sw:download-progress`，此處監聽並轉發給 UI。
  */
 async function downloadModel(): Promise<OffscreenResponse> {
+  localOnnxDownloadInProgress = true;
   try {
     // 進度聚合器：多檔案下載時計算整體百分比（避免進度條在文件切換時跳回 0%）。
     const aggregator = new DownloadProgressAggregator();
+    globalDownloadAggregator = aggregator;
 
     // 進度回調：實時回報下載進度給 Options 頁面。
+    // 注意：由於 ProxyCache 架構，transformers.js 的 progress_callback 不會收到中間進度，
+    // 實際進度由 SW 串流下載廣播，透過 globalDownloadAggregator 更新。
     const progressCallback = (progress: TransformersProgress): void => {
       const fileKey = progress.file ?? progress.name ?? 'unknown';
 
       if (progress.status === 'progress' && progress.loaded !== undefined) {
+        // 此分支在 ProxyCache 架構下不會觸發，保留以備未來直接下載場景。
         const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
         broadcastToAll({
           type: 'local-onnx:download-progress',
@@ -1138,6 +1043,9 @@ async function downloadModel(): Promise<OffscreenResponse> {
       ok: false,
       error: error.message,
     } satisfies OffscreenResponse;
+  } finally {
+    localOnnxDownloadInProgress = false;
+    globalDownloadAggregator = null;
   }
 }
 
@@ -1268,11 +1176,13 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
 
     // 進度聚合器：多檔案下載時計算整體百分比。
     const aggregator = new DownloadProgressAggregator();
+    globalDownloadAggregator = aggregator;
 
     const progressCallback = (progress: TransformersProgress): void => {
       const fileKey = progress.file ?? progress.name ?? 'unknown';
 
       if (progress.status === 'progress' && progress.loaded !== undefined) {
+        // 此分支在 ProxyCache 架構下不會觸發，保留以備未來直接下載場景。
         const agg = aggregator.update(fileKey, progress.loaded, progress.total ?? 0);
         broadcastToAll({
           type: 'asr-whisper:download-progress',
@@ -1358,6 +1268,7 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
     } satisfies OffscreenResponse;
   } finally {
     asrDownloadInProgress = false;
+    globalDownloadAggregator = null;
   }
 }
 
@@ -1596,38 +1507,15 @@ function calcUniqueNgramRatio(text: string, n: number): number {
 
 /**
  * 執行翻譯推理——使用本地 ONNX 模型翻譯文本。
- * 根據模型檔位使用不同的推理邏輯：
- * - small (MarianMT): 直接輸入文本，返回 translation_text
- * - medium (SmolLM2): 構造 SmolLM2 Prompt，解析 generated_text
- * - large (Qwen2.5): 構造 ChatML Prompt，解析 generated_text
- * 
- * @param requestedTier - 請求中指定的模型檔位。如果與當前檔位不同，會先切換模型。
+ * 使用 ChatML Prompt + generated_text 解析，chunk size 由配置決定。
  */
 async function runInference(
   text: string,
   targetLang: string,
   _sourceLang: string | undefined,
-  retriedWithWasm = false,
-  requestedTier?: LocalModelTier
+  retriedWithWasm = false
 ): Promise<OffscreenResponse> {
-  // 早期退出：Small model WASM 不相容時直接返回錯誤
-  if (requestedTier === 'small' && smallModelBroken) {
-    return {
-      type: 'local-onnx:translate-result',
-      ok: false,
-      error: 'Small model (MarianMT) is incompatible with this machine\'s WASM runtime. Please use Large model instead.',
-    } satisfies OffscreenResponse;
-  }
-
-  // 如果請求指定了不同的模型檔位，先切換模型
-  // setModelTier 已處理 dispose 和狀態清空，不再重複
-  if (requestedTier && requestedTier !== currentModelTier) {
-    console.log(`[AI_Trans] runInference: switching tier from ${currentModelTier} to ${requestedTier} per request`);
-    await setModelTier(requestedTier);
-  }
-
   // lazy 恢復：pipeline 未載入但快取存在 → 自動載入（Offscreen 重啟後無需重新下載）。
-  // ensurePipelineLoaded 內部會 await disposePromise，確保 dispose 完成後再載入。
   if (translationPipeline === null) {
     try {
       if (await hasModelInCache()) {
@@ -1666,119 +1554,71 @@ async function runInference(
   try {
     const inferStartedAt = performance.now();
 
-    if (isSmallModel()) {
-      // 小型翻譯模型 (MarianMT/opus-mt)：直接輸入文本
-      // 返回格式：[{ translation_text: "翻譯結果" }]
-      const pipelineFn = translationPipeline as (
-        input: string,
-        options?: Record<string, unknown>
-      ) => Promise<Array<{ translation_text: string }>>;
+    // 所有模型統一使用 ChatML Prompt + text-generation pipeline
+    console.log(`[AI_Trans:local-onnx] 開始翻譯, text length:`, text.length, 'targetLang:', targetLang);
+    const sourceLines = text.split('\n');
+    const prompt = buildPrompt(text, targetLang);
+    console.log(`[AI_Trans:local-onnx] prompt 構建完成, prompt length:`, prompt.length);
 
-      const result = await pipelineFn(text, {
-        max_new_tokens: 256,
-        do_sample: false,
-        repetition_penalty: 1.2,
-        no_repeat_ngram_size: 3,
-      });
-      let translatedText = result[0]?.translation_text ?? '';
-      
-      // 調試：輸出原始輸出（簡繁轉換前）
-      console.log('[AI_Trans:local-onnx-small] raw output (before S2T):', JSON.stringify(translatedText.slice(0, 200)));
-      
-      // 退化輸出檢測：檢查 3-gram 唯一率（在簡繁轉換前，避免轉換引入噪音）
-      if (translatedText.length > 100) {
-        const ngramRatio = calcUniqueNgramRatio(translatedText, 3);
-        if (ngramRatio < 0.2) {
-          console.warn(
-            `[AI_Trans:local-onnx-small] degenerate output detected: ` +
-            `ngramRatio=${ngramRatio.toFixed(3)}, length=${translatedText.length}`
-          );
-          return {
-            type: 'local-onnx:translate-result',
-            ok: false,
-            error: 'Small model produced degenerate output (repetition detected).',
-            degenerate: true,
-          } satisfies OffscreenResponse;
-        }
-      }
-      
-      // 簡繁轉換：opus-mt-en-zh 輸出簡體中文，zh-Hant 目標需要轉換為繁體
-      if (targetLang === 'zh-Hant') {
-        translatedText = s2tConverter(translatedText);
-      }
+    const pipelineFn = translationPipeline as (
+      input: string,
+      options?: Record<string, unknown>
+    ) => Promise<Array<{ generated_text: string }>>;
+
+    console.log(`[AI_Trans:local-onnx] 開始推理...`);
+    const result = await pipelineFn(prompt, {
+      max_new_tokens: 256,
+      do_sample: false,
+      repetition_penalty: 1.1,
+      return_full_text: false,
+    });
+    console.log(`[AI_Trans:local-onnx] 推理完成`);
+
+    // 解析生成結果——按行號還原譯文。
+    const generatedText = result[0]?.generated_text ?? '';
+    console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
+    console.log('[AI_Trans:local-onnx] generated_text.length:', generatedText.length, 'tail:', JSON.stringify(generatedText.slice(-500)));
+
+    const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
+
+    // 當檢測到 echo 時，輸出詳細診斷信息
+    if (echoed) {
+      console.log('[AI_Trans:local-onnx] ECHO DETECTED!');
+      console.log('[AI_Trans:local-onnx] similarCount:', similarCount, '/', sourceLines.length);
+      console.log('[AI_Trans:local-onnx] parsedCount:', parsedCount);
+      console.log('[AI_Trans:local-onnx] sourceLines (first 3):', JSON.stringify(sourceLines.slice(0, 3)));
+      console.log('[AI_Trans:local-onnx] translatedLines (first 3):', JSON.stringify(translatedLines.slice(0, 3)));
+      console.log('[AI_Trans:local-onnx] generated_text (full):', JSON.stringify(generatedText));
       
       const elapsedMs = Math.round(performance.now() - inferStartedAt);
-      console.log(`[AI_Trans:local-onnx-small] 翻譯完成 (${elapsedMs}ms):`, translatedText.slice(0, 100));
-
-      return {
-        type: 'local-onnx:translate-result',
-        ok: true,
-        translatedText,
-        echoed: false,
-      } satisfies OffscreenResponse;
-    } else {
-      // 中型/大型 LLM 模型：構造 Prompt 執行推理
-      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 開始翻譯, text length:`, text.length, 'targetLang:', targetLang);
-      const sourceLines = text.split('\n');
-      // 根據檔位選擇 prompt 格式：medium 用 SmolLM2 template，large 用 ChatML
-      const prompt = currentModelTier === 'medium'
-        ? buildPromptSmolLM2(text, targetLang)
-        : buildPrompt(text, targetLang);
-      console.log(`[AI_Trans:local-onnx-${currentModelTier}] prompt 構建完成, prompt length:`, prompt.length);
-
-      const pipelineFn = translationPipeline as (
-        input: string,
-        options?: Record<string, unknown>
-      ) => Promise<Array<{ generated_text: string }>>;
-
-      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 開始推理...`);
-      const result = await pipelineFn(prompt, {
-        max_new_tokens: 256,
-        do_sample: false,
-        repetition_penalty: 1.1,
-        return_full_text: false,
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-echo-output',
+          recoverable: true,
+          cause: new Error(
+            `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+              generatedText.slice(0, 200)
+            )}`
+          ),
+        },
       });
-      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 推理完成`);
-
-      // 解析生成結果——按行號還原譯文。
-      const generatedText = result[0]?.generated_text ?? '';
-      console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
-      console.log('[AI_Trans:local-onnx] generated_text.length:', generatedText.length, 'tail:', JSON.stringify(generatedText.slice(-500)));
-
-      const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
-
-      // 當檢測到 echo 時，輸出詳細診斷信息
-      if (echoed) {
-        console.log('[AI_Trans:local-onnx] ECHO DETECTED!');
-        console.log('[AI_Trans:local-onnx] similarCount:', similarCount, '/', sourceLines.length);
-        console.log('[AI_Trans:local-onnx] parsedCount:', parsedCount);
-        console.log('[AI_Trans:local-onnx] sourceLines (first 3):', JSON.stringify(sourceLines.slice(0, 3)));
-        console.log('[AI_Trans:local-onnx] translatedLines (first 3):', JSON.stringify(translatedLines.slice(0, 3)));
-        console.log('[AI_Trans:local-onnx] generated_text (full):', JSON.stringify(generatedText));
-        
-        const elapsedMs = Math.round(performance.now() - inferStartedAt);
-        recordDiagnostic({
-          type: 'pipeline-error',
-          error: {
-            port: 'translation',
-            code: 'local-onnx-echo-output',
-            recoverable: true,
-            cause: new Error(
-              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
-                generatedText.slice(0, 200)
-              )}`
-            ),
-          },
-        });
-      }
-
-      return {
-        type: 'local-onnx:translate-result',
-        ok: true,
-        translatedText: translatedLines.join('\n'),
-        echoed,
-      } satisfies OffscreenResponse;
     }
+
+    let finalText = translatedLines.join('\n');
+    // 簡繁轉換安全網：即使 prompt 已要求輸出繁體，部分模型仍可能輸出簡體，
+    // 對 zh-Hant 目標統一轉換（對已是繁體的內容為冪等操作）。
+    if (targetLang === 'zh-Hant') {
+      finalText = s2tConverter(finalText);
+    }
+
+    return {
+      type: 'local-onnx:translate-result',
+      ok: true,
+      translatedText: finalText,
+      echoed,
+    } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
     const error = toReadableError(err);
@@ -1835,7 +1675,7 @@ async function runInference(
         } satisfies OffscreenResponse;
       }
       // 重試推論一次（遞歸調用，帶重試標誌避免無限循環）
-      return runInference(text, targetLang, _sourceLang, true, requestedTier);
+      return runInference(text, targetLang, _sourceLang, true);
     }
     
     // WASM 記憶體錯誤：嘗試重新載入模型並重試一次
@@ -1870,11 +1710,6 @@ async function runInference(
             cause: loadError,
           },
         });
-        // Small model 重載失敗後標記 broken
-        if (isSmallModel()) {
-          smallModelBroken = true;
-          console.warn('[AI_Trans] Small model reload failed, marked as broken');
-        }
         return {
           type: 'local-onnx:translate-result',
           ok: false,
@@ -1882,13 +1717,7 @@ async function runInference(
         } satisfies OffscreenResponse;
       }
       // 重試推論一次
-      return runInference(text, targetLang, _sourceLang, true, requestedTier);
-    }
-    
-    // WASM 錯誤重試後仍失敗：標記 Small model 為 broken
-    if (isWasmMemoryError && retriedWithWasm && isSmallModel()) {
-      smallModelBroken = true;
-      console.warn('[AI_Trans] Small model WASM incompatible after retry, marked as broken');
+      return runInference(text, targetLang, _sourceLang, true);
     }
     
     recordDiagnostic({
@@ -1977,32 +1806,6 @@ function buildPrompt(text: string, targetLang: string): string {
 ${numbered}
 <|im_end|>
 <|im_start|>assistant
-`;
-}
-
-/**
- * 構造翻譯 Prompt——SmolLM2 chat template 格式 + 行號標記 + 目標語言 few-shot。
- * SmolLM2-360M-Instruct 使用不同的 chat template（非 ChatML）。
- */
-function buildPromptSmolLM2(text: string, targetLang: string): string {
-  const langName = getLanguageName(targetLang);
-  const numbered = text
-    .split('\n')
-    .map((line, i) => `${i + 1}. ${line}`)
-    .join('\n');
-
-  const fewShot = FEW_SHOT_LINES[langName];
-  const fewShotText = fewShot
-    ? `\nExamples:\n${fewShot.map(([src, dst]) => `9. ${src}\n9. ${dst}`).join('\n')}`
-    : '';
-
-  return `<|system|>
-You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
-<|end|>
-<|user|>
-${numbered}
-<|end|>
-<|assistant|>
 `;
 }
 
@@ -2130,9 +1933,8 @@ export function resetLocalOnnxModuleForTest(): void {
   asrDownloadInProgress = false;
   // M2-37：重置 ASR pipeline（避免測試間互相污染）。
   asrPipeline = null;
-  // 重置模型檔位為預設值（large）
-  currentModelTier = 'large';
-  currentModelName = LOCAL_TRANSLATION_MODELS.large;
+  // 重置模型名稱為預設值
+  currentModelName = LOCAL_ONNX_MODEL;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -2144,11 +1946,9 @@ export const _testExports = {
   downloadModel,
   ensurePipelineLoaded,
   buildPrompt,
-  buildPromptSmolLM2,
   parseNumberedOutput,
   warmupModel,
   shutdownForIdle,
-  setModelTier,
   // M1-59：ASR 狀態檢查/下載（供測試驗證 downloading 旗標與狀態字段）。
   checkAsrModelStatus,
   downloadAsrModel,
@@ -2162,14 +1962,10 @@ export const _testExports = {
   get webgpuFailed(): boolean {
     return webgpuFailed;
   },
-  // 當前模型檔位（getter；供測試斷言）
-  get currentModelTier(): LocalModelTier {
-    return currentModelTier;
-  },
   // 進度聚合器（供測試驗證多檔案下載進度計算）。
   DownloadProgressAggregator,
   // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
   calcUniqueNgramRatio,
-  // 檔位切換時清理舊檔位快取（供測試驗證）。
+  // 清理舊模型快取（供測試驗證）。
   clearCacheForModel,
 };

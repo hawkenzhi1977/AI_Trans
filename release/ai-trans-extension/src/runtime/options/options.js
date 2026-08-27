@@ -1,15 +1,7 @@
 "use strict";
 (() => {
   // src/domain/models/config.ts
-  var LOCAL_TRANSLATION_MODELS = {
-    /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
-    small: "Xenova/opus-mt-en-zh",
-    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
-    medium: "onnx-community/SmolLM2-360M-Instruct",
-    /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
-    large: "onnx-community/Qwen2.5-0.5B-Instruct"
-  };
-  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
+  var LOCAL_ONNX_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
   var DEBUG_LOG_OFF = {
     overlay: false,
     llm: false,
@@ -175,8 +167,8 @@
         model: $("translation-model").value || void 0,
         endpoint: $("translation-endpoint").value || void 0,
         fallbackType: $("translation-fallback").value || void 0,
-        localModelTier: $("local-model-tier").value || "large",
-        localModelName: LOCAL_TRANSLATION_MODELS[$("local-model-tier").value || "large"]
+        localOnnxChunkSize: Number($("local-onnx-chunk-size").value) || 5,
+        localModelName: LOCAL_ONNX_MODEL
       },
       asr: {
         type: asrType,
@@ -209,9 +201,7 @@
     $("translation-model").value = config.translation.model ?? "";
     $("translation-endpoint").value = config.translation.endpoint ?? "";
     $("translation-fallback").value = config.translation.fallbackType ?? "mt";
-    const localTier = config.translation.localModelTier ?? "large";
-    $("local-model-tier").value = localTier;
-    $("local-model-name").value = LOCAL_TRANSLATION_MODELS[localTier];
+    $("local-onnx-chunk-size").value = String(config.translation.localOnnxChunkSize ?? 5);
     $("asr-type").value = config.asr.type;
     $("asr-tier").value = config.asr.modelTier ?? "base";
     $("asr-endpoint").value = config.asr.endpoint ?? "";
@@ -250,14 +240,6 @@
       await store.set(config);
       await store.setApiKey("llm", $("translation-api-key").value.trim());
       await store.setApiKey("asr", $("asr-api-key").value.trim());
-      const localTier = config.translation.localModelTier ?? "large";
-      try {
-        await chrome.runtime.sendMessage({
-          topic: "local-onnx:set-model-tier",
-          tier: localTier
-        });
-      } catch {
-      }
       showStatus("\u914D\u7F6E\u5DF2\u4FDD\u5B58");
     } catch (err) {
       console.warn("[AI_Trans] config save failed:", err);
@@ -347,21 +329,8 @@
     const btnDownload = $("btn-download-model");
     const btnWarmup = $("btn-warmup-model");
     const btnClear = $("btn-clear-model");
-    const tierSelect = $("local-model-tier");
-    const modelNameInput = $("local-model-name");
     const sizeInfo = $("local-model-size-info");
-    const MODEL_SIZES = {
-      small: "\u7D04 150 MB",
-      medium: "\u7D04 200 MB",
-      large: "\u7D04 750 MB"
-    };
-    function updateModelInfo() {
-      const tier = tierSelect.value;
-      modelNameInput.value = LOCAL_TRANSLATION_MODELS[tier];
-      sizeInfo.textContent = MODEL_SIZES[tier];
-    }
-    tierSelect.addEventListener("change", updateModelInfo);
-    updateModelInfo();
+    sizeInfo.textContent = "\u7D04 750 MB";
     function updateStatusBadge(status, message) {
       const styles = {
         checking: { bg: "#eee", color: "#666", text: "\u6AA2\u6E2C\u4E2D..." },

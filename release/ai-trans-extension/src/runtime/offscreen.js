@@ -48533,15 +48533,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   };
 
   // src/domain/models/config.ts
-  var LOCAL_TRANSLATION_MODELS = {
-    /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
-    small: "Xenova/opus-mt-en-zh",
-    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
-    medium: "onnx-community/SmolLM2-360M-Instruct",
-    /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
-    large: "onnx-community/Qwen2.5-0.5B-Instruct"
-  };
-  var DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
+  var LOCAL_ONNX_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
 
   // node_modules/opencc-js/dist/esm/full.js
   var n = class {
@@ -48773,6 +48765,33 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   };
   var proxyCache = new ProxyCache();
+  var globalDownloadAggregator = null;
+  chrome.runtime.onMessage.addListener((message) => {
+    const msg = message;
+    if (msg.type === "sw:download-progress" && globalDownloadAggregator) {
+      const url = msg.url ?? "";
+      const loaded = msg.loaded ?? 0;
+      const total = msg.total ?? 0;
+      const fileKey = url.split("/").pop() ?? url;
+      const agg = globalDownloadAggregator.update(fileKey, loaded, total);
+      if (asrDownloadInProgress) {
+        broadcastToAll({
+          type: "asr-whisper:download-progress",
+          progress: agg.progress,
+          loaded: agg.loaded,
+          total: agg.total
+        });
+      } else if (localOnnxDownloadInProgress) {
+        broadcastToAll({
+          type: "local-onnx:download-progress",
+          progress: agg.progress,
+          loaded: agg.loaded,
+          total: agg.total
+        });
+      }
+    }
+    return false;
+  });
   var mediaStream = null;
   var audioContext = null;
   var scriptProcessor = null;
@@ -48919,67 +48938,56 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       void stopCapture();
     });
   });
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message, _sender) => {
     const msg = message;
     const type = msg.topic ?? msg.type;
     if (!type?.startsWith("local-onnx:") && !type?.startsWith("asr-whisper:")) return false;
     markActivity();
     busyCount += 1;
-    const respond = (result) => {
+    const broadcast = (result) => {
       busyCount = Math.max(0, busyCount - 1);
-      sendResponse(result);
       broadcastToAll(result);
     };
     switch (type) {
       case "local-onnx:check-status":
-        void checkModelStatus().then(respond);
-        return true;
+        void checkModelStatus().then(broadcast);
+        return false;
       case "local-onnx:warmup":
-        void warmupModel().then(respond);
-        return true;
-      case "local-onnx:download":
-        void downloadModel().then(respond);
-        return true;
-      case "local-onnx:clear-cache":
-        void clearModelCache().then(respond);
-        return true;
-      case "local-onnx:set-model-tier": {
-        const tierMsg = message;
-        void setModelTier(tierMsg.tier ?? "large").then(async (result) => {
-          const downloaded = await hasModelInCache();
-          respond({ type: "local-onnx:status", downloaded, modelName: result.modelName });
-        });
-        return true;
+        void warmupModel().then(broadcast);
+        return false;
+      case "local-onnx:download": {
+        void downloadModel().then(broadcast);
+        return false;
       }
+      case "local-onnx:clear-cache":
+        void clearModelCache().then(broadcast);
+        return false;
       case "local-onnx:translate": {
         if (onnxPortConnected) {
           busyCount = Math.max(0, busyCount - 1);
           return false;
         }
         const translateMsg = message;
-        const requestedTier = translateMsg.payload?.modelTier ?? translateMsg.modelTier;
         void runInference(
           translateMsg.payload?.text ?? translateMsg.text ?? "",
           translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? "",
-          translateMsg.payload?.sourceLang ?? translateMsg.sourceLang,
-          false,
-          requestedTier
-        ).then(respond);
-        return true;
+          translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
+        ).then(broadcast);
+        return false;
       }
       case "asr-whisper:check-status":
-        void checkAsrModelStatus(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(respond);
-        return true;
+        void checkAsrModelStatus(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(broadcast);
+        return false;
       case "asr-whisper:download":
-        void downloadAsrModel(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(respond);
-        return true;
+        void downloadAsrModel(msg.payload?.modelId ?? "Xenova/whisper-base.en").then(broadcast);
+        return false;
       case "asr-whisper:clear-cache":
-        void clearAsrModelCache(msg.payload?.modelId).then(respond);
-        return true;
+        void clearAsrModelCache(msg.payload?.modelId).then(broadcast);
+        return false;
       case "asr-whisper:warmup": {
         const warmupMsg = message;
-        void warmupAsrPipeline(warmupMsg.payload?.modelId ?? "Xenova/whisper-base.en").then(respond);
-        return true;
+        void warmupAsrPipeline(warmupMsg.payload?.modelId ?? "Xenova/whisper-base.en").then(broadcast);
+        return false;
       }
       case "asr-whisper:transcribe": {
         const transcribeMsg = message;
@@ -48987,8 +48995,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           transcribeMsg.payload?.pcm ?? new Float32Array(0),
           transcribeMsg.payload?.sampleRate ?? 16e3,
           transcribeMsg.payload?.hintLang
-        ).then(respond);
-        return true;
+        ).then(broadcast);
+        return false;
       }
     }
     return false;
@@ -49015,30 +49023,20 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             result = await warmupModel();
             broadcastToAll(result);
             break;
-          case "local-onnx:download":
+          case "local-onnx:download": {
             result = await downloadModel();
             broadcastToAll(result);
             break;
+          }
           case "local-onnx:clear-cache":
             result = await clearModelCache();
             broadcastToAll(result);
             break;
-          case "local-onnx:set-model-tier": {
-            const tier = msg.payload?.tier;
-            const tierResult = await setModelTier(tier ?? "large");
-            const downloaded = await hasModelInCache();
-            result = { tier: tierResult.tier, modelName: tierResult.modelName };
-            broadcastToAll({ type: "local-onnx:status", downloaded, modelName: tierResult.modelName });
-            break;
-          }
           case "local-onnx:translate": {
-            const requestedTier = msg.payload?.modelTier;
             result = await runInference(
               msg.payload?.text ?? msg.text ?? "",
               msg.payload?.targetLang ?? msg.targetLang ?? "",
-              msg.payload?.sourceLang ?? msg.sourceLang,
-              false,
-              requestedTier
+              msg.payload?.sourceLang ?? msg.sourceLang
             );
             broadcastToAll(result);
             break;
@@ -49097,42 +49095,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var loadPromise = null;
   var loadPromiseHasProgress = false;
   var cacheGeneration = 0;
-  var disposePromise = null;
-  var tierGeneration = 0;
-  var currentModelTier = "large";
-  var currentModelName = LOCAL_TRANSLATION_MODELS.large;
-  function isSmallModel() {
-    return currentModelTier === "small";
-  }
-  async function setModelTier(tier) {
-    if (tier !== currentModelTier) {
-      const oldModelName = currentModelName;
-      console.log(`[AI_Trans] \u5207\u63DB\u6A21\u578B\u6A94\u4F4D: ${currentModelTier} \u2192 ${tier}`);
-      currentModelTier = tier;
-      currentModelName = LOCAL_TRANSLATION_MODELS[tier];
-      tierGeneration++;
-      const oldPipeline = translationPipeline;
-      translationPipeline = null;
-      loadPromise = null;
-      loadPromiseHasProgress = false;
-      if (oldPipeline !== null) {
-        disposePromise = disposePipeline(oldPipeline).then(() => clearCacheForModel(oldModelName)).catch((err) => {
-          console.warn("[AI_Trans] setModelTier dispose/clear error:", err instanceof Error ? err.message : String(err));
-        }).finally(() => {
-          disposePromise = null;
-        });
-      } else {
-        disposePromise = clearCacheForModel(oldModelName).catch((err) => {
-          console.warn("[AI_Trans] setModelTier clear error:", err instanceof Error ? err.message : String(err));
-        }).finally(() => {
-          disposePromise = null;
-        });
-      }
-    }
-    return { tier: currentModelTier, modelName: currentModelName };
-  }
+  var currentModelName = LOCAL_ONNX_MODEL;
   var webgpuFailed = false;
-  var smallModelBroken = false;
   function preferWebGpu() {
     if (webgpuFailed) return false;
     try {
@@ -49143,6 +49107,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   var asrPipeline = null;
   var asrDownloadInProgress = false;
+  var localOnnxDownloadInProgress = false;
   var DownloadProgressAggregator = class {
     files = /* @__PURE__ */ new Map();
     /** 更新單文件進度並返回整體百分比（0-100）與累計 loaded/total。 */
@@ -49183,60 +49148,31 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     const modelName = currentModelName;
     const device = preferWebGpu() ? "webgpu" : "wasm";
-    if (isSmallModel()) {
-      console.log(`[AI_Trans] \u8F09\u5165\u5C0F\u578B\u7FFB\u8B6F\u6A21\u578B: ${modelName}`);
-      try {
-        return await pipeline("translation", modelName, {
-          dtype: "q8",
-          device,
-          ...progressCallback ? { progress_callback: progressCallback } : {}
-        });
-      } catch (err) {
-        if (device !== "webgpu") throw err;
-        webgpuFailed = true;
-        console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
-        recordDiagnostic({
-          type: "pipeline-error",
-          error: {
-            port: "translation",
-            code: "local-onnx-webgpu-fallback",
-            recoverable: true,
-            cause: err instanceof Error ? err : new Error(String(err))
-          }
-        });
-        return await pipeline("translation", modelName, {
-          dtype: "q8",
-          device: "wasm",
-          ...progressCallback ? { progress_callback: progressCallback } : {}
-        });
-      }
-    } else {
-      console.log(`[AI_Trans] \u8F09\u5165 ${currentModelTier} LLM \u6A21\u578B: ${modelName}`);
-      try {
-        return await pipeline("text-generation", modelName, {
-          dtype: "q4",
-          device,
-          ...progressCallback ? { progress_callback: progressCallback } : {}
-        });
-      } catch (err) {
-        if (device !== "webgpu") throw err;
-        webgpuFailed = true;
-        console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
-        recordDiagnostic({
-          type: "pipeline-error",
-          error: {
-            port: "translation",
-            code: "local-onnx-webgpu-fallback",
-            recoverable: true,
-            cause: err instanceof Error ? err : new Error(String(err))
-          }
-        });
-        return await pipeline("text-generation", modelName, {
-          dtype: "q4",
-          device: "wasm",
-          ...progressCallback ? { progress_callback: progressCallback } : {}
-        });
-      }
+    console.log(`[AI_Trans] \u8F09\u5165 LLM \u6A21\u578B: ${modelName}`);
+    try {
+      return await pipeline("text-generation", modelName, {
+        dtype: "q4",
+        device,
+        ...progressCallback ? { progress_callback: progressCallback } : {}
+      });
+    } catch (err) {
+      if (device !== "webgpu") throw err;
+      webgpuFailed = true;
+      console.warn("[AI_Trans] WebGPU \u8F09\u5165\u5931\u6557\uFF0C\u56DE\u9000 WASM:", err);
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-webgpu-fallback",
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err))
+        }
+      });
+      return await pipeline("text-generation", modelName, {
+        dtype: "q4",
+        device: "wasm",
+        ...progressCallback ? { progress_callback: progressCallback } : {}
+      });
     }
   }
   function logJsHeapBreadcrumb(label) {
@@ -49267,12 +49203,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   async function ensurePipelineLoaded(progressCallback) {
-    if (disposePromise) {
-      await disposePromise;
-    }
     if (translationPipeline !== null) return translationPipeline;
     const gen = cacheGeneration;
-    const tierGen = tierGeneration;
     if (loadPromise && !loadPromiseHasProgress && progressCallback) {
       try {
         await loadPromise;
@@ -49289,10 +49221,6 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         if (gen !== cacheGeneration) {
           await disposePipeline(p2);
           throw new ModelCacheClearedError();
-        }
-        if (tierGen !== tierGeneration) {
-          await disposePipeline(p2);
-          throw new Error("Model tier changed during load");
         }
         translationPipeline = p2;
         logJsHeapBreadcrumb("local-onnx \u6A21\u578B\u5DF2\u8F09\u5165");
@@ -49427,8 +49355,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   async function downloadModel() {
+    localOnnxDownloadInProgress = true;
     try {
       const aggregator = new DownloadProgressAggregator();
+      globalDownloadAggregator = aggregator;
       const progressCallback = (progress) => {
         const fileKey = progress.file ?? progress.name ?? "unknown";
         if (progress.status === "progress" && progress.loaded !== void 0) {
@@ -49475,6 +49405,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         ok: false,
         error: error.message
       };
+    } finally {
+      localOnnxDownloadInProgress = false;
+      globalDownloadAggregator = null;
     }
   }
   async function clearModelCache() {
@@ -49572,6 +49505,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         };
       }
       const aggregator = new DownloadProgressAggregator();
+      globalDownloadAggregator = aggregator;
       const progressCallback = (progress) => {
         const fileKey = progress.file ?? progress.name ?? "unknown";
         if (progress.status === "progress" && progress.loaded !== void 0) {
@@ -49649,6 +49583,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       };
     } finally {
       asrDownloadInProgress = false;
+      globalDownloadAggregator = null;
     }
   }
   async function clearAsrModelCache(modelId) {
@@ -49827,18 +49762,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     return unique.size / total;
   }
-  async function runInference(text, targetLang, _sourceLang, retriedWithWasm = false, requestedTier) {
-    if (requestedTier === "small" && smallModelBroken) {
-      return {
-        type: "local-onnx:translate-result",
-        ok: false,
-        error: "Small model (MarianMT) is incompatible with this machine's WASM runtime. Please use Large model instead."
-      };
-    }
-    if (requestedTier && requestedTier !== currentModelTier) {
-      console.log(`[AI_Trans] runInference: switching tier from ${currentModelTier} to ${requestedTier} per request`);
-      await setModelTier(requestedTier);
-    }
+  async function runInference(text, targetLang, _sourceLang, retriedWithWasm = false) {
     if (translationPipeline === null) {
       try {
         if (await hasModelInCache()) {
@@ -49873,88 +49797,55 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     try {
       const inferStartedAt = performance.now();
-      if (isSmallModel()) {
-        const pipelineFn = translationPipeline;
-        const result = await pipelineFn(text, {
-          max_new_tokens: 256,
-          do_sample: false,
-          repetition_penalty: 1.2,
-          no_repeat_ngram_size: 3
-        });
-        let translatedText = result[0]?.translation_text ?? "";
-        console.log("[AI_Trans:local-onnx-small] raw output (before S2T):", JSON.stringify(translatedText.slice(0, 200)));
-        if (translatedText.length > 100) {
-          const ngramRatio = calcUniqueNgramRatio(translatedText, 3);
-          if (ngramRatio < 0.2) {
-            console.warn(
-              `[AI_Trans:local-onnx-small] degenerate output detected: ngramRatio=${ngramRatio.toFixed(3)}, length=${translatedText.length}`
-            );
-            return {
-              type: "local-onnx:translate-result",
-              ok: false,
-              error: "Small model produced degenerate output (repetition detected).",
-              degenerate: true
-            };
-          }
-        }
-        if (targetLang === "zh-Hant") {
-          translatedText = s2tConverter(translatedText);
-        }
+      console.log(`[AI_Trans:local-onnx] \u958B\u59CB\u7FFB\u8B6F, text length:`, text.length, "targetLang:", targetLang);
+      const sourceLines = text.split("\n");
+      const prompt = buildPrompt(text, targetLang);
+      console.log(`[AI_Trans:local-onnx] prompt \u69CB\u5EFA\u5B8C\u6210, prompt length:`, prompt.length);
+      const pipelineFn = translationPipeline;
+      console.log(`[AI_Trans:local-onnx] \u958B\u59CB\u63A8\u7406...`);
+      const result = await pipelineFn(prompt, {
+        max_new_tokens: 256,
+        do_sample: false,
+        repetition_penalty: 1.1,
+        return_full_text: false
+      });
+      console.log(`[AI_Trans:local-onnx] \u63A8\u7406\u5B8C\u6210`);
+      const generatedText = result[0]?.generated_text ?? "";
+      console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
+      console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
+      const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
+      if (echoed) {
+        console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
+        console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
+        console.log("[AI_Trans:local-onnx] parsedCount:", parsedCount);
+        console.log("[AI_Trans:local-onnx] sourceLines (first 3):", JSON.stringify(sourceLines.slice(0, 3)));
+        console.log("[AI_Trans:local-onnx] translatedLines (first 3):", JSON.stringify(translatedLines.slice(0, 3)));
+        console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
         const elapsedMs = Math.round(performance.now() - inferStartedAt);
-        console.log(`[AI_Trans:local-onnx-small] \u7FFB\u8B6F\u5B8C\u6210 (${elapsedMs}ms):`, translatedText.slice(0, 100));
-        return {
-          type: "local-onnx:translate-result",
-          ok: true,
-          translatedText,
-          echoed: false
-        };
-      } else {
-        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u958B\u59CB\u7FFB\u8B6F, text length:`, text.length, "targetLang:", targetLang);
-        const sourceLines = text.split("\n");
-        const prompt = currentModelTier === "medium" ? buildPromptSmolLM2(text, targetLang) : buildPrompt(text, targetLang);
-        console.log(`[AI_Trans:local-onnx-${currentModelTier}] prompt \u69CB\u5EFA\u5B8C\u6210, prompt length:`, prompt.length);
-        const pipelineFn = translationPipeline;
-        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u958B\u59CB\u63A8\u7406...`);
-        const result = await pipelineFn(prompt, {
-          max_new_tokens: 256,
-          do_sample: false,
-          repetition_penalty: 1.1,
-          return_full_text: false
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-echo-output",
+            recoverable: true,
+            cause: new Error(
+              `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+                generatedText.slice(0, 200)
+              )}`
+            )
+          }
         });
-        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u63A8\u7406\u5B8C\u6210`);
-        const generatedText = result[0]?.generated_text ?? "";
-        console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
-        console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
-        const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
-        if (echoed) {
-          console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
-          console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
-          console.log("[AI_Trans:local-onnx] parsedCount:", parsedCount);
-          console.log("[AI_Trans:local-onnx] sourceLines (first 3):", JSON.stringify(sourceLines.slice(0, 3)));
-          console.log("[AI_Trans:local-onnx] translatedLines (first 3):", JSON.stringify(translatedLines.slice(0, 3)));
-          console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
-          const elapsedMs = Math.round(performance.now() - inferStartedAt);
-          recordDiagnostic({
-            type: "pipeline-error",
-            error: {
-              port: "translation",
-              code: "local-onnx-echo-output",
-              recoverable: true,
-              cause: new Error(
-                `local ONNX echoed input (parsed ${parsedCount}/${sourceLines.length} lines, similar ${similarCount}/${sourceLines.length}, took ${elapsedMs}ms); raw output: ${JSON.stringify(
-                  generatedText.slice(0, 200)
-                )}`
-              )
-            }
-          });
-        }
-        return {
-          type: "local-onnx:translate-result",
-          ok: true,
-          translatedText: translatedLines.join("\n"),
-          echoed
-        };
       }
+      let finalText = translatedLines.join("\n");
+      if (targetLang === "zh-Hant") {
+        finalText = s2tConverter(finalText);
+      }
+      return {
+        type: "local-onnx:translate-result",
+        ok: true,
+        translatedText: finalText,
+        echoed
+      };
     } catch (err) {
       const error = toReadableError(err);
       const errorMsg = error.message.toLowerCase();
@@ -49993,7 +49884,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             error: `WebGPU inference failed and WASM fallback failed: ${loadError.message}`
           };
         }
-        return runInference(text, targetLang, _sourceLang, true, requestedTier);
+        return runInference(text, targetLang, _sourceLang, true);
       }
       if (isWasmMemoryError && !retriedWithWasm) {
         console.warn("[AI_Trans] WASM \u8A18\u61B6\u9AD4\u932F\u8AA4\uFF0C\u5617\u8A66\u91CD\u65B0\u8F09\u5165\u6A21\u578B:", error.message);
@@ -50023,21 +49914,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
               cause: loadError
             }
           });
-          if (isSmallModel()) {
-            smallModelBroken = true;
-            console.warn("[AI_Trans] Small model reload failed, marked as broken");
-          }
           return {
             type: "local-onnx:translate-result",
             ok: false,
             error: `Model reload failed after WASM memory error: ${loadError.message}`
           };
         }
-        return runInference(text, targetLang, _sourceLang, true, requestedTier);
-      }
-      if (isWasmMemoryError && retriedWithWasm && isSmallModel()) {
-        smallModelBroken = true;
-        console.warn("[AI_Trans] Small model WASM incompatible after retry, marked as broken");
+        return runInference(text, targetLang, _sourceLang, true);
       }
       recordDiagnostic({
         type: "pipeline-error",
@@ -50108,23 +49991,6 @@ ${fewShot.map(([src, dst]) => `9. ${src}
 ${numbered}
 <|im_end|>
 <|im_start|>assistant
-`;
-  }
-  function buildPromptSmolLM2(text, targetLang) {
-    const langName = getLanguageName(targetLang);
-    const numbered = text.split("\n").map((line, i2) => `${i2 + 1}. ${line}`).join("\n");
-    const fewShot = FEW_SHOT_LINES[langName];
-    const fewShotText = fewShot ? `
-Examples:
-${fewShot.map(([src, dst]) => `9. ${src}
-9. ${dst}`).join("\n")}` : "";
-    return `<|system|>
-You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
-<|end|>
-<|user|>
-${numbered}
-<|end|>
-<|assistant|>
 `;
   }
   function parseNumberedOutput(generated, sourceLines) {
@@ -50215,8 +50081,7 @@ ${numbered}
     webgpuFailed = false;
     asrDownloadInProgress = false;
     asrPipeline = null;
-    currentModelTier = "large";
-    currentModelName = LOCAL_TRANSLATION_MODELS.large;
+    currentModelName = LOCAL_ONNX_MODEL;
   }
   var _testExports = {
     hasModelInCache,
@@ -50226,11 +50091,9 @@ ${numbered}
     downloadModel,
     ensurePipelineLoaded,
     buildPrompt,
-    buildPromptSmolLM2,
     parseNumberedOutput,
     warmupModel,
     shutdownForIdle,
-    setModelTier,
     // M1-59：ASR 狀態檢查/下載（供測試驗證 downloading 旗標與狀態字段）。
     checkAsrModelStatus,
     downloadAsrModel,
@@ -50244,15 +50107,11 @@ ${numbered}
     get webgpuFailed() {
       return webgpuFailed;
     },
-    // 當前模型檔位（getter；供測試斷言）
-    get currentModelTier() {
-      return currentModelTier;
-    },
     // 進度聚合器（供測試驗證多檔案下載進度計算）。
     DownloadProgressAggregator,
     // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
     calcUniqueNgramRatio,
-    // 檔位切換時清理舊檔位快取（供測試驗證）。
+    // 清理舊模型快取（供測試驗證）。
     clearCacheForModel
   };
 })();

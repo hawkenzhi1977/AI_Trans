@@ -248,6 +248,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // 代理 fetch：Offscreen/Content-script 受 CORS 限制無法直接 fetch HuggingFace，
   // 由 SW 代理（SW 有 host_permissions 即可跨域 fetch）。結果存入共享 Cache API，
   // 調用方從 Cache 讀取。
+  // 串流下載：分塊讀取響應並廣播進度，讓 UI 顯示真實下載進度（非 0%→100%）。
   if (msg.topic === 'sw:proxy-fetch') {
     const payload = msg.payload as { url: string };
     const url = payload?.url;
@@ -265,9 +266,39 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           });
           return;
         }
-        // 存入共享 Cache API（transformers-cache），供 Offscreen 的 customCache 讀取。
+        // 串流下載：分塊讀取並廣播進度。
+        const contentLength = Number(response.headers.get('content-length')) || 0;
+        const reader = response.body?.getReader();
+        const chunks: ArrayBuffer[] = [];
+        let loaded = 0;
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              // 複製為 ArrayBuffer（避免 SharedArrayBuffer 類型問題）。
+              chunks.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer);
+              loaded += value.length;
+              // 廣播進度（SW 無 UI，但 Offscreen 監聽此消息並轉發給 UI）。
+              chrome.runtime.sendMessage({
+                type: 'sw:download-progress',
+                url,
+                loaded,
+                total: contentLength,
+              }).catch(() => {});
+            }
+          }
+        }
+        // 組合完整 Response 存入 Cache API。
+        const blob = new Blob(chunks);
+        const headers = new Headers(response.headers);
+        const cachedResponse = new Response(blob, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
         const cache = await caches.open('transformers-cache');
-        await cache.put(new Request(url), response.clone());
+        await cache.put(new Request(url), cachedResponse);
         sendResponse({ ok: true });
       } catch (err) {
         sendResponse({

@@ -1,18 +1,11 @@
-/** 本地 ONNX 翻譯模型檔位。 */
-export const LOCAL_TRANSLATION_MODELS = {
-  /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
-  small: 'Xenova/opus-mt-en-zh',
-  /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
-  medium: 'onnx-community/SmolLM2-360M-Instruct',
-  /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
-  large: 'onnx-community/Qwen2.5-0.5B-Instruct',
-} as const;
+/** 本地 ONNX 翻譯模型名稱（唯一，Qwen2.5-0.5B-Instruct，INT4 量化）。 */
+export const LOCAL_ONNX_MODEL = 'onnx-community/Qwen2.5-0.5B-Instruct';
 
-/** 本地 ONNX 翻譯模型檔位類型。 */
-export type LocalModelTier = keyof typeof LOCAL_TRANSLATION_MODELS;
+/** 本地 ONNX 翻譯 chunk size 類型——單次推理的最大字幕行數。 */
+export type LocalOnnxChunkSize = 3 | 4 | 5;
 
-/** 本地 ONNX 翻譯兜底模型名稱（唯讀，預設為小型模型）。 */
-export const DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_TRANSLATION_MODELS.small;
+/** 本地 ONNX 翻譯兜底模型名稱（唯讀）。 */
+export const DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_ONNX_MODEL;
 
 /** 翻譯引擎配置。 */
 export interface TranslationConfig {
@@ -23,10 +16,10 @@ export interface TranslationConfig {
   apiKeyRef?: string;
   /** LLM 失敗時兜底引擎。 */
   fallbackType?: 'mt' | 'local-onnx' | 'none';
-  /** 本地 ONNX 兜底模型名稱（唯讀，預設為小型翻譯模型）。 */
+  /** 本地 ONNX 兜底模型名稱（唯讀）。 */
   localModelName?: string;
-  /** 本地 ONNX 模型檔位（small/large）。small 適合低配置機器，large 適合高質量需求。 */
-  localModelTier?: LocalModelTier;
+  /** 本地 ONNX chunk size（單次推理最大行數，3/4/5）。值越小記憶體峰值越低。 */
+  localOnnxChunkSize?: LocalOnnxChunkSize;
 }
 
 /** ASR 引擎配置。 */

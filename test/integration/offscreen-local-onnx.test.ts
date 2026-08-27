@@ -77,7 +77,6 @@ describe('offscreen local-onnx 模型載入彈性化', () => {
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
     // 這些測試使用 Qwen2.5 模型（large 檔位）
-    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {
@@ -234,7 +233,6 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
     // 這些測試使用 Qwen2.5 模型（large 檔位）
-    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {
@@ -603,7 +601,6 @@ describe('offscreen local-onnx WebGPU 載入後端（M2-26）', () => {
     await chrome.storage.local.clear();
     resetLocalOnnxModuleForTest();
     // 這些測試使用 Qwen2.5 模型（large 檔位）
-    _testExports.setModelTier('large');
   });
 
   afterEach(async () => {
@@ -828,8 +825,8 @@ describe('calcUniqueNgramRatio — 退化輸出檢測', () => {
   });
 });
 
-// 退化輸出檢測——Small model 推理返回退化輸出時標記 degenerate: true。
-describe('runInference：Small model 退化輸出檢測', () => {
+// 回顯（echo）檢測——runInference 統一使用 text-generation + ChatML，模型回顯輸入時標記 echoed: true。
+describe('runInference：回顯（echo）檢測', () => {
   beforeEach(() => {
     resetLocalOnnxModuleForTest();
     transformersMock.pipeline.mockReset();
@@ -839,79 +836,44 @@ describe('runInference：Small model 退化輸出檢測', () => {
     vi.restoreAllMocks();
   });
 
-  it('Small model 輸出重複循環 → 返回 degenerate: true', async () => {
-    // 模擬 Small model 返回重複循環的翻譯結果
-    const degenerateOutput = '我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望';
+  it('Small model 回顯輸入 → 標記 echoed: true', async () => {
+    // 模擬模型未翻譯，直接回傳編號輸入行
     transformersMock.pipeline.mockResolvedValue(
-      vi.fn().mockResolvedValue([{ translation_text: degenerateOutput }])
+      vi.fn().mockResolvedValue([{ generated_text: '1. test input' }])
     );
 
-    // 設置為 small model
-    _testExports.setModelTier('small');
-    // 模擬模型已載入（跳過實際載入）
-    await _testExports.ensurePipelineLoaded();
-
-    const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
-    expect(res.ok).toBe(false);
-    expect((res as { degenerate?: boolean }).degenerate).toBe(true);
-    expect(res.error).toContain('degenerate');
-  });
-
-  it('Small model 正常輸出 → 返回 ok: true，不標記 degenerate', async () => {
-    // 模擬 Small model 返回正常翻譯結果
-    const normalOutput = '這是蘋果公司最新的M6晶片，採用2奈米製程技術，性能大幅提升。';
-    transformersMock.pipeline.mockResolvedValue(
-      vi.fn().mockResolvedValue([{ translation_text: normalOutput }])
-    );
-
-    _testExports.setModelTier('small');
     await _testExports.ensurePipelineLoaded();
 
     const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
     expect(res.ok).toBe(true);
-    expect((res as { degenerate?: boolean }).degenerate).toBeUndefined();
-    expect(res.translatedText).toBe(normalOutput);
+    expect(res.echoed).toBe(true);
   });
 
-  it('Small model 短輸出（< 100 字符）→ 不做退化檢測，直接返回', async () => {
-    // 短輸出即使有重複也不檢測（< 100 字符，20 個 "你好" = 40 字符）
-    const shortOutput = '你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好';
+  it('Small model 正常輸出 → 返回 ok: true，不標記 echoed', async () => {
+    // 模擬模型返回正常編號譯文
     transformersMock.pipeline.mockResolvedValue(
-      vi.fn().mockResolvedValue([{ translation_text: shortOutput }])
+      vi.fn().mockResolvedValue([{ generated_text: '1. 這是測試輸入' }])
     );
 
-    _testExports.setModelTier('small');
     await _testExports.ensurePipelineLoaded();
 
-    const res = await _testExports.runInference('test', 'zh-Hant', undefined, false, 'small');
-    // 短輸出（< 100 字符）不做退化檢測，直接返回 ok: true
+    const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
     expect(res.ok).toBe(true);
-  });
-});
-
-// M2-39：buildPromptSmolLM2 — SmolLM2 chat template 格式。
-describe('buildPromptSmolLM2 — SmolLM2 chat template', () => {
-  const { buildPromptSmolLM2 } = _testExports;
-
-  it('生成包含 <|system|>、<|user|>、<|assistant|> 標籤的 prompt', () => {
-    const prompt = buildPromptSmolLM2('1. Hello world', 'zh-Hant');
-    expect(prompt).toContain('<|system|>');
-    expect(prompt).toContain('<|user|>');
-    expect(prompt).toContain('<|assistant|>');
-    expect(prompt).toContain('1. Hello world');
-    expect(prompt).toContain('Traditional Chinese');
+    expect(res.echoed).toBe(false);
+    expect(res.translatedText).toBe('這是測試輸入');
   });
 
-  it('包含 few-shot 示例（Traditional Chinese）', () => {
-    const prompt = buildPromptSmolLM2('1. Test', 'zh-Hant');
-    expect(prompt).toContain('Hello, world.');
-    expect(prompt).toContain('你好，世界。');
-  });
+  it('Small model 簡繁轉換安全網：zh-Hant 目標輸出簡體時轉繁體', async () => {
+    // 模型輸出簡體中文，應被 s2tConverter 轉為繁體
+    transformersMock.pipeline.mockResolvedValue(
+      vi.fn().mockResolvedValue([{ generated_text: '1. 这是测试输入' }])
+    );
 
-  it('不包含 ChatML 標籤（<|im_start|>）', () => {
-    const prompt = buildPromptSmolLM2('1. Test', 'zh-Hant');
-    expect(prompt).not.toContain('<|im_start|>');
-    expect(prompt).not.toContain('<|im_end|>');
+    await _testExports.ensurePipelineLoaded();
+
+    const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
+    expect(res.ok).toBe(true);
+    expect(res.translatedText).toBe('這是測試輸入');
   });
 });
 
@@ -931,8 +893,8 @@ describe('clearCacheForModel — 按模型名稱清理快取', () => {
     const deleteFn = vi.fn(async () => true);
     const cache = {
       keys: vi.fn(async () => [
-        makeRequest('https://huggingface.co/Xenova/opus-mt-en-zh/resolve/main/model.onnx'),
         makeRequest('https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/model.onnx'),
+        makeRequest('https://huggingface.co/onnx-community/other-model/resolve/main/model.onnx'),
       ]),
       delete: deleteFn,
     };
@@ -941,17 +903,17 @@ describe('clearCacheForModel — 按模型名稱清理快取', () => {
       open: vi.fn(async () => cache),
     });
 
-    await clearCacheForModel('Xenova/opus-mt-en-zh');
+    await clearCacheForModel('Qwen2.5-0.5B-Instruct');
 
     expect(deleteFn).toHaveBeenCalledTimes(1);
-    expect(deleteFn.mock.calls[0][0].url).toContain('opus-mt-en-zh');
+    expect(deleteFn.mock.calls[0][0].url).toContain('Qwen2.5-0.5B-Instruct');
   });
 
   it('不匹配 modelName 的條目不被清除', async () => {
     const deleteFn = vi.fn(async () => true);
     const cache = {
       keys: vi.fn(async () => [
-        makeRequest('https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/model.onnx'),
+        makeRequest('https://huggingface.co/onnx-community/other-model/resolve/main/model.onnx'),
       ]),
       delete: deleteFn,
     };
@@ -960,59 +922,8 @@ describe('clearCacheForModel — 按模型名稱清理快取', () => {
       open: vi.fn(async () => cache),
     });
 
-    await clearCacheForModel('Xenova/opus-mt-en-zh');
+    await clearCacheForModel('Qwen2.5-0.5B-Instruct');
 
     expect(deleteFn).not.toHaveBeenCalled();
-  });
-});
-
-// M2-39：setModelTier async — 切換檔位時清理舊檔位快取。
-describe('setModelTier async — 切換檔位清理舊檔位快取', () => {
-  beforeEach(() => {
-    resetLocalOnnxModuleForTest();
-    transformersMock.pipeline.mockReset();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('setModelTier 返回 Promise', async () => {
-    const result = _testExports.setModelTier('small');
-    expect(result).toBeInstanceOf(Promise);
-    await result;
-  });
-
-  it('切換檔位後 currentModelTier 更新', async () => {
-    await _testExports.setModelTier('small');
-    expect(_testExports.currentModelTier).toBe('small');
-
-    await _testExports.setModelTier('medium');
-    expect(_testExports.currentModelTier).toBe('medium');
-
-    await _testExports.setModelTier('large');
-    expect(_testExports.currentModelTier).toBe('large');
-  });
-});
-
-// M2-39：Medium tier — runInference 使用 SmolLM2 prompt 格式。
-describe('runInference：Medium tier 使用 SmolLM2 prompt', () => {
-  beforeEach(() => {
-    resetLocalOnnxModuleForTest();
-    transformersMock.pipeline.mockReset();
-  });
-
-  it('Medium tier 推理使用 text-generation pipeline', async () => {
-    const mockPipelineFn = vi.fn().mockResolvedValue([{ generated_text: '1. 測試翻譯' }]);
-    transformersMock.pipeline.mockResolvedValue(mockPipelineFn);
-
-    await _testExports.setModelTier('medium');
-    await _testExports.ensurePipelineLoaded();
-
-    const res = await _testExports.runInference('1. Test translation', 'zh-Hant', undefined, false, 'medium');
-
-    expect(res.ok).toBe(true);
-    // parseNumberedOutput 會提取行號後的譯文（不含行號前綴）
-    expect(res.translatedText).toBe('測試翻譯');
   });
 });
