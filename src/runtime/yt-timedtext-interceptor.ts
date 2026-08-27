@@ -411,6 +411,10 @@ const POT_REDRIVE_DELAY_MS = 2_000;
 const MAX_POT_REDRIVE_ATTEMPTS = 6;
 /** 空響應累計計數（調試輔助：pot 防護命中次數）。 */
 let emptyResponseCount = 0;
+/** XHR 請求被中止的累計計數（調試輔助：播放器中止請求次數）。 */
+let xhrAbortCount = 0;
+/** XHR 請求錯誤的累計計數（調試輔助：網絡錯誤次數）。 */
+let xhrErrorCount = 0;
 /** pot 重驅動已執行的嘗試次數。 */
 let potRedriveAttempts = 0;
 let potRedriveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -753,9 +757,14 @@ function install(): void {
     const urlStr = (this as unknown as { __aiTransUrl?: string }).__aiTransUrl;
     if (urlStr) {
       diagLog('interceptor', 'XHR timedtext request sending:', urlStr);
-      // R4：load 監聽器在請求完成後移除自身，不產生累積洩漏。
-      const onLoad = (): void => {
+      // R4：監聽器在請求完成/中止/錯誤後移除自身，不產生累積洩漏。
+      const cleanup = (): void => {
         this.removeEventListener('load', onLoad);
+        this.removeEventListener('abort', onAbort);
+        this.removeEventListener('error', onError);
+      };
+      const onLoad = (): void => {
+        cleanup();
         try {
           const responseType = (this as unknown as { responseType?: string }).responseType ?? '';
           const status = (this as unknown as { status?: number }).status ?? 0;
@@ -770,7 +779,23 @@ function install(): void {
           // §5.7：外部響應解析失敗不允許冒泡破壞播放器——吞掉（捕獲失敗僅意味著本輪不複用）。
         }
       };
+      const onAbort = (): void => {
+        cleanup();
+        xhrAbortCount++;
+        diagLog('interceptor', 'XHR timedtext request ABORTED:', urlStr, 'total aborts:', xhrAbortCount);
+        // 中止視為「需要重試」信號，觸發 pot re-drive
+        schedulePotRedrive();
+      };
+      const onError = (): void => {
+        cleanup();
+        xhrErrorCount++;
+        diagLog('interceptor', 'XHR timedtext request ERROR:', urlStr, 'total errors:', xhrErrorCount);
+        // 錯誤視為「需要重試」信號，觸發 pot re-drive
+        schedulePotRedrive();
+      };
       this.addEventListener('load', onLoad);
+      this.addEventListener('abort', onAbort);
+      this.addEventListener('error', onError);
     }
     return origSend.apply(this, args);
   };

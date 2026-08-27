@@ -236,6 +236,8 @@
   var POT_REDRIVE_DELAY_MS = 2e3;
   var MAX_POT_REDRIVE_ATTEMPTS = 6;
   var emptyResponseCount = 0;
+  var xhrAbortCount = 0;
+  var xhrErrorCount = 0;
   var potRedriveAttempts = 0;
   var potRedriveTimer = null;
   var suppressNativeTimer = null;
@@ -487,8 +489,13 @@
       const urlStr = this.__aiTransUrl;
       if (urlStr) {
         diagLog("interceptor", "XHR timedtext request sending:", urlStr);
-        const onLoad = () => {
+        const cleanup = () => {
           this.removeEventListener("load", onLoad);
+          this.removeEventListener("abort", onAbort);
+          this.removeEventListener("error", onError);
+        };
+        const onLoad = () => {
+          cleanup();
           try {
             const responseType = this.responseType ?? "";
             const status = this.status ?? 0;
@@ -500,7 +507,21 @@
           } catch {
           }
         };
+        const onAbort = () => {
+          cleanup();
+          xhrAbortCount++;
+          diagLog("interceptor", "XHR timedtext request ABORTED:", urlStr, "total aborts:", xhrAbortCount);
+          schedulePotRedrive();
+        };
+        const onError = () => {
+          cleanup();
+          xhrErrorCount++;
+          diagLog("interceptor", "XHR timedtext request ERROR:", urlStr, "total errors:", xhrErrorCount);
+          schedulePotRedrive();
+        };
         this.addEventListener("load", onLoad);
+        this.addEventListener("abort", onAbort);
+        this.addEventListener("error", onError);
       }
       return origSend.apply(this, args);
     };

@@ -139,6 +139,7 @@ describe('LocalONNXTranslationProvider', () => {
         payload: {
           text: 'line-0\nline-1',
           targetLang: 'zh-Hant',
+          modelTier: 'large',
         },
       })
     );
@@ -238,5 +239,52 @@ describe('LocalONNXTranslationProvider', () => {
 
     // 驗證 port 引用被清除（下次請求會重新建立連接）
     expect((provider as unknown as { port: unknown }).port).toBeNull();
+  });
+
+  it('Small model 退化輸出 → 回退原文 + 記錄診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'Xenova/opus-mt-en-zh',
+      modelTier: 'small',
+    });
+
+    // 注入 mock port
+    (provider as unknown as { port: unknown }).port = mockPort;
+
+    // 模擬 port 返回退化輸出
+    mockPort.postMessage.mockImplementation((msg: unknown) => {
+      setTimeout(() => {
+        const msgObj = msg as { topic?: string; messageId?: string };
+        if (msgObj.topic === 'local-onnx:translate') {
+          const response = {
+            messageId: msgObj.messageId,
+            result: {
+              ok: false,
+              error: 'Small model produced degenerate output (repetition detected).',
+              degenerate: true,
+            },
+          };
+          mockPort._simulateMessage(response);
+        }
+      }, 0);
+    });
+
+    const segments = [seg(0), seg(1), seg(2)];
+    const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+    // 驗證所有 segment 回退到原文
+    expect(result.segments).toHaveLength(3);
+    for (const s of result.segments) {
+      expect(s.translatedText).toBe(s.sourceText);
+    }
+
+    // 驗證記錄了診斷
+    expect(recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'pipeline-error',
+        error: expect.objectContaining({
+          code: 'small-model-degenerate',
+        }),
+      })
+    );
   });
 });

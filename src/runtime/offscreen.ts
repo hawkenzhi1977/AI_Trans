@@ -5,6 +5,10 @@
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { IdleTimeout } from '../infrastructure/idle-timeout';
 import { LOCAL_TRANSLATION_MODELS, type LocalModelTier } from '../domain/models/config';
+import OpenCC from 'opencc-js';
+
+/** 簡體→繁體轉換器（opus-mt-en-zh 模型輸出簡體，zh-Hant 目標需要轉換）。 */
+const s2tConverter = OpenCC.Converter({ from: 'cn', to: 't' });
 
 /** Offscreen Document 接收的消息類型（ASR + 本地 ONNX 翻譯）。 */
 type OffscreenRequest =
@@ -14,7 +18,7 @@ type OffscreenRequest =
   | { type: 'local-onnx:warmup' }
   | { type: 'local-onnx:download' }
   | { type: 'local-onnx:clear-cache' }
-  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string }
+  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string; modelTier?: 'small' | 'large' }
   | { type: 'local-onnx:set-model-tier'; tier: LocalModelTier }
   | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
@@ -33,7 +37,7 @@ type OffscreenResponse =
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
-  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
+  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean; degenerate?: boolean }
   | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
   | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
@@ -336,15 +340,19 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
       }
       const translateMsg = message as {
         topic: string;
-        payload?: { text?: string; targetLang?: string; sourceLang?: string };
+        payload?: { text?: string; targetLang?: string; sourceLang?: string; modelTier?: 'small' | 'large' };
         text?: string;
         targetLang?: string;
         sourceLang?: string;
+        modelTier?: 'small' | 'large';
       };
+      const requestedTier = translateMsg.payload?.modelTier ?? translateMsg.modelTier;
       void runInference(
         translateMsg.payload?.text ?? translateMsg.text ?? '',
         translateMsg.payload?.targetLang ?? translateMsg.targetLang ?? '',
-        translateMsg.payload?.sourceLang ?? translateMsg.sourceLang
+        translateMsg.payload?.sourceLang ?? translateMsg.sourceLang,
+        false,
+        requestedTier
       ).then(respond);
       return true;
     }
@@ -389,7 +397,7 @@ function connectToServiceWorker(): void {
       topic?: string;
       type?: string;
       messageId?: string;
-      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string; tier?: LocalModelTier };
+      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string; tier?: LocalModelTier; modelTier?: 'small' | 'large' };
       text?: string;
       targetLang?: string;
       sourceLang?: string;
@@ -431,15 +439,20 @@ function connectToServiceWorker(): void {
           broadcastToAll({ type: 'local-onnx:status', downloaded: false, modelName: tierResult.modelName });
           break;
         }
-        case 'local-onnx:translate':
+        case 'local-onnx:translate': {
           // 統一消息形狀：優先 payload（provider 用 { payload: { text } }），兼容舊頂層 text。
+          // 接收請求中的 modelTier，確保 offscreen 使用正確的推理路徑。
+          const requestedTier = msg.payload?.modelTier as 'small' | 'large' | undefined;
           result = await runInference(
             msg.payload?.text ?? msg.text ?? '',
             msg.payload?.targetLang ?? msg.targetLang ?? '',
-            msg.payload?.sourceLang ?? msg.sourceLang
+            msg.payload?.sourceLang ?? msg.sourceLang,
+            false,
+            requestedTier
           );
           broadcastToAll(result as OffscreenResponse);
           break;
+        }
         case 'asr-whisper:check-status':
           result = await checkAsrModelStatus(msg.payload?.modelId ?? 'Xenova/whisper-base.en');
           broadcastToAll(result as OffscreenResponse);
@@ -522,6 +535,18 @@ let loadPromiseHasProgress = false;
  */
 let cacheGeneration = 0;
 
+/**
+ * 待處理的 dispose Promise——setModelTier 啟動，ensurePipelineLoaded/runInference await。
+ * 避免 dispose 與新 pipeline 載入的 WASM 狀態衝突。
+ */
+let disposePromise: Promise<void> | null = null;
+
+/**
+ * 模型檔位世代計數器——每次 setModelTier 實際切換時遞增。
+ * 使 in-flight 載入在 tier 切換後自動作廢（類似 cacheGeneration 機制）。
+ */
+let tierGeneration = 0;
+
 /** 當前使用的模型檔位（可從 Options 切換，預設為 small）。 */
 let currentModelTier: LocalModelTier = 'small';
 
@@ -536,18 +561,34 @@ function isSmallModel(): boolean {
 /**
  * 設置模型檔位——切換後需要釋放當前 pipeline 以便下次載入使用新模型。
  * 返回當前檔位和模型名稱。
+ * 
+ * 競態安全修復：
+ * ① 捕獲舊 pipeline 引用（非模組級變量），避免 .then() 誤殺新載入的 pipeline
+ * ② 立即清空模組級狀態（translationPipeline/loadPromise），防止新請求誤用舊 pipeline
+ * ③ dispose 失敗不阻塞狀態重置（.catch() 兜底）
+ * ④ 遞增 tierGeneration，使 in-flight 載入自動作廢
  */
 function setModelTier(tier: LocalModelTier): { tier: LocalModelTier; modelName: string } {
   if (tier !== currentModelTier) {
     console.log(`[AI_Trans] 切換模型檔位: ${currentModelTier} → ${tier}`);
     currentModelTier = tier;
     currentModelName = LOCAL_TRANSLATION_MODELS[tier];
-    // 釋放當前 pipeline，下次推理時會載入新模型
-    if (translationPipeline !== null) {
-      void disposePipeline(translationPipeline).then(() => {
-        translationPipeline = null;
-        loadPromise = null;
-        loadPromiseHasProgress = false;
+    tierGeneration++;
+    
+    // 捕獲舊 pipeline 引用（非模組級變量），避免 .then() 誤殺新 pipeline
+    const oldPipeline = translationPipeline;
+    
+    // 立即清空模組級狀態
+    translationPipeline = null;
+    loadPromise = null;
+    loadPromiseHasProgress = false;
+    
+    // 異步 dispose 舊 pipeline（捕獲引用，安全 fire-and-forget）
+    if (oldPipeline !== null) {
+      disposePromise = disposePipeline(oldPipeline).catch((err) => {
+        console.warn('[AI_Trans] setModelTier dispose error:', err instanceof Error ? err.message : String(err));
+      }).finally(() => {
+        disposePromise = null;
       });
     }
   }
@@ -560,6 +601,13 @@ function setModelTier(tier: LocalModelTier): { tier: LocalModelTier; modelName: 
  * 僅影響本 Offscreen Document 生命週期；Document 重建後重置。
  */
 let webgpuFailed = false;
+
+/**
+ * Small model (MarianMT) WASM 不相容標記——首次 WASM 錯誤重試失敗後置 true，
+ * 後續請求直接返回錯誤，避免重複嘗試不可用的模型。
+ * 某些機器的 WASM runtime 與 MarianMT 模型存在根本性不相容（如 unaligned accesses）。
+ */
+let smallModelBroken = false;
 
 /**
  * 決定模型載入後端設備——WebGPU 優先（權重進 GPU VRAM，不佔 extension 渲染進程
@@ -767,11 +815,16 @@ class ModelCacheClearedError extends Error {
 /**
  * 釋放 pipeline 佔用的 wasm/ORT 記憶體（transformers.js Pipeline.dispose → model.dispose）。
  * 舊 session 不釋放會使反覆清/載後 wasm 堆膨脹，最終觸發 OOM 型 wasm trap。
+ * 冪等安全：dispose 失敗不拋錯（避免 double-dispose 導致 "cannot release session" 崩潰）。
  */
 async function disposePipeline(pipeline: unknown): Promise<void> {
   const candidate = pipeline as { dispose?: () => unknown | Promise<unknown> };
   if (typeof candidate?.dispose === 'function') {
-    await candidate.dispose();
+    try {
+      await candidate.dispose();
+    } catch (err) {
+      console.warn('[AI_Trans] disposePipeline error (ignored for idempotency):', err instanceof Error ? err.message : String(err));
+    }
   }
 }
 
@@ -785,13 +838,22 @@ async function disposePipeline(pipeline: unknown): Promise<void> {
  *    重新下載複用陳舊載入」導致的 wasm trap（如 [non-Error number] 1025635888）。
  * ② 進度防護——已存在「無進度回調」的載入（如 check-status 預熱）時，若本次調用
  *    需要進度回調，等待其結束後以帶進度的新鮮載入承接，避免下載無進度可看。
+ * ③ tier 世代失效——載入期間若模型檔位切換（tierGeneration 遞增），載入結果立即
+ *    dispose 且不落地，避免載入錯誤的模型。
+ * ④ dispose 等待——載入前先等待 pending dispose 完成，避免 WASM 狀態衝突。
  */
 async function ensurePipelineLoaded(
   progressCallback?: (p: TransformersProgress) => void
 ): Promise<unknown> {
+  // 等待 pending dispose 完成（避免 WASM 狀態衝突）
+  if (disposePromise) {
+    await disposePromise;
+  }
+  
   if (translationPipeline !== null) return translationPipeline;
 
   const gen = cacheGeneration;
+  const tierGen = tierGeneration;
 
   // 進度防護：既有載入無進度回調，但本次需要 → 等它結束再以帶進度的載入承接。
   if (loadPromise && !loadPromiseHasProgress && progressCallback) {
@@ -814,6 +876,11 @@ async function ensurePipelineLoaded(
         if (gen !== cacheGeneration) {
           await disposePipeline(p);
           throw new ModelCacheClearedError();
+        }
+        // 載入期間模型檔位切換 → 作廢：dispose 且不落地。
+        if (tierGen !== tierGeneration) {
+          await disposePipeline(p);
+          throw new Error('Model tier changed during load');
         }
         translationPipeline = p;
         // 麵包屑：模型載入完成後的 JS 堆記憶體（驗證 WebGPU 前後差異）。
@@ -1470,18 +1537,57 @@ async function runAsrInference(
 }
 
 /**
+ * 計算文本中唯一 n-gram 佔總 n-gram 的比例。
+ * 比例越低表示重複越嚴重（退化輸出）。
+ *
+ * 正常翻譯：80-100% 唯一
+ * "我希望我希望我希望..."：~0.2% 唯一
+ * "捉捉捉捉捉..."：~0.1% 唯一
+ */
+function calcUniqueNgramRatio(text: string, n: number): number {
+  if (text.length < n) return 1.0;
+  const unique = new Set<string>();
+  let total = 0;
+  for (let i = 0; i <= text.length - n; i++) {
+    unique.add(text.slice(i, i + n));
+    total++;
+  }
+  return unique.size / total;
+}
+
+/**
  * 執行翻譯推理——使用本地 ONNX 模型翻譯文本。
  * 根據模型檔位使用不同的推理邏輯：
  * - small (MarianMT): 直接輸入文本，返回 translation_text
  * - large (Qwen2.5): 構造 ChatML Prompt，解析 generated_text
+ * 
+ * @param requestedTier - 請求中指定的模型檔位。如果與當前檔位不同，會先切換模型。
  */
 async function runInference(
   text: string,
   targetLang: string,
   _sourceLang: string | undefined,
-  retriedWithWasm = false
+  retriedWithWasm = false,
+  requestedTier?: 'small' | 'large'
 ): Promise<OffscreenResponse> {
+  // 早期退出：Small model WASM 不相容時直接返回錯誤
+  if (requestedTier === 'small' && smallModelBroken) {
+    return {
+      type: 'local-onnx:translate-result',
+      ok: false,
+      error: 'Small model (MarianMT) is incompatible with this machine\'s WASM runtime. Please use Large model instead.',
+    } satisfies OffscreenResponse;
+  }
+
+  // 如果請求指定了不同的模型檔位，先切換模型
+  // setModelTier 已處理 dispose 和狀態清空，不再重複
+  if (requestedTier && requestedTier !== currentModelTier) {
+    console.log(`[AI_Trans] runInference: switching tier from ${currentModelTier} to ${requestedTier} per request`);
+    setModelTier(requestedTier);
+  }
+
   // lazy 恢復：pipeline 未載入但快取存在 → 自動載入（Offscreen 重啟後無需重新下載）。
+  // ensurePipelineLoaded 內部會 await disposePromise，確保 dispose 完成後再載入。
   if (translationPipeline === null) {
     try {
       if (await hasModelInCache()) {
@@ -1528,8 +1634,37 @@ async function runInference(
         options?: Record<string, unknown>
       ) => Promise<Array<{ translation_text: string }>>;
 
-      const result = await pipelineFn(text, {});
-      const translatedText = result[0]?.translation_text ?? '';
+      const result = await pipelineFn(text, {
+        max_new_tokens: 256,
+        repetition_penalty: 1.2,
+        no_repeat_ngram_size: 3,
+      });
+      let translatedText = result[0]?.translation_text ?? '';
+      
+      // 調試：輸出原始輸出（簡繁轉換前）
+      console.log('[AI_Trans:local-onnx-small] raw output (before S2T):', JSON.stringify(translatedText.slice(0, 200)));
+      
+      // 退化輸出檢測：檢查 3-gram 唯一率（在簡繁轉換前，避免轉換引入噪音）
+      if (translatedText.length > 100) {
+        const ngramRatio = calcUniqueNgramRatio(translatedText, 3);
+        if (ngramRatio < 0.2) {
+          console.warn(
+            `[AI_Trans:local-onnx-small] degenerate output detected: ` +
+            `ngramRatio=${ngramRatio.toFixed(3)}, length=${translatedText.length}`
+          );
+          return {
+            type: 'local-onnx:translate-result',
+            ok: false,
+            error: 'Small model produced degenerate output (repetition detected).',
+            degenerate: true,
+          } satisfies OffscreenResponse;
+        }
+      }
+      
+      // 簡繁轉換：opus-mt-en-zh 輸出簡體中文，zh-Hant 目標需要轉換為繁體
+      if (targetLang === 'zh-Hant') {
+        translatedText = s2tConverter(translatedText);
+      }
       
       const elapsedMs = Math.round(performance.now() - inferStartedAt);
       console.log(`[AI_Trans:local-onnx-small] 翻譯完成 (${elapsedMs}ms):`, translatedText.slice(0, 100));
@@ -1542,20 +1677,24 @@ async function runInference(
       } satisfies OffscreenResponse;
     } else {
       // 大型通用 LLM 模型 (Qwen2.5)：構造 ChatML Prompt
+      console.log('[AI_Trans:local-onnx-large] 開始翻譯, text length:', text.length, 'targetLang:', targetLang);
       const sourceLines = text.split('\n');
       const prompt = buildPrompt(text, targetLang);
+      console.log('[AI_Trans:local-onnx-large] prompt 構建完成, prompt length:', prompt.length);
 
       const pipelineFn = translationPipeline as (
         input: string,
         options?: Record<string, unknown>
       ) => Promise<Array<{ generated_text: string }>>;
 
+      console.log('[AI_Trans:local-onnx-large] 開始推理...');
       const result = await pipelineFn(prompt, {
         max_new_tokens: 256,
         do_sample: false,
         repetition_penalty: 1.1,
         return_full_text: false,
       });
+      console.log('[AI_Trans:local-onnx-large] 推理完成');
 
       // 解析生成結果——按行號還原譯文。
       const generatedText = result[0]?.generated_text ?? '';
@@ -1607,6 +1746,14 @@ async function runInference(
                           errorMsg.includes('device lost') ||
                           errorMsg.includes('gpu');
     
+    // 檢測 WASM 記憶體錯誤（memory access out of bounds / wasm trap / unaligned 等）
+    // 這類錯誤通常需要重新載入模型來恢復
+    const isWasmMemoryError = errorMsg.includes('memory access out of bounds') ||
+                              errorMsg.includes('wasm trap') ||
+                              errorMsg.includes('out of memory') ||
+                              errorMsg.includes('unreachable') ||
+                              errorMsg.includes('unaligned');
+    
     if (isWebGpuError && !retriedWithWasm) {
       webgpuFailed = true;
       console.warn('[AI_Trans] WebGPU 推論失敗，回退 WASM:', error.message);
@@ -1644,7 +1791,60 @@ async function runInference(
         } satisfies OffscreenResponse;
       }
       // 重試推論一次（遞歸調用，帶重試標誌避免無限循環）
-      return runInference(text, targetLang, _sourceLang, true);
+      return runInference(text, targetLang, _sourceLang, true, requestedTier);
+    }
+    
+    // WASM 記憶體錯誤：嘗試重新載入模型並重試一次
+    if (isWasmMemoryError && !retriedWithWasm) {
+      console.warn('[AI_Trans] WASM 記憶體錯誤，嘗試重新載入模型:', error.message);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-wasm-memory-error',
+          recoverable: true,
+          cause: error,
+        },
+      });
+      // 釋放當前 pipeline
+      await disposePipeline(translationPipeline);
+      translationPipeline = null;
+      loadPromise = null;
+      loadPromiseHasProgress = false;
+      
+      // 重新載入模型
+      try {
+        await ensurePipelineLoaded();
+      } catch (loadErr) {
+        const loadError = toReadableError(loadErr);
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'translation',
+            code: 'local-onnx-model-reload-failed',
+            recoverable: false,
+            cause: loadError,
+          },
+        });
+        // Small model 重載失敗後標記 broken
+        if (isSmallModel()) {
+          smallModelBroken = true;
+          console.warn('[AI_Trans] Small model reload failed, marked as broken');
+        }
+        return {
+          type: 'local-onnx:translate-result',
+          ok: false,
+          error: `Model reload failed after WASM memory error: ${loadError.message}`,
+        } satisfies OffscreenResponse;
+      }
+      // 重試推論一次
+      return runInference(text, targetLang, _sourceLang, true, requestedTier);
+    }
+    
+    // WASM 錯誤重試後仍失敗：標記 Small model 為 broken
+    if (isWasmMemoryError && retriedWithWasm && isSmallModel()) {
+      smallModelBroken = true;
+      console.warn('[AI_Trans] Small model WASM incompatible after retry, marked as broken');
     }
     
     recordDiagnostic({
@@ -1746,6 +1946,9 @@ function parseNumberedOutput(
   generated: string,
   sourceLines: string[]
 ): { translatedLines: string[]; echoed: boolean; parsedCount: number; similarCount: number } {
+  console.log('[AI_Trans:local-onnx] parseNumberedOutput: starting, generated length:', generated.length);
+  console.log('[AI_Trans:local-onnx] parseNumberedOutput: sourceLines count:', sourceLines.length);
+  
   const parsed = new Map<number, string>();
   for (const line of generated.split('\n')) {
     const m = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
@@ -1755,21 +1958,26 @@ function parseNumberedOutput(
       if (idx >= 0 && val.length > 0) parsed.set(idx, val);
     }
   }
+  console.log('[AI_Trans:local-onnx] parseNumberedOutput: parsed numbered lines count:', parsed.size);
   
   // F6: 回退解析器——如果沒有編號行但輸出包含中文，直接使用原始輸出
   if (parsed.size === 0) {
     const hasChinese = /[\u4e00-\u9fff]/.test(generated);
+    console.log('[AI_Trans:local-onnx] parseNumberedOutput: no numbered lines, hasChinese:', hasChinese);
     if (hasChinese) {
       // 使用原始輸出作為翻譯（按行分割）
       const rawLines = generated.split('\n').map(l => l.trim()).filter(l => l.length > 0);
       // 映射到源行（如果行數不足則回退到原文）
       const translatedLines = sourceLines.map((src, i) => rawLines[i] || src);
-      console.log('[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation');
+      console.log('[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation, rawLines count:', rawLines.length);
       return { translatedLines, echoed: false, parsedCount: 0, similarCount: 0 };
+    } else {
+      console.log('[AI_Trans:local-onnx] parseNumberedOutput: no Chinese detected, will fallback to source');
     }
   }
   
   const translatedLines = sourceLines.map((src, i) => parsed.get(i)?.trim() || src);
+  console.log('[AI_Trans:local-onnx] parseNumberedOutput: final translatedLines count:', translatedLines.length);
   
   // F4 + F7: 改進 echo 偵測邏輯
   // 檢查模型是否回顯原文（parsed 的行與 sourceLines 相同）
@@ -1889,4 +2097,6 @@ export const _testExports = {
   },
   // 進度聚合器（供測試驗證多檔案下載進度計算）。
   DownloadProgressAggregator,
+  // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
+  calcUniqueNgramRatio,
 };

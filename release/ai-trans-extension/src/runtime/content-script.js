@@ -2283,13 +2283,29 @@ Output example:
 
   // src/adapters/translation/local-onnx-translation.ts
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
+  var smallModelStats = {
+    totalChunks: 0,
+    mergedChunks: 0,
+    // 輸出行數 < 輸入行數的 chunks
+    perfectChunks: 0,
+    // 輸出行數 = 輸入行數的 chunks
+    totalFallbacks: 0
+    // 回退原文的行數
+  };
+  var consecutiveDegenerateCount = 0;
   var LocalONNXTranslationProvider = class _LocalONNXTranslationProvider {
     engineId = "local-onnx";
     location = "local";
     /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
-    static CHUNK_SIZE = 5;
+    static CHUNK_SIZE_LARGE = 5;
+    /** Small model (MarianMT/opus-mt) 的 chunk size：3 行。
+      * MarianMT 傾向將多行合併為 1 行輸出，但速度從 0.10 seg/s 提升到 ~0.25 seg/s。
+      * 配合 splitBySentenceBoundary 嘗試分割，不足的行回退原文。
+      */
+    static CHUNK_SIZE_SMALL = 3;
     defaultTargetLang;
     isPrimary;
+    modelTier;
     /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
     port = null;
     messageIdCounter = 0;
@@ -2297,18 +2313,34 @@ Output example:
       void config.modelName;
       this.defaultTargetLang = config.targetLang ?? "zh-Hant";
       this.isPrimary = config.isPrimary ?? false;
+      this.modelTier = config.modelTier ?? "large";
+    }
+    /** 根據模型檔位返回 chunk size：small model 逐句翻譯，large model 可合併多行。 */
+    get chunkSize() {
+      return this.modelTier === "small" ? _LocalONNXTranslationProvider.CHUNK_SIZE_SMALL : _LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
     }
     /**
      * 建立與 Service Worker 的 port 長連接。
      * 使用 port 而非 sendMessage，避免推理時間過長導致消息通道關閉。
+     * 添加 port 有效性檢查：當 port 已斷開但 onDisconnect 回調尚未觸發時，
+     * 主動清除並重建連接，避免 "Attempting to use a disconnected port object" 錯誤。
      */
     ensurePort() {
-      if (this.port) return this.port;
-      this.port = chrome.runtime.connect({ name: "content-onnx" });
-      this.port.onDisconnect.addListener(() => {
-        diagLog("local-onnx", "port disconnected, will reconnect on next request");
-        this.port = null;
-      });
+      if (this.port) {
+        try {
+          void this.port.name;
+        } catch {
+          diagLog("local-onnx", "port was disconnected, clearing reference");
+          this.port = null;
+        }
+      }
+      if (!this.port) {
+        this.port = chrome.runtime.connect({ name: "content-onnx" });
+        this.port.onDisconnect.addListener(() => {
+          diagLog("local-onnx", "port disconnected, will reconnect on next request");
+          this.port = null;
+        });
+      }
       return this.port;
     }
     /**
@@ -2345,8 +2377,8 @@ Output example:
     async translate(req) {
       const targetLang = req.targetLang ?? this.defaultTargetLang;
       const translatedSegments = [];
-      for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
-        const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
+      for (let i = 0; i < req.segments.length; i += this.chunkSize) {
+        const chunk = req.segments.slice(i, i + this.chunkSize);
         const chunkResult = await this.translateChunk(chunk, targetLang);
         translatedSegments.push(...chunkResult.segments);
       }
@@ -2359,26 +2391,101 @@ Output example:
     }
     /**
      * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
-     * 將 Offscreen 返回的單一結果拆分回各 segment（行號對齊由 Offscreen 端保證），
-     * 並攜帶 Offscreen 判定的 echo 標記（供流式路徑統計低質量輸出）。
+     * 將 Offscreen 返回的單一結果拆分回各 segment。
+     * Small model (MarianMT) 可能輸出少於輸入行數，需要智能分割。
      */
     async translateChunk(chunk, targetLang) {
       const combinedText = chunk.map((s) => s.sourceText).join("\n");
+      diagLog("local-onnx", `translateChunk: modelTier=${this.modelTier}, chunkSize=${chunk.length}, targetLang=${targetLang}`);
       const request = {
         topic: "local-onnx:translate",
         payload: {
           text: combinedText,
-          targetLang
+          targetLang,
+          modelTier: this.modelTier
         }
       };
+      diagLog("local-onnx", `requestTranslate: sending request`);
       const res = await this.requestTranslate(request);
-      const translatedTexts = (res.translatedText ?? "").split("\n");
+      if (res.degenerate) {
+        consecutiveDegenerateCount++;
+        const segments2 = chunk.map((seg) => ({
+          ...seg,
+          translatedText: seg.sourceText
+        }));
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "small-model-degenerate",
+            recoverable: true,
+            cause: new Error(`Small model repetition loop detected (consecutive: ${consecutiveDegenerateCount})`)
+          }
+        });
+        if (consecutiveDegenerateCount === 1) {
+          diagLog(
+            "local-onnx",
+            "small-model-degenerate: Small model \u7522\u751F\u4E0D\u53EF\u9760\u7FFB\u8B6F\uFF0C\u5DF2\u986F\u793A\u539F\u6587\u3002\u5EFA\u8B70\u5728 Options \u4E2D\u5207\u63DB\u5230 Large model \u4EE5\u7372\u5F97\u66F4\u597D\u54C1\u8CEA\u3002"
+          );
+        }
+        return { segments: segments2, echoed: false };
+      }
+      consecutiveDegenerateCount = 0;
+      const rawOutput = res.translatedText ?? "";
+      let translatedTexts;
+      const outputLines = rawOutput.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+      diagLog("local-onnx", `translateChunk: received response, rawOutput length=${rawOutput.length}, outputLines=${outputLines.length}`);
+      if (outputLines.length === chunk.length) {
+        translatedTexts = outputLines;
+      } else if (outputLines.length < chunk.length && this.modelTier === "small") {
+        diagLog(
+          "local-onnx",
+          `small-model-merge-detected: input=${chunk.length} lines, rawOutput=${outputLines.length} lines, inputText="${combinedText.slice(0, 100)}...", rawOutput="${rawOutput.slice(0, 200)}..."`
+        );
+        translatedTexts = this.splitBySentenceBoundary(rawOutput, chunk.length);
+        if (translatedTexts.length < chunk.length) {
+          diagLog(
+            "local-onnx",
+            `chunk output mismatch: input=${chunk.length} lines, output=${outputLines.length} lines, split=${translatedTexts.length} lines`
+          );
+        }
+      } else {
+        translatedTexts = outputLines;
+      }
       const segments = chunk.map((seg, j) => ({
         ...seg,
         // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
         translatedText: translatedTexts[j]?.trim() || seg.sourceText
       }));
+      if (this.modelTier === "small") {
+        smallModelStats.totalChunks++;
+        if (outputLines.length < chunk.length) {
+          smallModelStats.mergedChunks++;
+          smallModelStats.totalFallbacks += chunk.length - translatedTexts.length;
+        } else if (outputLines.length === chunk.length) {
+          smallModelStats.perfectChunks++;
+        }
+        if (smallModelStats.totalChunks % 10 === 0) {
+          diagLog("local-onnx", `small-model-stats: chunks=${smallModelStats.totalChunks}, merged=${smallModelStats.mergedChunks}, perfect=${smallModelStats.perfectChunks}, fallbacks=${smallModelStats.totalFallbacks}`);
+        }
+      }
       return { segments, echoed: res.echoed === true };
+    }
+    /**
+     * 按句子邊界分割文本——用於 Small model 輸出行數少於輸入行數的情況。
+     * 嘗試按中文標點（。！？；）分割，如果分割後行數仍不足，則按逗號分割。
+     * 如果仍不足，剩餘行回退到原文。
+     */
+    splitBySentenceBoundary(text, expectedLines) {
+      const strongSplit = text.split(/[。！？；]/).filter((s) => s.trim().length > 0);
+      if (strongSplit.length >= expectedLines) {
+        return strongSplit.slice(0, expectedLines);
+      }
+      const weakSplit = text.split(/[，,、]/).filter((s) => s.trim().length > 0);
+      if (weakSplit.length >= expectedLines) {
+        return weakSplit.slice(0, expectedLines);
+      }
+      return weakSplit.length > 0 ? weakSplit : [text];
     }
     /**
      * 發送單次翻譯請求並校驗結果——使用 port 長連接。
@@ -2419,7 +2526,7 @@ Output example:
             reject(new Error("Offscreen Document response timeout"));
           }, 12e4);
         });
-        if (!response.ok) {
+        if (!response.ok && !response.degenerate) {
           const error = new Error(response.error ?? "local-onnx translation failed");
           recordDiagnostic({
             type: "pipeline-error",
@@ -2462,9 +2569,9 @@ Output example:
       const targetLang = req.targetLang ?? this.defaultTargetLang;
       const accumulated = [];
       let echoedChunks = 0;
-      const totalChunks = Math.ceil(req.segments.length / _LocalONNXTranslationProvider.CHUNK_SIZE);
+      const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
       const streamStartedAt = performance.now();
-      for (let i = 0; i < req.segments.length; i += _LocalONNXTranslationProvider.CHUNK_SIZE) {
+      for (let i = 0; i < req.segments.length; i += this.chunkSize) {
         if (req.signal?.aborted) {
           diagLog("local-onnx", "translation aborted by signal after", accumulated.length, "segments");
           throw new DOMException("Translation aborted", "AbortError");
@@ -2485,8 +2592,8 @@ Output example:
           });
           throw new Error("local-onnx session timeout (10min limit)");
         }
-        const chunk = req.segments.slice(i, i + _LocalONNXTranslationProvider.CHUNK_SIZE);
-        const chunkIndex = Math.floor(i / _LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+        const chunk = req.segments.slice(i, i + this.chunkSize);
+        const chunkIndex = Math.floor(i / this.chunkSize) + 1;
         const chunkStartedAt = performance.now();
         const chunkResult = await this.translateChunk(chunk, targetLang);
         const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
@@ -3251,7 +3358,8 @@ Output example:
       const localOnnx = new LocalONNXTranslationProvider({
         modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
         targetLang: config.targetLang,
-        isPrimary: tc.type === "local-onnx"
+        isPrimary: tc.type === "local-onnx",
+        modelTier: tc.localModelTier ?? "small"
       });
       providers.set(localOnnx.engineId, localOnnx);
     }

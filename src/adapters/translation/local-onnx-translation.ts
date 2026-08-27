@@ -16,6 +16,8 @@ interface LocalOnnxTranslateRequest {
     text: string;
     targetLang: string;
     sourceLang?: string;
+    /** 模型檔位（small/large）——offscreen 據此選擇正確的推理路徑。 */
+    modelTier?: 'small' | 'large';
   };
 }
 
@@ -28,6 +30,8 @@ interface LocalOnnxTranslateResponse {
   notDownloaded?: boolean;
   /** 該 chunk 是否被判定為回顯原文（低質量輸出，Offscreen 端判定，供診斷統計）。 */
   echoed?: boolean;
+  /** 該 chunk 是否為退化輸出（Small model 重複循環，Offscreen 端判定）。 */
+  degenerate?: boolean;
 }
 
 /** 本地 ONNX 翻譯適配器配置。 */
@@ -38,10 +42,23 @@ export interface LocalOnnxTranslationConfig {
   targetLang?: string;
   /** 是否作為主翻譯引擎（primary）——primary 成功時不標記 degraded，避免誤發降級事件。 */
   isPrimary?: boolean;
+  /** 模型檔位（small/large），影響 chunk size 策略。 */
+  modelTier?: 'small' | 'large';
 }
 
 /** 單次翻譯會話的最大時限（毫秒）：超過此時間主動中斷，避免 Offscreen 長時間運行不穩定。 */
 const MAX_SESSION_DURATION_MS = 10 * 60 * 1000; // 10 分鐘
+
+/** Small model 翻譯質量統計（用於後續優化分析）。 */
+const smallModelStats = {
+  totalChunks: 0,
+  mergedChunks: 0,      // 輸出行數 < 輸入行數的 chunks
+  perfectChunks: 0,     // 輸出行數 = 輸入行數的 chunks
+  totalFallbacks: 0,    // 回退原文的行數
+};
+
+/** Small model 連續退化輸出計數（非連續時重置）。 */
+let consecutiveDegenerateCount = 0;
 
 /**
  * 本地 ONNX 翻譯 Provider——透過 Offscreen Document 執行推理。
@@ -52,10 +69,16 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   readonly location = 'local' as const;
 
   /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
-  private static readonly CHUNK_SIZE = 5;
+  private static readonly CHUNK_SIZE_LARGE = 5;
+  /** Small model (MarianMT/opus-mt) 的 chunk size：3 行。
+    * MarianMT 傾向將多行合併為 1 行輸出，但速度從 0.10 seg/s 提升到 ~0.25 seg/s。
+    * 配合 splitBySentenceBoundary 嘗試分割，不足的行回退原文。
+    */
+  private static readonly CHUNK_SIZE_SMALL = 3;
 
   private readonly defaultTargetLang: string;
   private readonly isPrimary: boolean;
+  private readonly modelTier: 'small' | 'large';
   
   /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
   private port: chrome.runtime.Port | null = null;
@@ -66,20 +89,43 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     void config.modelName;
     this.defaultTargetLang = config.targetLang ?? 'zh-Hant';
     this.isPrimary = config.isPrimary ?? false;
+    this.modelTier = config.modelTier ?? 'large';
+  }
+
+  /** 根據模型檔位返回 chunk size：small model 逐句翻譯，large model 可合併多行。 */
+  private get chunkSize(): number {
+    return this.modelTier === 'small'
+      ? LocalONNXTranslationProvider.CHUNK_SIZE_SMALL
+      : LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
   }
 
   /**
    * 建立與 Service Worker 的 port 長連接。
    * 使用 port 而非 sendMessage，避免推理時間過長導致消息通道關閉。
+   * 添加 port 有效性檢查：當 port 已斷開但 onDisconnect 回調尚未觸發時，
+   * 主動清除並重建連接，避免 "Attempting to use a disconnected port object" 錯誤。
    */
   private ensurePort(): chrome.runtime.Port {
-    if (this.port) return this.port;
+    // 檢查現有 port 是否有效
+    if (this.port) {
+      try {
+        // 嘗試訪問 port.name 來驗證 port 是否仍然有效
+        // 如果 port 已斷開，這會拋出 "Attempting to use a disconnected port object" 錯誤
+        void this.port.name;
+      } catch {
+        // port 已斷開，清除引用以便重建
+        diagLog('local-onnx', 'port was disconnected, clearing reference');
+        this.port = null;
+      }
+    }
     
-    this.port = chrome.runtime.connect({ name: 'content-onnx' });
-    this.port.onDisconnect.addListener(() => {
-      diagLog('local-onnx', 'port disconnected, will reconnect on next request');
-      this.port = null;
-    });
+    if (!this.port) {
+      this.port = chrome.runtime.connect({ name: 'content-onnx' });
+      this.port.onDisconnect.addListener(() => {
+        diagLog('local-onnx', 'port disconnected, will reconnect on next request');
+        this.port = null;
+      });
+    }
     
     return this.port;
   }
@@ -121,8 +167,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     const targetLang = req.targetLang ?? this.defaultTargetLang;
     const translatedSegments: SubtitleSegment[] = [];
 
-    for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
-      const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
+    for (let i = 0; i < req.segments.length; i += this.chunkSize) {
+      const chunk = req.segments.slice(i, i + this.chunkSize);
       const chunkResult = await this.translateChunk(chunk, targetLang);
       translatedSegments.push(...chunkResult.segments);
     }
@@ -136,8 +182,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
   /**
    * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
-   * 將 Offscreen 返回的單一結果拆分回各 segment（行號對齊由 Offscreen 端保證），
-   * 並攜帶 Offscreen 判定的 echo 標記（供流式路徑統計低質量輸出）。
+   * 將 Offscreen 返回的單一結果拆分回各 segment。
+   * Small model (MarianMT) 可能輸出少於輸入行數，需要智能分割。
    */
   private async translateChunk(
     chunk: SubtitleSegment[],
@@ -145,24 +191,132 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   ): Promise<{ segments: SubtitleSegment[]; echoed: boolean }> {
     const combinedText = chunk.map((s) => s.sourceText).join('\n');
 
+    diagLog('local-onnx', `translateChunk: modelTier=${this.modelTier}, chunkSize=${chunk.length}, targetLang=${targetLang}`);
+
     const request: LocalOnnxTranslateRequest = {
       topic: 'local-onnx:translate',
       payload: {
         text: combinedText,
         targetLang,
+        modelTier: this.modelTier,
       },
     };
 
+    diagLog('local-onnx', `requestTranslate: sending request`);
     const res = await this.requestTranslate(request);
-
+    
+    // 退化輸出處理：回退原文 + 提示用戶（不自動切換 Large model）
+    if (res.degenerate) {
+      consecutiveDegenerateCount++;
+      
+      const segments = chunk.map(seg => ({
+        ...seg,
+        translatedText: seg.sourceText,
+      }));
+      
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'small-model-degenerate',
+          recoverable: true,
+          cause: new Error(`Small model repetition loop detected (consecutive: ${consecutiveDegenerateCount})`),
+        },
+      });
+      
+      if (consecutiveDegenerateCount === 1) {
+        diagLog('local-onnx',
+          'small-model-degenerate: Small model 產生不可靠翻譯，已顯示原文。' +
+          '建議在 Options 中切換到 Large model 以獲得更好品質。'
+        );
+      }
+      
+      return { segments, echoed: false };
+    }
+    
+    // 非退化輸出時重置計數
+    consecutiveDegenerateCount = 0;
+    
+    const rawOutput = res.translatedText ?? '';
+    
     // 解析翻譯結果——將單一結果拆分回各 segment。
-    const translatedTexts = (res.translatedText ?? '').split('\n');
+    let translatedTexts: string[];
+    
+    // 如果輸出行數等於輸入行數，直接按行分割
+    const outputLines = rawOutput.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    diagLog('local-onnx', `translateChunk: received response, rawOutput length=${rawOutput.length}, outputLines=${outputLines.length}`);
+    
+    if (outputLines.length === chunk.length) {
+      translatedTexts = outputLines;
+    } else if (outputLines.length < chunk.length && this.modelTier === 'small') {
+      // Small model 輸出行數少於輸入行數：記錄合併行為
+      diagLog(
+        'local-onnx',
+        `small-model-merge-detected: input=${chunk.length} lines, rawOutput=${outputLines.length} lines, ` +
+        `inputText="${combinedText.slice(0, 100)}...", rawOutput="${rawOutput.slice(0, 200)}..."`
+      );
+      // 嘗試按句子邊界分割
+      translatedTexts = this.splitBySentenceBoundary(rawOutput, chunk.length);
+      
+      // 記錄診斷：輸出行數不匹配
+      if (translatedTexts.length < chunk.length) {
+        diagLog(
+          'local-onnx',
+          `chunk output mismatch: input=${chunk.length} lines, output=${outputLines.length} lines, split=${translatedTexts.length} lines`
+        );
+      }
+    } else {
+      // Large model 或輸出行數多於輸入：按行分割，多餘的忽略
+      translatedTexts = outputLines;
+    }
+
     const segments = chunk.map((seg, j) => ({
       ...seg,
       // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
       translatedText: translatedTexts[j]?.trim() || seg.sourceText,
     }));
+    
+    // 更新 Small model 統計
+    if (this.modelTier === 'small') {
+      smallModelStats.totalChunks++;
+      if (outputLines.length < chunk.length) {
+        smallModelStats.mergedChunks++;
+        smallModelStats.totalFallbacks += (chunk.length - translatedTexts.length);
+      } else if (outputLines.length === chunk.length) {
+        smallModelStats.perfectChunks++;
+      }
+      
+      // 每 10 個 chunks 輸出一次統計摘要
+      if (smallModelStats.totalChunks % 10 === 0) {
+        diagLog('local-onnx', `small-model-stats: chunks=${smallModelStats.totalChunks}, ` +
+          `merged=${smallModelStats.mergedChunks}, perfect=${smallModelStats.perfectChunks}, ` +
+          `fallbacks=${smallModelStats.totalFallbacks}`);
+      }
+    }
+    
     return { segments, echoed: res.echoed === true };
+  }
+
+  /**
+   * 按句子邊界分割文本——用於 Small model 輸出行數少於輸入行數的情況。
+   * 嘗試按中文標點（。！？；）分割，如果分割後行數仍不足，則按逗號分割。
+   * 如果仍不足，剩餘行回退到原文。
+   */
+  private splitBySentenceBoundary(text: string, expectedLines: number): string[] {
+    // 先嘗試按強標點分割（句號、問號、感嘆號、分號）
+    const strongSplit = text.split(/[。！？；]/).filter(s => s.trim().length > 0);
+    if (strongSplit.length >= expectedLines) {
+      return strongSplit.slice(0, expectedLines);
+    }
+
+    // 如果強標點分割不足，嘗試按弱標點分割（逗號、頓號）
+    const weakSplit = text.split(/[，,、]/).filter(s => s.trim().length > 0);
+    if (weakSplit.length >= expectedLines) {
+      return weakSplit.slice(0, expectedLines);
+    }
+
+    // 如果仍不足，返回實際分割的行數，剩餘行會回退到原文
+    return weakSplit.length > 0 ? weakSplit : [text];
   }
 
   /**
@@ -215,7 +369,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         }, 120000);
       });
 
-      if (!response.ok) {
+      if (!response.ok && !response.degenerate) {
         const error = new Error(response.error ?? 'local-onnx translation failed');
         recordDiagnostic({
           type: 'pipeline-error',
@@ -263,10 +417,10 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     const targetLang = req.targetLang ?? this.defaultTargetLang;
     const accumulated: SubtitleSegment[] = [];
     let echoedChunks = 0;
-    const totalChunks = Math.ceil(req.segments.length / LocalONNXTranslationProvider.CHUNK_SIZE);
+    const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
     const streamStartedAt = performance.now();
 
-    for (let i = 0; i < req.segments.length; i += LocalONNXTranslationProvider.CHUNK_SIZE) {
+    for (let i = 0; i < req.segments.length; i += this.chunkSize) {
       // 每個 chunk 前檢查 abort signal——seek 中斷時停止翻譯，避免浪費已落後位置的 chunks。
       if (req.signal?.aborted) {
         diagLog('local-onnx', 'translation aborted by signal after', accumulated.length, 'segments');
@@ -291,8 +445,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         throw new Error('local-onnx session timeout (10min limit)');
       }
 
-      const chunk = req.segments.slice(i, i + LocalONNXTranslationProvider.CHUNK_SIZE);
-      const chunkIndex = Math.floor(i / LocalONNXTranslationProvider.CHUNK_SIZE) + 1;
+      const chunk = req.segments.slice(i, i + this.chunkSize);
+      const chunkIndex = Math.floor(i / this.chunkSize) + 1;
       const chunkStartedAt = performance.now();
       const chunkResult = await this.translateChunk(chunk, targetLang);
       const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);

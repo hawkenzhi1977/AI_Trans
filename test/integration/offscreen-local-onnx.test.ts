@@ -793,3 +793,98 @@ describe('DownloadProgressAggregator — 多檔案下載進度聚合', () => {
     expect(result.total).toBe(500); // 200 + 300
   });
 });
+
+// 退化輸出檢測——calcUniqueNgramRatio 計算唯一 n-gram 比例。
+describe('calcUniqueNgramRatio — 退化輸出檢測', () => {
+  const { calcUniqueNgramRatio } = _testExports;
+
+  it('正常中文翻譯：唯一 3-gram 比例 > 0.8', () => {
+    const normalText = '這是蘋果公司最新的M6晶片，採用2奈米製程技術，性能大幅提升。';
+    const ratio = calcUniqueNgramRatio(normalText, 3);
+    expect(ratio).toBeGreaterThan(0.8);
+  });
+
+  it('重複循環輸出（"我希望我希望..."）：唯一 3-gram 比例 < 0.1', () => {
+    const degenerateText = '我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望';
+    const ratio = calcUniqueNgramRatio(degenerateText, 3);
+    expect(ratio).toBeLessThan(0.1);
+  });
+
+  it('單字符重複（"捉捉捉..."）：唯一 3-gram 比例 < 0.05', () => {
+    const degenerateText = '捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉捉';
+    const ratio = calcUniqueNgramRatio(degenerateText, 3);
+    expect(ratio).toBeLessThan(0.05);
+  });
+
+  it('短文本（< n 字符）：返回 1.0（不視為退化）', () => {
+    expect(calcUniqueNgramRatio('ab', 3)).toBe(1.0);
+    expect(calcUniqueNgramRatio('', 3)).toBe(1.0);
+  });
+
+  it('英文重複輸出（"bears bears bears..."）：唯一 3-gram 比例 < 0.1', () => {
+    const degenerateText = 'bears bears bears bears bears bears bears bears bears bears bears bears bears bears bears';
+    const ratio = calcUniqueNgramRatio(degenerateText, 3);
+    expect(ratio).toBeLessThan(0.1);
+  });
+});
+
+// 退化輸出檢測——Small model 推理返回退化輸出時標記 degenerate: true。
+describe('runInference：Small model 退化輸出檢測', () => {
+  beforeEach(() => {
+    resetLocalOnnxModuleForTest();
+    transformersMock.pipeline.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('Small model 輸出重複循環 → 返回 degenerate: true', async () => {
+    // 模擬 Small model 返回重複循環的翻譯結果
+    const degenerateOutput = '我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望我希望';
+    transformersMock.pipeline.mockResolvedValue(
+      vi.fn().mockResolvedValue([{ translation_text: degenerateOutput }])
+    );
+
+    // 設置為 small model
+    _testExports.setModelTier('small');
+    // 模擬模型已載入（跳過實際載入）
+    await _testExports.ensurePipelineLoaded();
+
+    const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
+    expect(res.ok).toBe(false);
+    expect((res as { degenerate?: boolean }).degenerate).toBe(true);
+    expect(res.error).toContain('degenerate');
+  });
+
+  it('Small model 正常輸出 → 返回 ok: true，不標記 degenerate', async () => {
+    // 模擬 Small model 返回正常翻譯結果
+    const normalOutput = '這是蘋果公司最新的M6晶片，採用2奈米製程技術，性能大幅提升。';
+    transformersMock.pipeline.mockResolvedValue(
+      vi.fn().mockResolvedValue([{ translation_text: normalOutput }])
+    );
+
+    _testExports.setModelTier('small');
+    await _testExports.ensurePipelineLoaded();
+
+    const res = await _testExports.runInference('test input', 'zh-Hant', undefined, false, 'small');
+    expect(res.ok).toBe(true);
+    expect((res as { degenerate?: boolean }).degenerate).toBeUndefined();
+    expect(res.translatedText).toBe(normalOutput);
+  });
+
+  it('Small model 短輸出（< 100 字符）→ 不做退化檢測，直接返回', async () => {
+    // 短輸出即使有重複也不檢測（< 100 字符，20 個 "你好" = 40 字符）
+    const shortOutput = '你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好';
+    transformersMock.pipeline.mockResolvedValue(
+      vi.fn().mockResolvedValue([{ translation_text: shortOutput }])
+    );
+
+    _testExports.setModelTier('small');
+    await _testExports.ensurePipelineLoaded();
+
+    const res = await _testExports.runInference('test', 'zh-Hant', undefined, false, 'small');
+    // 短輸出（< 100 字符）不做退化檢測，直接返回 ok: true
+    expect(res.ok).toBe(true);
+  });
+});

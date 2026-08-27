@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-08-20（**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」（webgpu 不可用降級 wasm）、§4.21「popup-init-slow」（>3s）、§4.22「popup-init-timeout」（>10s）；先前：**M2-25**（新增 `offscreen-close-failed` Offscreen 空閒關閉失敗）；先前：**M2-24 補充修復十六**（§2.20 + §4.18 + §4.19）；先前：**M2-24 補充修復十五（§2.19 + §4.17）**）
+> 最後更新：2026-08-27（**M2-38：Small model (MarianMT) 退化輸出檢測**——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
 
 ---
 
@@ -576,6 +576,19 @@
 - **用戶響應**: 刷新插件或重啟瀏覽器；若反覆出現 → 檢查本地 ONNX 模型是否佔滿進程（§2.21），考慮 webgpu 環境
 - **開發者響應**: SW console `[AI_Trans:sw]` 麵包屑 + Offscreen heap breadcrumb；確認是否進程堆超限
 - **代碼落點**: src/runtime/popup/popup.ts（`fireInitTimeout` 10s timer）
+
+
+### 4.23 Small model (MarianMT) 退化輸出檢測（重複循環）
+
+- **診斷碼**: `small-model-degenerate`
+- **port / kind**: `translation` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: Error: Small model produced degenerate output (repetition loop detected) (consecutive: N)」；字幕顯示原文（未翻譯）
+- **觸發條件**: Offscreen `runInference` Small model 分支——推理完成後、簡繁轉換前，對 `translation_text` 計算 3-gram 唯一率（`calcUniqueNgramRatio(text, 3)`）；當文本長度 >100 字符且唯一率 <0.2 時判定為退化輸出（重複循環），返回 `{ ok: false, degenerate: true }`
+- **根因**: Small model (MarianMT/opus-mt-en-zh) 在部分機器上 WASM 推理產生退化輸出——模型不崩潰但輸出為高度重複的無意義字符（如「我希望我希望我希望...」「捉捉捉捉...」）。根因為 q8 量化 + WASM 後端精度損失 + MarianTokenizer 慢版 tokenizer 精度警告 + 默認 `repetition_penalty: 1.0`（無重複懲罰）疊加導致解碼器陷入重複循環
+- **修復措施**: ①推理參數增強——添加 `max_new_tokens: 256`、`repetition_penalty: 1.2`、`no_repeat_ngram_size: 3`；②退化輸出檢測——3-gram 唯一率 <0.2 時標記 `degenerate: true`；③content-script 層處理——收到退化響應後回退原文 + 記錄診斷 + 輸出提示（建議用戶切換 Large model）；④不自動切換——用戶因硬件限制選擇 Small model 時保持選擇權
+- **用戶響應**: popup「最近失敗」顯示退化提示；字幕顯示原文。建議在 Options 中切換到 Large model 以獲得更好品質
+- **開發者響應**: 開啟 Options「調試日誌 → local-onnx」查看 `small-model-degenerate` 麵包屑；對照 Offscreen console `ngramRatio` 值確認退化程度；若生成參數增強後仍退化，可能需考慮更換模型或量化方案
+- **代碼落點**: src/runtime/offscreen.ts（`calcUniqueNgramRatio` + `runInference` 退化檢測分支）、src/adapters/translation/local-onnx-translation.ts（`translateChunk` 退化響應處理 + `consecutiveDegenerateCount` + `recordDiagnostic`）
 
 
 ---
