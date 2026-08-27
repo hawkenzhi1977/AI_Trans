@@ -6,6 +6,7 @@
 import type { TranslationProvider } from '../../domain/ports/translation-provider';
 import type { TranslationRequest, TranslationResult } from '../../domain/models/translation';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
+import type { LocalModelTier } from '../../domain/models/config';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
 import { diagLog } from '../../infrastructure/debug-log';
 
@@ -16,8 +17,8 @@ interface LocalOnnxTranslateRequest {
     text: string;
     targetLang: string;
     sourceLang?: string;
-    /** 模型檔位（small/large）——offscreen 據此選擇正確的推理路徑。 */
-    modelTier?: 'small' | 'large';
+    /** 模型檔位（small/medium/large）——offscreen 據此選擇正確的推理路徑。 */
+    modelTier?: LocalModelTier;
   };
 }
 
@@ -42,8 +43,8 @@ export interface LocalOnnxTranslationConfig {
   targetLang?: string;
   /** 是否作為主翻譯引擎（primary）——primary 成功時不標記 degraded，避免誤發降級事件。 */
   isPrimary?: boolean;
-  /** 模型檔位（small/large），影響 chunk size 策略。 */
-  modelTier?: 'small' | 'large';
+  /** 模型檔位（small/medium/large），影響 chunk size 策略。 */
+  modelTier?: LocalModelTier;
 }
 
 /** 單次翻譯會話的最大時限（毫秒）：超過此時間主動中斷，避免 Offscreen 長時間運行不穩定。 */
@@ -70,6 +71,10 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
   /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
   private static readonly CHUNK_SIZE_LARGE = 5;
+  /** Medium model (SmolLM2-360M) 的 chunk size：4 行。
+    * 比 Large 稍小，避免中等模型上下文過長導致注意力退化。
+    */
+  private static readonly CHUNK_SIZE_MEDIUM = 4;
   /** Small model (MarianMT/opus-mt) 的 chunk size：3 行。
     * MarianMT 傾向將多行合併為 1 行輸出，但速度從 0.10 seg/s 提升到 ~0.25 seg/s。
     * 配合 splitBySentenceBoundary 嘗試分割，不足的行回退原文。
@@ -78,7 +83,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
   private readonly defaultTargetLang: string;
   private readonly isPrimary: boolean;
-  private readonly modelTier: 'small' | 'large';
+  private readonly modelTier: LocalModelTier;
   
   /** Port 長連接——避免 sendMessage 短連接被 Service Worker 回收。 */
   private port: chrome.runtime.Port | null = null;
@@ -92,11 +97,13 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     this.modelTier = config.modelTier ?? 'large';
   }
 
-  /** 根據模型檔位返回 chunk size：small model 逐句翻譯，large model 可合併多行。 */
+  /** 根據模型檔位返回 chunk size：small 3 行，medium 4 行，large 5 行。 */
   private get chunkSize(): number {
-    return this.modelTier === 'small'
-      ? LocalONNXTranslationProvider.CHUNK_SIZE_SMALL
-      : LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
+    switch (this.modelTier) {
+      case 'small': return LocalONNXTranslationProvider.CHUNK_SIZE_SMALL;
+      case 'medium': return LocalONNXTranslationProvider.CHUNK_SIZE_MEDIUM;
+      case 'large': return LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
+    }
   }
 
   /**

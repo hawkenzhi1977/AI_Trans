@@ -4,6 +4,8 @@
   var LOCAL_TRANSLATION_MODELS = {
     /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
     small: "Xenova/opus-mt-en-zh",
+    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
+    medium: "onnx-community/SmolLM2-360M-Instruct",
     /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
     large: "onnx-community/Qwen2.5-0.5B-Instruct"
   };
@@ -173,8 +175,8 @@
         model: $("translation-model").value || void 0,
         endpoint: $("translation-endpoint").value || void 0,
         fallbackType: $("translation-fallback").value || void 0,
-        localModelTier: $("local-model-tier").value || "small",
-        localModelName: LOCAL_TRANSLATION_MODELS[$("local-model-tier").value || "small"]
+        localModelTier: $("local-model-tier").value || "large",
+        localModelName: LOCAL_TRANSLATION_MODELS[$("local-model-tier").value || "large"]
       },
       asr: {
         type: asrType,
@@ -207,7 +209,7 @@
     $("translation-model").value = config.translation.model ?? "";
     $("translation-endpoint").value = config.translation.endpoint ?? "";
     $("translation-fallback").value = config.translation.fallbackType ?? "mt";
-    const localTier = config.translation.localModelTier ?? "small";
+    const localTier = config.translation.localModelTier ?? "large";
     $("local-model-tier").value = localTier;
     $("local-model-name").value = LOCAL_TRANSLATION_MODELS[localTier];
     $("asr-type").value = config.asr.type;
@@ -248,7 +250,7 @@
       await store.set(config);
       await store.setApiKey("llm", $("translation-api-key").value.trim());
       await store.setApiKey("asr", $("asr-api-key").value.trim());
-      const localTier = config.translation.localModelTier ?? "small";
+      const localTier = config.translation.localModelTier ?? "large";
       try {
         await chrome.runtime.sendMessage({
           topic: "local-onnx:set-model-tier",
@@ -350,6 +352,7 @@
     const sizeInfo = $("local-model-size-info");
     const MODEL_SIZES = {
       small: "\u7D04 150 MB",
+      medium: "\u7D04 200 MB",
       large: "\u7D04 750 MB"
     };
     function updateModelInfo() {

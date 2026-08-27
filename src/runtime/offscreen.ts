@@ -18,7 +18,7 @@ type OffscreenRequest =
   | { type: 'local-onnx:warmup' }
   | { type: 'local-onnx:download' }
   | { type: 'local-onnx:clear-cache' }
-  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string; modelTier?: 'small' | 'large' }
+  | { type: 'local-onnx:translate'; text: string; targetLang: string; sourceLang?: string; modelTier?: LocalModelTier }
   | { type: 'local-onnx:set-model-tier'; tier: LocalModelTier }
   | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
@@ -327,8 +327,10 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
       return true;
     case 'local-onnx:set-model-tier': {
       const tierMsg = message as { topic?: string; tier?: LocalModelTier };
-      const result = setModelTier(tierMsg.tier ?? 'small');
-      respond({ type: 'local-onnx:status', downloaded: false, modelName: result.modelName });
+      void setModelTier(tierMsg.tier ?? 'large').then(async (result) => {
+        const downloaded = await hasModelInCache();
+        respond({ type: 'local-onnx:status', downloaded, modelName: result.modelName });
+      });
       return true;
     }
     case 'local-onnx:translate': {
@@ -340,11 +342,11 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
       }
       const translateMsg = message as {
         topic: string;
-        payload?: { text?: string; targetLang?: string; sourceLang?: string; modelTier?: 'small' | 'large' };
+        payload?: { text?: string; targetLang?: string; sourceLang?: string; modelTier?: LocalModelTier };
         text?: string;
         targetLang?: string;
         sourceLang?: string;
-        modelTier?: 'small' | 'large';
+        modelTier?: LocalModelTier;
       };
       const requestedTier = translateMsg.payload?.modelTier ?? translateMsg.modelTier;
       void runInference(
@@ -434,15 +436,16 @@ function connectToServiceWorker(): void {
           break;
         case 'local-onnx:set-model-tier': {
           const tier = msg.payload?.tier as LocalModelTier | undefined;
-          const tierResult = setModelTier(tier ?? 'small');
+          const tierResult = await setModelTier(tier ?? 'large');
+          const downloaded = await hasModelInCache();
           result = { tier: tierResult.tier, modelName: tierResult.modelName };
-          broadcastToAll({ type: 'local-onnx:status', downloaded: false, modelName: tierResult.modelName });
+          broadcastToAll({ type: 'local-onnx:status', downloaded, modelName: tierResult.modelName });
           break;
         }
         case 'local-onnx:translate': {
           // 統一消息形狀：優先 payload（provider 用 { payload: { text } }），兼容舊頂層 text。
           // 接收請求中的 modelTier，確保 offscreen 使用正確的推理路徑。
-          const requestedTier = msg.payload?.modelTier as 'small' | 'large' | undefined;
+          const requestedTier = msg.payload?.modelTier as LocalModelTier | undefined;
           result = await runInference(
             msg.payload?.text ?? msg.text ?? '',
             msg.payload?.targetLang ?? msg.targetLang ?? '',
@@ -547,11 +550,11 @@ let disposePromise: Promise<void> | null = null;
  */
 let tierGeneration = 0;
 
-/** 當前使用的模型檔位（可從 Options 切換，預設為 small）。 */
-let currentModelTier: LocalModelTier = 'small';
+/** 當前使用的模型檔位（可從 Options 切換，預設為 large）。 */
+let currentModelTier: LocalModelTier = 'large';
 
 /** 當前載入的模型名稱（根據 currentModelTier 動態決定）。 */
-let currentModelName: string = LOCAL_TRANSLATION_MODELS.small;
+let currentModelName: string = LOCAL_TRANSLATION_MODELS.large;
 
 /** 判斷當前是否使用小型翻譯模型（MarianMT）。 */
 function isSmallModel(): boolean {
@@ -568,8 +571,9 @@ function isSmallModel(): boolean {
  * ③ dispose 失敗不阻塞狀態重置（.catch() 兜底）
  * ④ 遞增 tierGeneration，使 in-flight 載入自動作廢
  */
-function setModelTier(tier: LocalModelTier): { tier: LocalModelTier; modelName: string } {
+async function setModelTier(tier: LocalModelTier): Promise<{ tier: LocalModelTier; modelName: string }> {
   if (tier !== currentModelTier) {
+    const oldModelName = currentModelName;
     console.log(`[AI_Trans] 切換模型檔位: ${currentModelTier} → ${tier}`);
     currentModelTier = tier;
     currentModelName = LOCAL_TRANSLATION_MODELS[tier];
@@ -583,13 +587,23 @@ function setModelTier(tier: LocalModelTier): { tier: LocalModelTier; modelName: 
     loadPromise = null;
     loadPromiseHasProgress = false;
     
-    // 異步 dispose 舊 pipeline（捕獲引用，安全 fire-and-forget）
+    // 異步 dispose 舊 pipeline + 清除舊檔位快取（釋放儲存空間）
     if (oldPipeline !== null) {
-      disposePromise = disposePipeline(oldPipeline).catch((err) => {
-        console.warn('[AI_Trans] setModelTier dispose error:', err instanceof Error ? err.message : String(err));
-      }).finally(() => {
-        disposePromise = null;
-      });
+      disposePromise = disposePipeline(oldPipeline)
+        .then(() => clearCacheForModel(oldModelName))
+        .catch((err) => {
+          console.warn('[AI_Trans] setModelTier dispose/clear error:', err instanceof Error ? err.message : String(err));
+        }).finally(() => {
+          disposePromise = null;
+        });
+    } else {
+      // 無內存 pipeline 時仍需清除舊檔位快取
+      disposePromise = clearCacheForModel(oldModelName)
+        .catch((err) => {
+          console.warn('[AI_Trans] setModelTier clear error:', err instanceof Error ? err.message : String(err));
+        }).finally(() => {
+          disposePromise = null;
+        });
     }
   }
   return { tier: currentModelTier, modelName: currentModelName };
@@ -753,9 +767,9 @@ async function loadPipeline(
       });
     }
   } else {
-    // 大型通用 LLM 模型 (Qwen2.5)：使用 text-generation pipeline
-    // 記憶體約 750MB，推理較慢，但翻譯質量更高
-    console.log(`[AI_Trans] 載入大型 LLM 模型: ${modelName}`);
+    // 中型/大型 LLM 模型：使用 text-generation pipeline
+    // Medium (SmolLM2-360M): ~200MB, Large (Qwen2.5-0.5B): ~750MB
+    console.log(`[AI_Trans] 載入 ${currentModelTier} LLM 模型: ${modelName}`);
     try {
       return await pipeline('text-generation', modelName, {
         dtype: 'q4',
@@ -1008,8 +1022,33 @@ async function checkModelStatus(): Promise<OffscreenResponse> {
 }
 
 /**
+ * 清除指定模型的快取檔案——按 modelName 過濾 Cache API 條目，僅刪除匹配項。
+ * 用於檔位切換時清理舊檔位模型，釋放儲存空間。
+ */
+async function clearCacheForModel(modelName: string): Promise<void> {
+  try {
+    const cachesApi = globalThis.caches;
+    if (typeof cachesApi === 'undefined' || typeof cachesApi.keys !== 'function') return;
+    const cacheNames = await cachesApi.keys();
+    const target = cacheNames.find((name) => name === 'transformers-cache');
+    if (!target) return;
+
+    const cache = await cachesApi.open(target);
+    const requests = await cache.keys();
+    for (const req of requests) {
+      if (req.url.includes(modelName)) {
+        await cache.delete(req);
+      }
+    }
+    console.log(`[AI_Trans] 已清除模型快取: ${modelName}`);
+  } catch (err) {
+    console.warn('[AI_Trans] clearCacheForModel failed:', err);
+  }
+}
+
+/**
  * 查詢本地模型快取——transformers.js v3 使用 Cache API（'transformers-cache'），
- * 檢查其中是否有模型檔案（.onnx）。不依賴內存 translationPipeline，
+ * 檢查其中是否有當前檔位模型的檔案。不依賴內存 translationPipeline，
  * Offscreen 重啟後依然準確。
  */
 async function hasModelInCache(): Promise<boolean> {
@@ -1024,8 +1063,8 @@ async function hasModelInCache(): Promise<boolean> {
 
     const cache = await cachesApi.open(target);
     const requests = await cache.keys();
-    // 模型檔案（.onnx）存在即視為已下載。
-    return requests.some((r) => r.url.includes('.onnx') || r.url.includes(currentModelName));
+    // 精確匹配當前檔位模型名稱（避免多檔位共存時誤判）。
+    return requests.some((r) => r.url.includes(currentModelName));
   } catch {
     // 快取不可查時視為未下載；狀態檢查失敗留痕由調用方（checkModelStatus）記錄。
     return false;
@@ -1559,6 +1598,7 @@ function calcUniqueNgramRatio(text: string, n: number): number {
  * 執行翻譯推理——使用本地 ONNX 模型翻譯文本。
  * 根據模型檔位使用不同的推理邏輯：
  * - small (MarianMT): 直接輸入文本，返回 translation_text
+ * - medium (SmolLM2): 構造 SmolLM2 Prompt，解析 generated_text
  * - large (Qwen2.5): 構造 ChatML Prompt，解析 generated_text
  * 
  * @param requestedTier - 請求中指定的模型檔位。如果與當前檔位不同，會先切換模型。
@@ -1568,7 +1608,7 @@ async function runInference(
   targetLang: string,
   _sourceLang: string | undefined,
   retriedWithWasm = false,
-  requestedTier?: 'small' | 'large'
+  requestedTier?: LocalModelTier
 ): Promise<OffscreenResponse> {
   // 早期退出：Small model WASM 不相容時直接返回錯誤
   if (requestedTier === 'small' && smallModelBroken) {
@@ -1583,7 +1623,7 @@ async function runInference(
   // setModelTier 已處理 dispose 和狀態清空，不再重複
   if (requestedTier && requestedTier !== currentModelTier) {
     console.log(`[AI_Trans] runInference: switching tier from ${currentModelTier} to ${requestedTier} per request`);
-    setModelTier(requestedTier);
+    await setModelTier(requestedTier);
   }
 
   // lazy 恢復：pipeline 未載入但快取存在 → 自動載入（Offscreen 重啟後無需重新下載）。
@@ -1636,6 +1676,7 @@ async function runInference(
 
       const result = await pipelineFn(text, {
         max_new_tokens: 256,
+        do_sample: false,
         repetition_penalty: 1.2,
         no_repeat_ngram_size: 3,
       });
@@ -1676,25 +1717,28 @@ async function runInference(
         echoed: false,
       } satisfies OffscreenResponse;
     } else {
-      // 大型通用 LLM 模型 (Qwen2.5)：構造 ChatML Prompt
-      console.log('[AI_Trans:local-onnx-large] 開始翻譯, text length:', text.length, 'targetLang:', targetLang);
+      // 中型/大型 LLM 模型：構造 Prompt 執行推理
+      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 開始翻譯, text length:`, text.length, 'targetLang:', targetLang);
       const sourceLines = text.split('\n');
-      const prompt = buildPrompt(text, targetLang);
-      console.log('[AI_Trans:local-onnx-large] prompt 構建完成, prompt length:', prompt.length);
+      // 根據檔位選擇 prompt 格式：medium 用 SmolLM2 template，large 用 ChatML
+      const prompt = currentModelTier === 'medium'
+        ? buildPromptSmolLM2(text, targetLang)
+        : buildPrompt(text, targetLang);
+      console.log(`[AI_Trans:local-onnx-${currentModelTier}] prompt 構建完成, prompt length:`, prompt.length);
 
       const pipelineFn = translationPipeline as (
         input: string,
         options?: Record<string, unknown>
       ) => Promise<Array<{ generated_text: string }>>;
 
-      console.log('[AI_Trans:local-onnx-large] 開始推理...');
+      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 開始推理...`);
       const result = await pipelineFn(prompt, {
         max_new_tokens: 256,
         do_sample: false,
         repetition_penalty: 1.1,
         return_full_text: false,
       });
-      console.log('[AI_Trans:local-onnx-large] 推理完成');
+      console.log(`[AI_Trans:local-onnx-${currentModelTier}] 推理完成`);
 
       // 解析生成結果——按行號還原譯文。
       const generatedText = result[0]?.generated_text ?? '';
@@ -1927,12 +1971,38 @@ function buildPrompt(text: string, targetLang: string): string {
     : '';
 
   return `<|im_start|>system
-You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+ You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
 <|im_end|>
 <|im_start|>user
 ${numbered}
 <|im_end|>
 <|im_start|>assistant
+`;
+}
+
+/**
+ * 構造翻譯 Prompt——SmolLM2 chat template 格式 + 行號標記 + 目標語言 few-shot。
+ * SmolLM2-360M-Instruct 使用不同的 chat template（非 ChatML）。
+ */
+function buildPromptSmolLM2(text: string, targetLang: string): string {
+  const langName = getLanguageName(targetLang);
+  const numbered = text
+    .split('\n')
+    .map((line, i) => `${i + 1}. ${line}`)
+    .join('\n');
+
+  const fewShot = FEW_SHOT_LINES[langName];
+  const fewShotText = fewShot
+    ? `\nExamples:\n${fewShot.map(([src, dst]) => `9. ${src}\n9. ${dst}`).join('\n')}`
+    : '';
+
+  return `<|system|>
+You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+<|end|>
+<|user|>
+${numbered}
+<|end|>
+<|assistant|>
 `;
 }
 
@@ -2060,9 +2130,9 @@ export function resetLocalOnnxModuleForTest(): void {
   asrDownloadInProgress = false;
   // M2-37：重置 ASR pipeline（避免測試間互相污染）。
   asrPipeline = null;
-  // 重置模型檔位為預設值（small）
-  currentModelTier = 'small';
-  currentModelName = LOCAL_TRANSLATION_MODELS.small;
+  // 重置模型檔位為預設值（large）
+  currentModelTier = 'large';
+  currentModelName = LOCAL_TRANSLATION_MODELS.large;
 }
 
 /** 供測試直接調用內部狀態檢查/推理邏輯。 */
@@ -2074,6 +2144,7 @@ export const _testExports = {
   downloadModel,
   ensurePipelineLoaded,
   buildPrompt,
+  buildPromptSmolLM2,
   parseNumberedOutput,
   warmupModel,
   shutdownForIdle,
@@ -2099,4 +2170,6 @@ export const _testExports = {
   DownloadProgressAggregator,
   // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
   calcUniqueNgramRatio,
+  // 檔位切換時清理舊檔位快取（供測試驗證）。
+  clearCacheForModel,
 };

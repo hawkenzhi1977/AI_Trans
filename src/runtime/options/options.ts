@@ -99,8 +99,8 @@ function readForm(): EngineConfig {
       model: $<HTMLInputElement>('translation-model').value || undefined,
       endpoint: $<HTMLInputElement>('translation-endpoint').value || undefined,
       fallbackType: ($<HTMLSelectElement>('translation-fallback').value as 'mt' | 'none') || undefined,
-      localModelTier: ($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'small',
-      localModelName: LOCAL_TRANSLATION_MODELS[($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'small'],
+      localModelTier: ($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'large',
+      localModelName: LOCAL_TRANSLATION_MODELS[($<HTMLSelectElement>('local-model-tier').value as LocalModelTier) || 'large'],
     },
     asr: {
       type: asrType,
@@ -137,7 +137,7 @@ function fillForm(config: EngineConfig): void {
   $<HTMLInputElement>('translation-endpoint').value = config.translation.endpoint ?? '';
   $<HTMLSelectElement>('translation-fallback').value = config.translation.fallbackType ?? 'mt';
   // 本地模型檔位
-  const localTier = config.translation.localModelTier ?? 'small';
+  const localTier = config.translation.localModelTier ?? 'large';
   $<HTMLSelectElement>('local-model-tier').value = localTier;
   $<HTMLInputElement>('local-model-name').value = LOCAL_TRANSLATION_MODELS[localTier];
   $<HTMLSelectElement>('asr-type').value = config.asr.type;
@@ -186,7 +186,7 @@ async function save(): Promise<void> {
     await store.setApiKey('asr', $<HTMLInputElement>('asr-api-key').value.trim());
     
     // 通知 Offscreen Document 切換模型檔位（如果已載入）
-    const localTier = config.translation.localModelTier ?? 'small';
+    const localTier = config.translation.localModelTier ?? 'large';
     try {
       await chrome.runtime.sendMessage({
         topic: 'local-onnx:set-model-tier',
@@ -328,6 +328,7 @@ function initLocalOnnxModelUI(): void {
   /** 模型大小映射（根據檔位）。 */
   const MODEL_SIZES: Record<LocalModelTier, string> = {
     small: '約 150 MB',
+    medium: '約 200 MB',
     large: '約 750 MB',
   };
 

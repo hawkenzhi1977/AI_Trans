@@ -86,6 +86,8 @@
   var LOCAL_TRANSLATION_MODELS = {
     /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
     small: "Xenova/opus-mt-en-zh",
+    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
+    medium: "onnx-community/SmolLM2-360M-Instruct",
     /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
     large: "onnx-community/Qwen2.5-0.5B-Instruct"
   };
@@ -2298,6 +2300,10 @@ Output example:
     location = "local";
     /** 單次推理的最大字幕行數——限制 prompt/生成長度，避免 0.5B 小模型長輸入時回顯原文。 */
     static CHUNK_SIZE_LARGE = 5;
+    /** Medium model (SmolLM2-360M) 的 chunk size：4 行。
+      * 比 Large 稍小，避免中等模型上下文過長導致注意力退化。
+      */
+    static CHUNK_SIZE_MEDIUM = 4;
     /** Small model (MarianMT/opus-mt) 的 chunk size：3 行。
       * MarianMT 傾向將多行合併為 1 行輸出，但速度從 0.10 seg/s 提升到 ~0.25 seg/s。
       * 配合 splitBySentenceBoundary 嘗試分割，不足的行回退原文。
@@ -2315,9 +2321,16 @@ Output example:
       this.isPrimary = config.isPrimary ?? false;
       this.modelTier = config.modelTier ?? "large";
     }
-    /** 根據模型檔位返回 chunk size：small model 逐句翻譯，large model 可合併多行。 */
+    /** 根據模型檔位返回 chunk size：small 3 行，medium 4 行，large 5 行。 */
     get chunkSize() {
-      return this.modelTier === "small" ? _LocalONNXTranslationProvider.CHUNK_SIZE_SMALL : _LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
+      switch (this.modelTier) {
+        case "small":
+          return _LocalONNXTranslationProvider.CHUNK_SIZE_SMALL;
+        case "medium":
+          return _LocalONNXTranslationProvider.CHUNK_SIZE_MEDIUM;
+        case "large":
+          return _LocalONNXTranslationProvider.CHUNK_SIZE_LARGE;
+      }
     }
     /**
      * 建立與 Service Worker 的 port 長連接。
@@ -3359,7 +3372,7 @@ Output example:
         modelName: tc.localModelName ?? DEFAULT_LOCAL_TRANSLATION_MODEL,
         targetLang: config.targetLang,
         isPrimary: tc.type === "local-onnx",
-        modelTier: tc.localModelTier ?? "small"
+        modelTier: tc.localModelTier ?? "large"
       });
       providers.set(localOnnx.engineId, localOnnx);
     }

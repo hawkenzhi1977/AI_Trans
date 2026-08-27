@@ -2,6 +2,8 @@
 var LOCAL_TRANSLATION_MODELS = {
   /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
   small: "Xenova/opus-mt-en-zh",
+  /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
+  medium: "onnx-community/SmolLM2-360M-Instruct",
   /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
   large: "onnx-community/Qwen2.5-0.5B-Instruct"
 };

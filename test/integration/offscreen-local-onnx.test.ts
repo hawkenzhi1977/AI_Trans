@@ -888,3 +888,131 @@ describe('runInference：Small model 退化輸出檢測', () => {
     expect(res.ok).toBe(true);
   });
 });
+
+// M2-39：buildPromptSmolLM2 — SmolLM2 chat template 格式。
+describe('buildPromptSmolLM2 — SmolLM2 chat template', () => {
+  const { buildPromptSmolLM2 } = _testExports;
+
+  it('生成包含 <|system|>、<|user|>、<|assistant|> 標籤的 prompt', () => {
+    const prompt = buildPromptSmolLM2('1. Hello world', 'zh-Hant');
+    expect(prompt).toContain('<|system|>');
+    expect(prompt).toContain('<|user|>');
+    expect(prompt).toContain('<|assistant|>');
+    expect(prompt).toContain('1. Hello world');
+    expect(prompt).toContain('Traditional Chinese');
+  });
+
+  it('包含 few-shot 示例（Traditional Chinese）', () => {
+    const prompt = buildPromptSmolLM2('1. Test', 'zh-Hant');
+    expect(prompt).toContain('Hello, world.');
+    expect(prompt).toContain('你好，世界。');
+  });
+
+  it('不包含 ChatML 標籤（<|im_start|>）', () => {
+    const prompt = buildPromptSmolLM2('1. Test', 'zh-Hant');
+    expect(prompt).not.toContain('<|im_start|>');
+    expect(prompt).not.toContain('<|im_end|>');
+  });
+});
+
+// M2-39：clearCacheForModel — 按模型名稱清理快取。
+describe('clearCacheForModel — 按模型名稱清理快取', () => {
+  const { clearCacheForModel } = _testExports;
+
+  beforeEach(() => {
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('清除匹配 modelName 的快取條目', async () => {
+    const deleteFn = vi.fn(async () => true);
+    const cache = {
+      keys: vi.fn(async () => [
+        makeRequest('https://huggingface.co/Xenova/opus-mt-en-zh/resolve/main/model.onnx'),
+        makeRequest('https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/model.onnx'),
+      ]),
+      delete: deleteFn,
+    };
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache']),
+      open: vi.fn(async () => cache),
+    });
+
+    await clearCacheForModel('Xenova/opus-mt-en-zh');
+
+    expect(deleteFn).toHaveBeenCalledTimes(1);
+    expect(deleteFn.mock.calls[0][0].url).toContain('opus-mt-en-zh');
+  });
+
+  it('不匹配 modelName 的條目不被清除', async () => {
+    const deleteFn = vi.fn(async () => true);
+    const cache = {
+      keys: vi.fn(async () => [
+        makeRequest('https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/model.onnx'),
+      ]),
+      delete: deleteFn,
+    };
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache']),
+      open: vi.fn(async () => cache),
+    });
+
+    await clearCacheForModel('Xenova/opus-mt-en-zh');
+
+    expect(deleteFn).not.toHaveBeenCalled();
+  });
+});
+
+// M2-39：setModelTier async — 切換檔位時清理舊檔位快取。
+describe('setModelTier async — 切換檔位清理舊檔位快取', () => {
+  beforeEach(() => {
+    resetLocalOnnxModuleForTest();
+    transformersMock.pipeline.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('setModelTier 返回 Promise', async () => {
+    const result = _testExports.setModelTier('small');
+    expect(result).toBeInstanceOf(Promise);
+    await result;
+  });
+
+  it('切換檔位後 currentModelTier 更新', async () => {
+    await _testExports.setModelTier('small');
+    expect(_testExports.currentModelTier).toBe('small');
+
+    await _testExports.setModelTier('medium');
+    expect(_testExports.currentModelTier).toBe('medium');
+
+    await _testExports.setModelTier('large');
+    expect(_testExports.currentModelTier).toBe('large');
+  });
+});
+
+// M2-39：Medium tier — runInference 使用 SmolLM2 prompt 格式。
+describe('runInference：Medium tier 使用 SmolLM2 prompt', () => {
+  beforeEach(() => {
+    resetLocalOnnxModuleForTest();
+    transformersMock.pipeline.mockReset();
+  });
+
+  it('Medium tier 推理使用 text-generation pipeline', async () => {
+    const mockPipelineFn = vi.fn().mockResolvedValue([{ generated_text: '1. 測試翻譯' }]);
+    transformersMock.pipeline.mockResolvedValue(mockPipelineFn);
+
+    await _testExports.setModelTier('medium');
+    await _testExports.ensurePipelineLoaded();
+
+    const res = await _testExports.runInference('1. Test translation', 'zh-Hant', undefined, false, 'medium');
+
+    expect(res.ok).toBe(true);
+    // parseNumberedOutput 會提取行號後的譯文（不含行號前綴）
+    expect(res.translatedText).toBe('測試翻譯');
+  });
+});

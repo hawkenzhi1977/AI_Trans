@@ -48536,6 +48536,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var LOCAL_TRANSLATION_MODELS = {
     /** 小型翻譯模型（MarianMT），專為翻譯設計，記憶體小、速度快。僅支援英→中。 */
     small: "Xenova/opus-mt-en-zh",
+    /** 中型 LLM 模型（SmolLM2），平衡質量與性能，適合低配置機器。 */
+    medium: "onnx-community/SmolLM2-360M-Instruct",
     /** 大型通用 LLM 模型（Qwen2.5），高質量翻譯，但記憶體大、速度較慢。 */
     large: "onnx-community/Qwen2.5-0.5B-Instruct"
   };
@@ -48943,8 +48945,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         return true;
       case "local-onnx:set-model-tier": {
         const tierMsg = message;
-        const result = setModelTier(tierMsg.tier ?? "small");
-        respond({ type: "local-onnx:status", downloaded: false, modelName: result.modelName });
+        void setModelTier(tierMsg.tier ?? "large").then(async (result) => {
+          const downloaded = await hasModelInCache();
+          respond({ type: "local-onnx:status", downloaded, modelName: result.modelName });
+        });
         return true;
       }
       case "local-onnx:translate": {
@@ -49021,9 +49025,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             break;
           case "local-onnx:set-model-tier": {
             const tier = msg.payload?.tier;
-            const tierResult = setModelTier(tier ?? "small");
+            const tierResult = await setModelTier(tier ?? "large");
+            const downloaded = await hasModelInCache();
             result = { tier: tierResult.tier, modelName: tierResult.modelName };
-            broadcastToAll({ type: "local-onnx:status", downloaded: false, modelName: tierResult.modelName });
+            broadcastToAll({ type: "local-onnx:status", downloaded, modelName: tierResult.modelName });
             break;
           }
           case "local-onnx:translate": {
@@ -49094,13 +49099,14 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var cacheGeneration = 0;
   var disposePromise = null;
   var tierGeneration = 0;
-  var currentModelTier = "small";
-  var currentModelName = LOCAL_TRANSLATION_MODELS.small;
+  var currentModelTier = "large";
+  var currentModelName = LOCAL_TRANSLATION_MODELS.large;
   function isSmallModel() {
     return currentModelTier === "small";
   }
-  function setModelTier(tier) {
+  async function setModelTier(tier) {
     if (tier !== currentModelTier) {
+      const oldModelName = currentModelName;
       console.log(`[AI_Trans] \u5207\u63DB\u6A21\u578B\u6A94\u4F4D: ${currentModelTier} \u2192 ${tier}`);
       currentModelTier = tier;
       currentModelName = LOCAL_TRANSLATION_MODELS[tier];
@@ -49110,8 +49116,14 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       loadPromise = null;
       loadPromiseHasProgress = false;
       if (oldPipeline !== null) {
-        disposePromise = disposePipeline(oldPipeline).catch((err) => {
-          console.warn("[AI_Trans] setModelTier dispose error:", err instanceof Error ? err.message : String(err));
+        disposePromise = disposePipeline(oldPipeline).then(() => clearCacheForModel(oldModelName)).catch((err) => {
+          console.warn("[AI_Trans] setModelTier dispose/clear error:", err instanceof Error ? err.message : String(err));
+        }).finally(() => {
+          disposePromise = null;
+        });
+      } else {
+        disposePromise = clearCacheForModel(oldModelName).catch((err) => {
+          console.warn("[AI_Trans] setModelTier clear error:", err instanceof Error ? err.message : String(err));
         }).finally(() => {
           disposePromise = null;
         });
@@ -49199,7 +49211,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         });
       }
     } else {
-      console.log(`[AI_Trans] \u8F09\u5165\u5927\u578B LLM \u6A21\u578B: ${modelName}`);
+      console.log(`[AI_Trans] \u8F09\u5165 ${currentModelTier} LLM \u6A21\u578B: ${modelName}`);
       try {
         return await pipeline("text-generation", modelName, {
           dtype: "q4",
@@ -49379,6 +49391,25 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       };
     }
   }
+  async function clearCacheForModel(modelName) {
+    try {
+      const cachesApi = globalThis.caches;
+      if (typeof cachesApi === "undefined" || typeof cachesApi.keys !== "function") return;
+      const cacheNames = await cachesApi.keys();
+      const target = cacheNames.find((name) => name === "transformers-cache");
+      if (!target) return;
+      const cache = await cachesApi.open(target);
+      const requests = await cache.keys();
+      for (const req of requests) {
+        if (req.url.includes(modelName)) {
+          await cache.delete(req);
+        }
+      }
+      console.log(`[AI_Trans] \u5DF2\u6E05\u9664\u6A21\u578B\u5FEB\u53D6: ${modelName}`);
+    } catch (err) {
+      console.warn("[AI_Trans] clearCacheForModel failed:", err);
+    }
+  }
   async function hasModelInCache() {
     try {
       const cachesApi = globalThis.caches;
@@ -49390,7 +49421,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       if (!target) return false;
       const cache = await cachesApi.open(target);
       const requests = await cache.keys();
-      return requests.some((r2) => r2.url.includes(".onnx") || r2.url.includes(currentModelName));
+      return requests.some((r2) => r2.url.includes(currentModelName));
     } catch {
       return false;
     }
@@ -49806,7 +49837,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     if (requestedTier && requestedTier !== currentModelTier) {
       console.log(`[AI_Trans] runInference: switching tier from ${currentModelTier} to ${requestedTier} per request`);
-      setModelTier(requestedTier);
+      await setModelTier(requestedTier);
     }
     if (translationPipeline === null) {
       try {
@@ -49846,6 +49877,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         const pipelineFn = translationPipeline;
         const result = await pipelineFn(text, {
           max_new_tokens: 256,
+          do_sample: false,
           repetition_penalty: 1.2,
           no_repeat_ngram_size: 3
         });
@@ -49877,19 +49909,19 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           echoed: false
         };
       } else {
-        console.log("[AI_Trans:local-onnx-large] \u958B\u59CB\u7FFB\u8B6F, text length:", text.length, "targetLang:", targetLang);
+        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u958B\u59CB\u7FFB\u8B6F, text length:`, text.length, "targetLang:", targetLang);
         const sourceLines = text.split("\n");
-        const prompt = buildPrompt(text, targetLang);
-        console.log("[AI_Trans:local-onnx-large] prompt \u69CB\u5EFA\u5B8C\u6210, prompt length:", prompt.length);
+        const prompt = currentModelTier === "medium" ? buildPromptSmolLM2(text, targetLang) : buildPrompt(text, targetLang);
+        console.log(`[AI_Trans:local-onnx-${currentModelTier}] prompt \u69CB\u5EFA\u5B8C\u6210, prompt length:`, prompt.length);
         const pipelineFn = translationPipeline;
-        console.log("[AI_Trans:local-onnx-large] \u958B\u59CB\u63A8\u7406...");
+        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u958B\u59CB\u63A8\u7406...`);
         const result = await pipelineFn(prompt, {
           max_new_tokens: 256,
           do_sample: false,
           repetition_penalty: 1.1,
           return_full_text: false
         });
-        console.log("[AI_Trans:local-onnx-large] \u63A8\u7406\u5B8C\u6210");
+        console.log(`[AI_Trans:local-onnx-${currentModelTier}] \u63A8\u7406\u5B8C\u6210`);
         const generatedText = result[0]?.generated_text ?? "";
         console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
         console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
@@ -50070,12 +50102,29 @@ Examples:
 ${fewShot.map(([src, dst]) => `9. ${src}
 9. ${dst}`).join("\n")}` : "";
     return `<|im_start|>system
-You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+ You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
 <|im_end|>
 <|im_start|>user
 ${numbered}
 <|im_end|>
 <|im_start|>assistant
+`;
+  }
+  function buildPromptSmolLM2(text, targetLang) {
+    const langName = getLanguageName(targetLang);
+    const numbered = text.split("\n").map((line, i2) => `${i2 + 1}. ${line}`).join("\n");
+    const fewShot = FEW_SHOT_LINES[langName];
+    const fewShotText = fewShot ? `
+Examples:
+${fewShot.map(([src, dst]) => `9. ${src}
+9. ${dst}`).join("\n")}` : "";
+    return `<|system|>
+You are a professional subtitle translator. Translate each numbered line into ${langName}. Keep the same line numbers and output ONLY the translation after each number, one line per input line, no explanations.${fewShotText}
+<|end|>
+<|user|>
+${numbered}
+<|end|>
+<|assistant|>
 `;
   }
   function parseNumberedOutput(generated, sourceLines) {
@@ -50166,8 +50215,8 @@ ${numbered}
     webgpuFailed = false;
     asrDownloadInProgress = false;
     asrPipeline = null;
-    currentModelTier = "small";
-    currentModelName = LOCAL_TRANSLATION_MODELS.small;
+    currentModelTier = "large";
+    currentModelName = LOCAL_TRANSLATION_MODELS.large;
   }
   var _testExports = {
     hasModelInCache,
@@ -50177,6 +50226,7 @@ ${numbered}
     downloadModel,
     ensurePipelineLoaded,
     buildPrompt,
+    buildPromptSmolLM2,
     parseNumberedOutput,
     warmupModel,
     shutdownForIdle,
@@ -50201,7 +50251,9 @@ ${numbered}
     // 進度聚合器（供測試驗證多檔案下載進度計算）。
     DownloadProgressAggregator,
     // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
-    calcUniqueNgramRatio
+    calcUniqueNgramRatio,
+    // 檔位切換時清理舊檔位快取（供測試驗證）。
+    clearCacheForModel
   };
 })();
 /*! Bundled license information:

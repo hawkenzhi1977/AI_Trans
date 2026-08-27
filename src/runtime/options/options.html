@@ -64,10 +64,11 @@
     
     <label for="local-model-tier">模型檔位</label>
     <select id="local-model-tier">
-      <option value="small">小型翻譯模型（~150MB，速度快，僅支援英→中）</option>
-      <option value="large">大型 LLM 模型（~750MB，高質量，支援多語言）</option>
+      <option value="small">小型翻譯模型（~150MB，⚠ 質量不穩定，僅支援英→中）</option>
+      <option value="medium">中型 LLM 模型（~200MB，平衡質量與性能）</option>
+      <option value="large" selected>大型 LLM 模型（~750MB，高質量，支援多語言）</option>
     </select>
-    <p class="hint" id="local-model-tier-hint">推薦低配置機器使用小型模型，高配置機器可選擇大型模型獲得更好翻譯質量。</p>
+    <p class="hint" id="local-model-tier-hint">推薦使用大型模型獲得最佳翻譯質量。低配置機器可嘗試中型模型。小型模型在部分設備上可能產生亂碼。</p>
     
     <label for="local-model-name">當前模型名稱</label>
     <input id="local-model-name" type="text" disabled />
