@@ -44,7 +44,7 @@ English version: [README.md](./README.md).
 預構建的發布件位於 [`release/`](./release/)：
 
 - `release/ai-trans-extension/` — 未打包擴充目錄（推薦）。
-- `release/ai-trans-extension-v0.5.0.zip` — 壓縮包。
+- `release/ai-trans-extension-v0.6.0.zip` — 壓縮包。
 
 在 **Windows、macOS、Linux 上加載方式完全相同**，任何 Chromium 內核瀏覽器（Chrome / Edge / Brave）通用：
 

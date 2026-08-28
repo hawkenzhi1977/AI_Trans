@@ -44,7 +44,7 @@ AI_Trans grabs a video's captions (or, later, transcribes its audio), translates
 Prebuilt artifacts live in [`release/`](./release/):
 
 - `release/ai-trans-extension/` — unpacked extension folder (recommended).
-- `release/ai-trans-extension-v0.5.0.zip` — zipped archive.
+- `release/ai-trans-extension-v0.6.0.zip` — zipped archive.
 
 Loading is **identical on Windows, macOS, and Linux** and on any Chromium browser (Chrome / Edge / Brave):
 
