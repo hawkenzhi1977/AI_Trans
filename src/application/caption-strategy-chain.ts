@@ -67,7 +67,20 @@ export class CaptionStrategyChain {
             to: next.origin,
           });
         } else {
-          // 無可降級策略，停止
+          // M2-44 修復：最後一個策略 run() 拋錯時，也發送 pipeline-error（§5.6）。
+          // 此前直接 return 跳過了後面的 pipeline-error 邏輯，導致晚捕獲重試機制永遠不會觸發。
+          const reason = diagnostics.length > 0
+            ? diagnostics.join(' | ')
+            : `${strategy.origin}: run failed — ${causeMsg}`;
+          this.onEvent?.({
+            type: 'pipeline-error',
+            error: {
+              port: 'platform',
+              code: 'no-caption-strategy',
+              recoverable: false,
+              cause: new Error(reason),
+            },
+          });
           return { origin: strategy.origin, errors };
         }
       }

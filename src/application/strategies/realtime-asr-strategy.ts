@@ -12,6 +12,7 @@ import type { SubtitleSegment } from '../../domain/models/subtitle';
 import { EnergyVAD } from '../../infrastructure/vad';
 import { PerfMetrics } from '../../infrastructure/perf/metrics';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
+import { diagLog } from '../../infrastructure/debug-log';
 
 /** RealtimeASRStrategy 依賴注入。 */
 export interface RealtimeASRDeps {
@@ -97,8 +98,12 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     }, 10000);
 
     // 啟動音頻源（保存 handle 供 stop() 關閉，§5.4 洩漏零容忍）。
+    // M2-44：增加診斷日誌，方便排查掛起或拋錯。
+    diagLog('strategy', 'realtime-asr: opening audio source...');
     this.audioHandle = await audioSource.open(ctx.platform);
+    diagLog('strategy', 'realtime-asr: audio source opened, starting...');
     await this.audioHandle.start();
+    diagLog('strategy', 'realtime-asr: audio source started successfully');
 
     // 監聽音頻塊。
     audioSource.onChunk(async (chunk: AudioChunk) => {

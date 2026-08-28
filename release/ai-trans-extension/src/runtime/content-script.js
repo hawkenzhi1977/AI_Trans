@@ -53,6 +53,16 @@
               to: next.origin
             });
           } else {
+            const reason = diagnostics.length > 0 ? diagnostics.join(" | ") : `${strategy.origin}: run failed \u2014 ${causeMsg}`;
+            this.onEvent?.({
+              type: "pipeline-error",
+              error: {
+                port: "platform",
+                code: "no-caption-strategy",
+                recoverable: false,
+                cause: new Error(reason)
+              }
+            });
             return { origin: strategy.origin, errors };
           }
         }
@@ -495,8 +505,11 @@
           });
         }
       }, 1e4);
+      diagLog("strategy", "realtime-asr: opening audio source...");
       this.audioHandle = await audioSource.open(ctx.platform);
+      diagLog("strategy", "realtime-asr: audio source opened, starting...");
       await this.audioHandle.start();
+      diagLog("strategy", "realtime-asr: audio source started successfully");
       audioSource.onChunk(async (chunk) => {
         if (!this.running) return;
         this.vad.markChunk(chunk);
@@ -2728,7 +2741,25 @@ Output example:
 
   // src/adapters/audio/tab-capture-source.ts
   var OFFSCREEN_URL = "src/runtime/offscreen.html";
+  var CHROME_API_TIMEOUT_MS = 5e3;
   var seqCounter = 0;
+  function withTimeout(promise, timeoutMs, message) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`${message} (timeout after ${timeoutMs}ms)`));
+      }, timeoutMs);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
   var TabCaptureAudioSource = class {
     kind = "tab-capture";
     port = null;
@@ -2748,14 +2779,27 @@ Output example:
     async start() {
       if (!this.offscreenCreated) {
         try {
-          await chrome.offscreen.createDocument({
-            url: OFFSCREEN_URL,
-            reasons: [chrome.offscreen.Reason.USER_MEDIA],
-            justification: "ASR audio processing: tabCapture + PCM extraction"
-          });
+          await withTimeout(
+            chrome.offscreen.createDocument({
+              url: OFFSCREEN_URL,
+              reasons: [chrome.offscreen.Reason.USER_MEDIA],
+              justification: "ASR audio processing: tabCapture + PCM extraction"
+            }),
+            CHROME_API_TIMEOUT_MS,
+            "chrome.offscreen.createDocument"
+          );
           this.offscreenCreated = true;
         } catch (err) {
           if (!(err instanceof Error && err.message.includes("only one"))) {
+            recordDiagnostic({
+              type: "pipeline-error",
+              error: {
+                port: "audio",
+                code: "offscreen-create-failed",
+                recoverable: true,
+                cause: err instanceof Error ? err : new Error(String(err))
+              }
+            });
             throw err;
           }
         }
@@ -2781,7 +2825,11 @@ Output example:
         }
         this.port = null;
       });
-      const authState = await chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]);
+      const authState = await withTimeout(
+        chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]),
+        CHROME_API_TIMEOUT_MS,
+        "chrome.storage.local.get"
+      );
       if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
         throw new Error("tabCapture not authorized or streamId missing");
       }

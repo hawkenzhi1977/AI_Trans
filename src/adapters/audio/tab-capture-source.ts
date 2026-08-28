@@ -22,8 +22,30 @@ type OffscreenResponse =
 /** Offscreen Document URL（相對路徑，Chrome 會解析為擴充內部 URL）。 */
 const OFFSCREEN_URL = 'src/runtime/offscreen.html';
 
+/** M2-44：超時時間（毫秒）：Chrome API 調用超時保護。 */
+const CHROME_API_TIMEOUT_MS = 5_000;
+
 /** 音頻塊序號計數器（單調遞增）。 */
 let seqCounter = 0;
+
+/** M2-44：Promise 超時包裝器。 */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${message} (timeout after ${timeoutMs}ms)`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
 
 export class TabCaptureAudioSource implements AudioSourceProvider {
   readonly kind = 'tab-capture' as const;
@@ -48,15 +70,30 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
     // 創建 Offscreen Document（MV3 同時只允許一個，重複創建會拋錯）。
     if (!this.offscreenCreated) {
       try {
-        await chrome.offscreen.createDocument({
-          url: OFFSCREEN_URL,
-          reasons: [chrome.offscreen.Reason.USER_MEDIA],
-          justification: 'ASR audio processing: tabCapture + PCM extraction',
-        });
+        // M2-44：增加超時機制，防止 Chrome API 掛起導致策略鏈卡住。
+        await withTimeout(
+          chrome.offscreen.createDocument({
+            url: OFFSCREEN_URL,
+            reasons: [chrome.offscreen.Reason.USER_MEDIA],
+            justification: 'ASR audio processing: tabCapture + PCM extraction',
+          }),
+          CHROME_API_TIMEOUT_MS,
+          'chrome.offscreen.createDocument'
+        );
         this.offscreenCreated = true;
       } catch (err) {
         // 已存在時忽略（MV3 限制），但仍嘗試建立 port。
         if (!(err instanceof Error && err.message.includes('only one'))) {
+          // §5.6：超時或其他錯誤必須落診斷。
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'audio',
+              code: 'offscreen-create-failed',
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err)),
+            },
+          });
           throw err;
         }
       }
@@ -87,7 +124,12 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
     });
 
     // 從存儲讀取 streamId（Popup「啟用 ASR」按鈕授權時獲取）。
-    const authState = await chrome.storage.local.get(['tabCaptureAuthorized', 'tabCaptureStreamId']);
+    // M2-44：增加超時機制。
+    const authState = await withTimeout(
+      chrome.storage.local.get(['tabCaptureAuthorized', 'tabCaptureStreamId']),
+      CHROME_API_TIMEOUT_MS,
+      'chrome.storage.local.get'
+    );
     if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
       throw new Error('tabCapture not authorized or streamId missing');
     }
