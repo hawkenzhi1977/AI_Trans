@@ -125,6 +125,7 @@
       videoId: extractVideoId(url)
     };
     diagLog("interceptor", "emitCapture: success, captureRequestCount:", captureRequestCount, "videoId:", capture.videoId);
+    cancelCaptureVerification();
     resetPotRedrive();
     scheduleSuppressNative();
     lastCapture = capture;
@@ -190,6 +191,35 @@
     return manual ?? tracklist[0];
   }
   var captionModuleDriven = false;
+  var captureVerifyTimer = null;
+  var captureVerifyRetries = 0;
+  var MAX_CAPTURE_VERIFY_RETRIES = 3;
+  var CAPTURE_VERIFY_TIMEOUT_MS = 8e3;
+  function startCaptureVerification() {
+    if (captureVerifyTimer !== null) {
+      clearTimeout(captureVerifyTimer);
+    }
+    captureVerifyTimer = setTimeout(() => {
+      captureVerifyTimer = null;
+      const currentVid = extractVideoId(globalThis.location?.href ?? "");
+      const hasValidCapture = lastCapture && (!currentVid || lastCapture.videoId === currentVid);
+      if (!hasValidCapture && captureVerifyRetries < MAX_CAPTURE_VERIFY_RETRIES) {
+        captureVerifyRetries++;
+        diagLog("interceptor", "capture verification timeout, retry", captureVerifyRetries, "/", MAX_CAPTURE_VERIFY_RETRIES);
+        captionModuleDriven = false;
+        ensureCaptionModuleLoaded();
+      } else if (captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
+        diagLog("interceptor", "capture verification exhausted after", MAX_CAPTURE_VERIFY_RETRIES, "retries");
+      }
+    }, CAPTURE_VERIFY_TIMEOUT_MS);
+  }
+  function cancelCaptureVerification() {
+    if (captureVerifyTimer !== null) {
+      clearTimeout(captureVerifyTimer);
+      captureVerifyTimer = null;
+    }
+    captureVerifyRetries = 0;
+  }
   function getCaptionTracksFromPlayerResponse() {
     const scripts = document.querySelectorAll("script:not([src])");
     for (const el of Array.from(scripts)) {
@@ -380,14 +410,29 @@
     diagLog("interceptor", "Found", tracklist.length, "caption tracks from", source);
     Reflect.set(globalThis, "__aiTransCaptionTracks", tracklist.length);
     emitTrackInfo(tracklist);
-    const track = pickTargetTrack(tracklist);
+    let track;
     try {
+      track = pickTargetTrack(tracklist);
+      diagLog("interceptor", "pickTargetTrack result:", JSON.stringify({
+        languageCode: track.languageCode,
+        baseUrl: track.baseUrl?.substring(0, 80),
+        kind: track.kind,
+        hasBaseUrl: Boolean(track.baseUrl)
+      }));
+    } catch (err) {
+      diagLog("interceptor", "pickTargetTrack error:", err);
+      return;
+    }
+    try {
+      diagLog("interceptor", "Calling player.setOption...");
       player.setOption("captions", "track", track);
       captionModuleDriven = true;
       diagLog("interceptor", "Caption module driven successfully, selected track:", track);
+      startCaptureVerification();
       scheduleSuppressDeadline(player);
     } catch (err) {
       diagLog("interceptor", "setOption error:", err);
+      diagLog("interceptor", "setOption error stack:", err instanceof Error ? err.stack : "no stack");
     }
   }
   function startCaptionModuleDriver() {
@@ -405,6 +450,7 @@
   function resetAndRedriveCaptionModule() {
     if (interceptorDisabled) return;
     resetPotRedrive();
+    cancelCaptureVerification();
     captionModuleDriven = false;
     ensureCaptionModuleLoaded();
     if (!captionModuleDriven) {
@@ -434,6 +480,7 @@
       lastCapture = null;
       detectedAudioLang = void 0;
       Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);
+      cancelCaptureVerification();
       captionModuleDriven = false;
       resetAndRedriveCaptionModule();
     };
