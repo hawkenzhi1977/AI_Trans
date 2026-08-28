@@ -185,6 +185,8 @@ function emitCapture(
     videoId: extractVideoId(url),
   };
   diagLog('interceptor', 'emitCapture: success, captureRequestCount:', captureRequestCount, 'videoId:', capture.videoId);
+  // 成功捕獲後取消驗證計時器（不再重試驅動）。
+  cancelCaptureVerification();
   // M2-24 補充修復十二：成功捕獲後重置 pot 重驅動，並排程復位抑制原生字幕（避免雙重顯示）。
   resetPotRedrive();
   scheduleSuppressNative();
@@ -308,6 +310,43 @@ function pickTargetTrack(tracklist: YtCaptionTrack[]): YtCaptionTrack {
 
 /** 標記字幕模組驅動是否已成功（避免重試定時器無限跑）。 */
 let captionModuleDriven = false;
+
+/** 捕獲驗證計時器（setOption 成功後啟動，超時未捕獲則重試）。 */
+let captureVerifyTimer: ReturnType<typeof setTimeout> | null = null;
+/** 捕獲驗證已重試次數（限制最多 3 次重試，避免無限循環）。 */
+let captureVerifyRetries = 0;
+const MAX_CAPTURE_VERIFY_RETRIES = 3;
+const CAPTURE_VERIFY_TIMEOUT_MS = 8_000;
+
+/** 啟動捕獲驗證：setOption 成功後 8 秒內若未捕獲任何 timedtext 響應，則重試驅動。 */
+function startCaptureVerification(): void {
+  if (captureVerifyTimer !== null) {
+    clearTimeout(captureVerifyTimer);
+  }
+  captureVerifyTimer = setTimeout(() => {
+    captureVerifyTimer = null;
+    // 若 8 秒內仍未捕獲（lastCapture 為 null 或 videoId 不匹配），則重試驅動。
+    const currentVid = extractVideoId(globalThis.location?.href ?? '');
+    const hasValidCapture = lastCapture && (!currentVid || lastCapture.videoId === currentVid);
+    if (!hasValidCapture && captureVerifyRetries < MAX_CAPTURE_VERIFY_RETRIES) {
+      captureVerifyRetries++;
+      diagLog('interceptor', 'capture verification timeout, retry', captureVerifyRetries, '/', MAX_CAPTURE_VERIFY_RETRIES);
+      captionModuleDriven = false;
+      ensureCaptionModuleLoaded();
+    } else if (captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
+      diagLog('interceptor', 'capture verification exhausted after', MAX_CAPTURE_VERIFY_RETRIES, 'retries');
+    }
+  }, CAPTURE_VERIFY_TIMEOUT_MS);
+}
+
+/** 取消捕獲驗證計時器（成功捕獲或視頻切換時調用）。 */
+function cancelCaptureVerification(): void {
+  if (captureVerifyTimer !== null) {
+    clearTimeout(captureVerifyTimer);
+    captureVerifyTimer = null;
+  }
+  captureVerifyRetries = 0;
+}
 
 /**
  * 從 DOM 中的 ytInitialPlayerResponse 解析字幕軌列表（M2-18 修復 + M2-22 videoId 驗證）。
@@ -610,19 +649,37 @@ function ensureCaptionModuleLoaded(): void {
   // M2-22 第三層：發送軌道信息給 content script（content script 無法訪問播放器 API，
   // 當 DOM stale 時需要這些信息來構建字幕軌列表）。
   emitTrackInfo(tracklist);
-  const track = pickTargetTrack(tracklist);
+  
+  // 增強診斷 + 異常捕獲：包裹 pickTargetTrack 在 try-catch 中，避免未捕獲異常導致函數提前退出。
+  let track: YtCaptionTrack;
+  try {
+    track = pickTargetTrack(tracklist);
+    diagLog('interceptor', 'pickTargetTrack result:', JSON.stringify({
+      languageCode: track.languageCode,
+      baseUrl: track.baseUrl?.substring(0, 80),
+      kind: track.kind,
+      hasBaseUrl: Boolean(track.baseUrl),
+    }));
+  } catch (err) {
+    diagLog('interceptor', 'pickTargetTrack error:', err);
+    return;
+  }
   
   try {
     // 選軌 → 播放器發帶 pot 的 timedtext 請求（被 XHR/fetch hook 捕獲）。
+    diagLog('interceptor', 'Calling player.setOption...');
     player.setOption('captions', 'track', track);
     captionModuleDriven = true;
     diagLog('interceptor', 'Caption module driven successfully, selected track:', track);
+    // 啟動捕獲驗證：8 秒內若未捕獲任何 timedtext 響應，則重試驅動（處理廣告期間播放器不就緒的情況）。
+    startCaptureVerification();
     // M2-24 補充修復十二：不再用固定 3 秒復位（可能打斷播放器尚未完成的 pot 重試），
     // 改為「成功捕獲後抑制原生字幕」+ 10 秒截止復位。原生字幕可能短暫顯示，
     // 但捕獲成功後（scheduleSuppressNative）即被隱藏，可接受。
     scheduleSuppressDeadline(player);
   } catch (err) {
     diagLog('interceptor', 'setOption error:', err);
+    diagLog('interceptor', 'setOption error stack:', err instanceof Error ? err.stack : 'no stack');
     // 選軌失敗：不標記成功，重試定時器會再試。
   }
 }
@@ -647,6 +704,8 @@ function resetAndRedriveCaptionModule(): void {
   if (interceptorDisabled) return;
   // M2-24 補充修復十二：重置 pot 重驅動計數並清除排程（視頻切換/熱重啟時重新開始）。
   resetPotRedrive();
+  // 重置捕獲驗證計數器（視頻切換/重啟時重新開始）。
+  cancelCaptureVerification();
   captionModuleDriven = false;
   // 立即嘗試一次（處理播放器已就緒的情況）
   ensureCaptionModuleLoaded();
@@ -691,6 +750,8 @@ function install(): void {
     detectedAudioLang = undefined;
     // 同步清空調試輔助全局變量（與 emitCapture 中的設置對應）。
     Reflect.set(globalThis, '__aiTransTimedtextLastCapture', null);
+    // 重置捕獲驗證計數器（視頻切換時重新開始）。
+    cancelCaptureVerification();
     captionModuleDriven = false;
     resetAndRedriveCaptionModule();
   };
