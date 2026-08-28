@@ -67,8 +67,7 @@
     
     <label for="local-onnx-chunk-size">Chunk Size（單次推理行數）</label>
     <select id="local-onnx-chunk-size">
-      <option value="3">3（低記憶體，適合低配置機器）</option>
-      <option value="4">4（平衡）</option>
+      <option value="4">4（低記憶體，適合低配置機器）</option>
       <option value="5" selected>5（高質量，默認）</option>
     </select>
     <p class="hint">值越小，單次推理的記憶體峰值越低，但翻譯速度可能稍慢。值越大，翻譯質量越好，但需要更多記憶體。</p>

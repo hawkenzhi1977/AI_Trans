@@ -48779,14 +48779,18 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           type: "asr-whisper:download-progress",
           progress: agg.progress,
           loaded: agg.loaded,
-          total: agg.total
+          total: agg.total,
+          fileCount: agg.fileCount,
+          completedFiles: agg.completedFiles
         });
       } else if (localOnnxDownloadInProgress) {
         broadcastToAll({
           type: "local-onnx:download-progress",
           progress: agg.progress,
           loaded: agg.loaded,
-          total: agg.total
+          total: agg.total,
+          fileCount: agg.fileCount,
+          completedFiles: agg.completedFiles
         });
       }
     }
@@ -49112,15 +49116,26 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     files = /* @__PURE__ */ new Map();
     /** 更新單文件進度並返回整體百分比（0-100）與累計 loaded/total。 */
     update(file, loaded, total) {
-      this.files.set(file, { loaded, total });
+      const existing = this.files.get(file);
+      const done = existing?.done ?? false;
+      this.files.set(file, { loaded, total, done });
       let totalLoaded = 0;
       let totalBytes = 0;
+      let completedFiles = 0;
       for (const f2 of this.files.values()) {
         totalLoaded += f2.loaded;
         totalBytes += f2.total;
+        if (f2.done) completedFiles++;
       }
       const progress = totalBytes > 0 ? Math.round(totalLoaded / totalBytes * 100) : 0;
-      return { progress, loaded: totalLoaded, total: totalBytes };
+      return { progress, loaded: totalLoaded, total: totalBytes, fileCount: this.files.size, completedFiles };
+    }
+    /** 標記文件下載完成。 */
+    markDone(file) {
+      const existing = this.files.get(file);
+      if (existing) {
+        existing.done = true;
+      }
     }
     reset() {
       this.files.clear();
@@ -49367,13 +49382,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             type: "local-onnx:download-progress",
             progress: agg.progress,
             loaded: agg.loaded,
-            total: agg.total
+            total: agg.total,
+            fileCount: agg.fileCount,
+            completedFiles: agg.completedFiles
           });
         } else if (progress.status === "initiate") {
-          console.log("[AI_Trans:local-onnx] download initiated for:", fileKey);
+          console.log("[AI_Trans:local-onnx] download initiated for:", fileKey, "total:", progress.total);
           aggregator.update(fileKey, 0, progress.total ?? 0);
         } else if (progress.status === "done") {
           console.log("[AI_Trans:local-onnx] file download done:", fileKey);
+          aggregator.markDone(fileKey);
         } else if (progress.status === "ready") {
           console.log("[AI_Trans:local-onnx] model ready");
           broadcastToAll({
@@ -49514,13 +49532,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             type: "asr-whisper:download-progress",
             progress: agg.progress,
             loaded: agg.loaded,
-            total: agg.total
+            total: agg.total,
+            fileCount: agg.fileCount,
+            completedFiles: agg.completedFiles
           });
         } else if (progress.status === "initiate") {
-          console.log("[AI_Trans:asr-whisper] download initiated for:", fileKey);
+          console.log("[AI_Trans:asr-whisper] download initiated for:", fileKey, "total:", progress.total);
           aggregator.update(fileKey, 0, progress.total ?? 0);
         } else if (progress.status === "done") {
           console.log("[AI_Trans:asr-whisper] file download done:", fileKey);
+          aggregator.markDone(fileKey);
         } else if (progress.status === "ready") {
           console.log("[AI_Trans:asr-whisper] model ready");
           broadcastToAll({

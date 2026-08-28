@@ -33,12 +33,12 @@ type OffscreenResponse =
   | { type: 'error'; message: string }
   | { type: 'local-onnx:status'; downloaded: boolean; modelName: string; loaded?: boolean; loading?: boolean; downloading?: boolean }
   | { type: 'local-onnx:warmup-complete'; ok: boolean; error?: string }
-  | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number }
+  | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number; fileCount?: number; completedFiles?: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
   | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
   | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
-  | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number }
+  | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number; fileCount?: number; completedFiles?: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
   | { type: 'asr-whisper:cache-cleared'; ok: boolean }
   | { type: 'asr-whisper:warmup-complete'; ok: boolean; error?: string }
@@ -109,6 +109,8 @@ chrome.runtime.onMessage.addListener((message: unknown): boolean => {
         progress: agg.progress,
         loaded: agg.loaded,
         total: agg.total,
+        fileCount: agg.fileCount,
+        completedFiles: agg.completedFiles,
       });
     } else if (localOnnxDownloadInProgress) {
       broadcastToAll({
@@ -116,6 +118,8 @@ chrome.runtime.onMessage.addListener((message: unknown): boolean => {
         progress: agg.progress,
         loaded: agg.loaded,
         total: agg.total,
+        fileCount: agg.fileCount,
+        completedFiles: agg.completedFiles,
       });
     }
   }
@@ -607,19 +611,31 @@ interface TransformersProgress {
  * 計算整體百分比。
  */
 class DownloadProgressAggregator {
-  private files = new Map<string, { loaded: number; total: number }>();
+  private files = new Map<string, { loaded: number; total: number; done: boolean }>();
 
   /** 更新單文件進度並返回整體百分比（0-100）與累計 loaded/total。 */
-  update(file: string, loaded: number, total: number): { progress: number; loaded: number; total: number } {
-    this.files.set(file, { loaded, total });
+  update(file: string, loaded: number, total: number): { progress: number; loaded: number; total: number; fileCount: number; completedFiles: number } {
+    const existing = this.files.get(file);
+    const done = existing?.done ?? false;
+    this.files.set(file, { loaded, total, done });
     let totalLoaded = 0;
     let totalBytes = 0;
+    let completedFiles = 0;
     for (const f of this.files.values()) {
       totalLoaded += f.loaded;
       totalBytes += f.total;
+      if (f.done) completedFiles++;
     }
     const progress = totalBytes > 0 ? Math.round((totalLoaded / totalBytes) * 100) : 0;
-    return { progress, loaded: totalLoaded, total: totalBytes };
+    return { progress, loaded: totalLoaded, total: totalBytes, fileCount: this.files.size, completedFiles };
+  }
+
+  /** 標記文件下載完成。 */
+  markDone(file: string): void {
+    const existing = this.files.get(file);
+    if (existing) {
+      existing.done = true;
+    }
   }
 
   reset(): void {
@@ -650,7 +666,7 @@ function toReadableError(err: unknown): Error {
  * env 配置統一在此設置，避免各調用點不一致導致行為漂移。
  * 
  * 所有模型統一使用 text-generation pipeline + INT4 量化（dtype: 'q4'）。
- * - small (Qwen2-0.5B): ~750MB, chunk size=3
+ * - small (Qwen2-0.5B): ~750MB, chunk size=4
  * - large (Qwen2.5-0.5B): ~750MB, chunk size=5
  */
 async function loadPipeline(
@@ -996,13 +1012,16 @@ async function downloadModel(): Promise<OffscreenResponse> {
           progress: agg.progress,
           loaded: agg.loaded,
           total: agg.total,
+          fileCount: agg.fileCount,
+          completedFiles: agg.completedFiles,
         });
       } else if (progress.status === 'initiate') {
-        console.log('[AI_Trans:local-onnx] download initiated for:', fileKey);
+        console.log('[AI_Trans:local-onnx] download initiated for:', fileKey, 'total:', progress.total);
         // initiate 時註冊文件（loaded=0），但不廣播 0%（避免進度條跳回）。
         aggregator.update(fileKey, 0, progress.total ?? 0);
       } else if (progress.status === 'done') {
         console.log('[AI_Trans:local-onnx] file download done:', fileKey);
+        aggregator.markDone(fileKey);
       } else if (progress.status === 'ready') {
         console.log('[AI_Trans:local-onnx] model ready');
         broadcastToAll({
@@ -1189,12 +1208,15 @@ async function downloadAsrModel(modelId: string): Promise<OffscreenResponse> {
           progress: agg.progress,
           loaded: agg.loaded,
           total: agg.total,
+          fileCount: agg.fileCount,
+          completedFiles: agg.completedFiles,
         });
       } else if (progress.status === 'initiate') {
-        console.log('[AI_Trans:asr-whisper] download initiated for:', fileKey);
+        console.log('[AI_Trans:asr-whisper] download initiated for:', fileKey, 'total:', progress.total);
         aggregator.update(fileKey, 0, progress.total ?? 0);
       } else if (progress.status === 'done') {
         console.log('[AI_Trans:asr-whisper] file download done:', fileKey);
+        aggregator.markDone(fileKey);
       } else if (progress.status === 'ready') {
         console.log('[AI_Trans:asr-whisper] model ready');
         broadcastToAll({

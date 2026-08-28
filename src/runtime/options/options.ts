@@ -457,10 +457,16 @@ function initLocalOnnxModelUI(): void {
           progress: number;
           loaded: number;
           total: number;
+          fileCount?: number;
+          completedFiles?: number;
         };
+        const fileProgress = progressMsg.fileCount
+          ? `檔案 ${progressMsg.completedFiles ?? 0}/${progressMsg.fileCount}`
+          : '';
+        const byteProgress = `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`;
         updateProgress(
           progressMsg.progress,
-          `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+          fileProgress ? `${fileProgress}（${byteProgress}）` : byteProgress
         );
       } else if (msg.type === 'local-onnx:download-complete') {
         const completeMsg = msg as { type: string; ok: boolean; error?: string };
@@ -567,11 +573,11 @@ const WHISPER_MODEL_IDS: Record<string, string> = {
   small: 'Xenova/whisper-small.en',
 };
 
-/** Whisper 模型大小提示。 */
+/** Whisper 模型大小提示（dtype: q8 實際下載大小）。 */
 const WHISPER_MODEL_SIZES: Record<string, string> = {
-  'Xenova/whisper-tiny.en': '約 150 MB',
-  'Xenova/whisper-base.en': '約 290 MB',
-  'Xenova/whisper-small.en': '約 460 MB',
+  'Xenova/whisper-tiny.en': '約 40 MB',
+  'Xenova/whisper-base.en': '約 80 MB',
+  'Xenova/whisper-small.en': '約 180 MB',
 };
 
 /** ASR 模型狀態。 */
@@ -710,10 +716,16 @@ function initAsrModelUI(): void {
           progress: number;
           loaded: number;
           total: number;
+          fileCount?: number;
+          completedFiles?: number;
         };
+        const fileProgress = progressMsg.fileCount
+          ? `檔案 ${progressMsg.completedFiles ?? 0}/${progressMsg.fileCount}`
+          : '';
+        const byteProgress = `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`;
         updateProgress(
           progressMsg.progress,
-          `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+          fileProgress ? `${fileProgress}（${byteProgress}）` : byteProgress
         );
       } else if (msg.type === 'asr-whisper:download-complete') {
         const completeMsg = msg as { type: string; ok: boolean; error?: string };

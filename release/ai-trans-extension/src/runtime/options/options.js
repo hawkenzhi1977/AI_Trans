@@ -442,9 +442,11 @@
         console.log("[AI_Trans:options] received message:", msg.type, msg);
         if (msg.type === "local-onnx:download-progress") {
           const progressMsg = msg;
+          const fileProgress = progressMsg.fileCount ? `\u6A94\u6848 ${progressMsg.completedFiles ?? 0}/${progressMsg.fileCount}` : "";
+          const byteProgress = `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`;
           updateProgress(
             progressMsg.progress,
-            `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+            fileProgress ? `${fileProgress}\uFF08${byteProgress}\uFF09` : byteProgress
           );
         } else if (msg.type === "local-onnx:download-complete") {
           const completeMsg = msg;
@@ -523,9 +525,9 @@
     small: "Xenova/whisper-small.en"
   };
   var WHISPER_MODEL_SIZES = {
-    "Xenova/whisper-tiny.en": "\u7D04 150 MB",
-    "Xenova/whisper-base.en": "\u7D04 290 MB",
-    "Xenova/whisper-small.en": "\u7D04 460 MB"
+    "Xenova/whisper-tiny.en": "\u7D04 40 MB",
+    "Xenova/whisper-base.en": "\u7D04 80 MB",
+    "Xenova/whisper-small.en": "\u7D04 180 MB"
   };
   function initAsrModelUI() {
     const modelNameInput = $("asr-model-name");
@@ -628,9 +630,11 @@
         const msg = message;
         if (msg.type === "asr-whisper:download-progress") {
           const progressMsg = msg;
+          const fileProgress = progressMsg.fileCount ? `\u6A94\u6848 ${progressMsg.completedFiles ?? 0}/${progressMsg.fileCount}` : "";
+          const byteProgress = `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`;
           updateProgress(
             progressMsg.progress,
-            `${formatBytes(progressMsg.loaded)} / ${formatBytes(progressMsg.total)}`
+            fileProgress ? `${fileProgress}\uFF08${byteProgress}\uFF09` : byteProgress
           );
         } else if (msg.type === "asr-whisper:download-complete") {
           const completeMsg = msg;

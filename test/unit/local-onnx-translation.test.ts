@@ -243,7 +243,7 @@ describe('LocalONNXTranslationProvider', () => {
   it('回顯輸出 → 返回翻譯結果 + 記錄診斷', async () => {
     const provider = new LocalONNXTranslationProvider({
       modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
-      chunkSize: 3,
+      chunkSize: 4,
     });
 
     // 注入 mock port

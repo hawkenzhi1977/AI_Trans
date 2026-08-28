@@ -2,7 +2,7 @@
 export const LOCAL_ONNX_MODEL = 'onnx-community/Qwen2.5-0.5B-Instruct';
 
 /** 本地 ONNX 翻譯 chunk size 類型——單次推理的最大字幕行數。 */
-export type LocalOnnxChunkSize = 3 | 4 | 5;
+export type LocalOnnxChunkSize = 4 | 5;
 
 /** 本地 ONNX 翻譯兜底模型名稱（唯讀）。 */
 export const DEFAULT_LOCAL_TRANSLATION_MODEL = LOCAL_ONNX_MODEL;
@@ -18,7 +18,7 @@ export interface TranslationConfig {
   fallbackType?: 'mt' | 'local-onnx' | 'none';
   /** 本地 ONNX 兜底模型名稱（唯讀）。 */
   localModelName?: string;
-  /** 本地 ONNX chunk size（單次推理最大行數，3/4/5）。值越小記憶體峰值越低。 */
+  /** 本地 ONNX chunk size（單次推理最大行數，4/5）。值越小記憶體峰值越低。 */
   localOnnxChunkSize?: LocalOnnxChunkSize;
 }
 
