@@ -33,6 +33,7 @@
   var TRACK_INFO_EVENT = "ai-trans:track-info";
   var EXTENSION_DISABLED_EVENT = "ai-trans:disable";
   var EXTENSION_ENABLED_EVENT = "ai-trans:enable";
+  var REDRIVE_CAPTIONS_EVENT = "ai-trans:redrive-captions";
   var INSTALL_FLAG = "__aiTransTimedtextInterceptorInstalled";
   var interceptorDisabled = false;
   var detectedAudioLang;
@@ -193,8 +194,8 @@
   var captionModuleDriven = false;
   var captureVerifyTimer = null;
   var captureVerifyRetries = 0;
-  var MAX_CAPTURE_VERIFY_RETRIES = 3;
-  var CAPTURE_VERIFY_TIMEOUT_MS = 8e3;
+  var MAX_CAPTURE_VERIFY_RETRIES = 6;
+  var CAPTURE_VERIFY_TIMEOUT_MS = 1e4;
   function startCaptureVerification() {
     if (captureVerifyTimer !== null) {
       clearTimeout(captureVerifyTimer);
@@ -205,11 +206,22 @@
       const hasValidCapture = lastCapture && (!currentVid || lastCapture.videoId === currentVid);
       if (!hasValidCapture && captureVerifyRetries < MAX_CAPTURE_VERIFY_RETRIES) {
         captureVerifyRetries++;
-        diagLog("interceptor", "capture verification timeout, retry", captureVerifyRetries, "/", MAX_CAPTURE_VERIFY_RETRIES);
+        const totalWaitSec = (captureVerifyRetries * CAPTURE_VERIFY_TIMEOUT_MS / 1e3).toFixed(0);
+        diagLog(
+          "interceptor",
+          "capture verification timeout, retry",
+          captureVerifyRetries,
+          "/",
+          MAX_CAPTURE_VERIFY_RETRIES,
+          "(total wait:",
+          totalWaitSec + "s)"
+        );
         captionModuleDriven = false;
         ensureCaptionModuleLoaded();
-      } else if (captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
-        diagLog("interceptor", "capture verification exhausted after", MAX_CAPTURE_VERIFY_RETRIES, "retries");
+      } else if (!hasValidCapture && captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
+        diagLog("interceptor", "capture verification exhausted after", MAX_CAPTURE_VERIFY_RETRIES, "retries, starting slow recovery driver");
+        captionModuleDriven = false;
+        startSlowRecoveryDriver();
       }
     }, CAPTURE_VERIFY_TIMEOUT_MS);
   }
@@ -219,6 +231,25 @@
       captureVerifyTimer = null;
     }
     captureVerifyRetries = 0;
+  }
+  function startSlowRecoveryDriver() {
+    const SLOW_INTERVAL_MS = 3e3;
+    const SLOW_MAX_RETRIES = 20;
+    let slowAttempts = 0;
+    const timer = setInterval(() => {
+      slowAttempts++;
+      if (lastCapture || slowAttempts >= SLOW_MAX_RETRIES || interceptorDisabled) {
+        clearInterval(timer);
+        if (lastCapture) {
+          diagLog("interceptor", "slow recovery driver: capture arrived, stopping");
+        } else if (slowAttempts >= SLOW_MAX_RETRIES) {
+          diagLog("interceptor", "slow recovery driver: max retries reached, giving up");
+        }
+        return;
+      }
+      diagLog("interceptor", "slow recovery driver: attempt", slowAttempts, "/", SLOW_MAX_RETRIES);
+      ensureCaptionModuleLoaded();
+    }, SLOW_INTERVAL_MS);
   }
   function getCaptionTracksFromPlayerResponse() {
     const scripts = document.querySelectorAll("script:not([src])");
@@ -410,6 +441,7 @@
     diagLog("interceptor", "Found", tracklist.length, "caption tracks from", source);
     Reflect.set(globalThis, "__aiTransCaptionTracks", tracklist.length);
     emitTrackInfo(tracklist);
+    diagLog("interceptor", "proceeding to pickTargetTrack with", tracklist.length, "tracks");
     let track;
     try {
       track = pickTargetTrack(tracklist);
@@ -510,6 +542,12 @@
       resetAndRedriveCaptionModule();
     };
     document.addEventListener(EXTENSION_ENABLED_EVENT, onExtensionEnabled);
+    const onRedriveCaptions = () => {
+      if (interceptorDisabled) return;
+      diagLog("interceptor", "Received redrive-captions from content-script, re-driving caption module");
+      resetAndRedriveCaptionModule();
+    };
+    document.addEventListener(REDRIVE_CAPTIONS_EVENT, onRedriveCaptions);
     startCaptionModuleDriver();
     Reflect.set(globalThis, "__aiTransTimedtextRequests", 0);
     Reflect.set(globalThis, "__aiTransTimedtextLastCapture", null);

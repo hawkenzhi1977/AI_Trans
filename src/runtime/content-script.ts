@@ -63,6 +63,8 @@ class SubtitleController {
     maxRetries: MAX_LATE_CAPTURE_RETRIES,
     cooldownMs: LATE_CAPTURE_RETRY_COOLDOWN_MS,
   });
+  // 廣告場景修復：晚捕獲主動觸發定時器（管線降級後播放器仍未發請求時觸發重新驅動）。
+  private lateCaptureRedriveTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingMountObserver: MutationObserver | null = null;
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
   // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
@@ -328,6 +330,11 @@ class SubtitleController {
     this.unsubscribeCapture?.();
     this.unsubscribeCapture = null;
     this.lateCaptureRetry.disarm();
+    // 廣告場景修復：清理晚捕獲主動觸發定時器（R4：stop 必須解除）。
+    if (this.lateCaptureRedriveTimer !== null) {
+      clearTimeout(this.lateCaptureRedriveTimer);
+      this.lateCaptureRedriveTimer = null;
+    }
     // R4：暫停 MAIN world 攔截橋的消息監聽與輪詢，但**保留 latest 捕獲緩存**
     // （restart 熱重載後字幕已加載的播放器不會再發請求，丟緩存會永久回退 fetch）。
     this.bridge.stop();
@@ -478,6 +485,8 @@ class SubtitleController {
       const videoId = extractVideoId(this.currentUrl());
       this.lateCaptureRetry.arm(videoId || null);
       diagLog('content', 'no-caption-strategy: arming late-capture retry for videoId:', videoId);
+      // 廣告場景修復：10 秒後主動通知 MAIN world 重新驅動播放器（廣告期間 setOption 可能被忽略）。
+      this.scheduleLateCaptureRedrive();
     }
     diagLog('content', 'onEvent received', e.type, e.type === 'engine-degraded' ? e.reason : '');
     // 降級/錯誤事件：持久化診斷 + console 麵包屑，讓「字幕沒出來」的原因可被用戶查詢。
@@ -525,6 +534,17 @@ class SubtitleController {
     // 重跑 native 策略時 tryReuseCapture 會命中 bridge.latest（晚捕獲）。
     await this.orchestrator.start(url);
     diagLog('content', 'retryAfterLateCapture: completed');
+  }
+
+  /** 廣告場景修復：管線降級後 10 秒主動觸發播放器重新驅動字幕模組。 */
+  private scheduleLateCaptureRedrive(): void {
+    if (this.lateCaptureRedriveTimer !== null) return;
+    this.lateCaptureRedriveTimer = setTimeout(() => {
+      this.lateCaptureRedriveTimer = null;
+      if (!this.lateCaptureRetry.isAwaiting) return;
+      diagLog('content', 'lateCaptureRedrive: no capture arrived after 10s, re-triggering player caption module');
+      document.dispatchEvent(new CustomEvent('ai-trans:redrive-captions'));
+    }, 10_000);
   }
 
   /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */

@@ -31,6 +31,8 @@ export const TRACK_INFO_EVENT = 'ai-trans:track-info';
 export const EXTENSION_DISABLED_EVENT = 'ai-trans:disable';
 /** 消息通道常量（M2-31）：content-script 通知攔截器重新啟用。 */
 export const EXTENSION_ENABLED_EVENT = 'ai-trans:enable';
+/** 消息通道常量（廣告場景修復）：content-script 通知攔截器重新驅動字幕模組（晚捕獲主動觸發）。 */
+export const REDRIVE_CAPTIONS_EVENT = 'ai-trans:redrive-captions';
 
 /** 發送給 content-script 的捕獲結果。 */
 export interface TimedTextCapture {
@@ -313,28 +315,31 @@ let captionModuleDriven = false;
 
 /** 捕獲驗證計時器（setOption 成功後啟動，超時未捕獲則重試）。 */
 let captureVerifyTimer: ReturnType<typeof setTimeout> | null = null;
-/** 捕獲驗證已重試次數（限制最多 3 次重試，避免無限循環）。 */
+/** 捕獲驗證已重試次數（限制最多 6 次重試，覆蓋廣告 30s + 播放器啟動時間）。 */
 let captureVerifyRetries = 0;
-const MAX_CAPTURE_VERIFY_RETRIES = 3;
-const CAPTURE_VERIFY_TIMEOUT_MS = 8_000;
+const MAX_CAPTURE_VERIFY_RETRIES = 6;
+const CAPTURE_VERIFY_TIMEOUT_MS = 10_000;
 
-/** 啟動捕獲驗證：setOption 成功後 8 秒內若未捕獲任何 timedtext 響應，則重試驅動。 */
+/** 啟動捕獲驗證：setOption 成功後 10 秒內若未捕獲任何 timedtext 響應，則重試驅動。 */
 function startCaptureVerification(): void {
   if (captureVerifyTimer !== null) {
     clearTimeout(captureVerifyTimer);
   }
   captureVerifyTimer = setTimeout(() => {
     captureVerifyTimer = null;
-    // 若 8 秒內仍未捕獲（lastCapture 為 null 或 videoId 不匹配），則重試驅動。
     const currentVid = extractVideoId(globalThis.location?.href ?? '');
     const hasValidCapture = lastCapture && (!currentVid || lastCapture.videoId === currentVid);
     if (!hasValidCapture && captureVerifyRetries < MAX_CAPTURE_VERIFY_RETRIES) {
       captureVerifyRetries++;
-      diagLog('interceptor', 'capture verification timeout, retry', captureVerifyRetries, '/', MAX_CAPTURE_VERIFY_RETRIES);
+      const totalWaitSec = (captureVerifyRetries * CAPTURE_VERIFY_TIMEOUT_MS / 1000).toFixed(0);
+      diagLog('interceptor', 'capture verification timeout, retry', captureVerifyRetries, '/', MAX_CAPTURE_VERIFY_RETRIES,
+        '(total wait:', totalWaitSec + 's)');
       captionModuleDriven = false;
       ensureCaptionModuleLoaded();
-    } else if (captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
-      diagLog('interceptor', 'capture verification exhausted after', MAX_CAPTURE_VERIFY_RETRIES, 'retries');
+    } else if (!hasValidCapture && captureVerifyRetries >= MAX_CAPTURE_VERIFY_RETRIES) {
+      diagLog('interceptor', 'capture verification exhausted after', MAX_CAPTURE_VERIFY_RETRIES, 'retries, starting slow recovery driver');
+      captionModuleDriven = false;
+      startSlowRecoveryDriver();
     }
   }, CAPTURE_VERIFY_TIMEOUT_MS);
 }
@@ -346,6 +351,27 @@ function cancelCaptureVerification(): void {
     captureVerifyTimer = null;
   }
   captureVerifyRetries = 0;
+}
+
+/** 捕獲驗證耗盡後的低頻恢復驅動（廣告場景：廣告可能很長，播放器延遲發請求）。 */
+function startSlowRecoveryDriver(): void {
+  const SLOW_INTERVAL_MS = 3_000;
+  const SLOW_MAX_RETRIES = 20;
+  let slowAttempts = 0;
+  const timer = setInterval(() => {
+    slowAttempts++;
+    if (lastCapture || slowAttempts >= SLOW_MAX_RETRIES || interceptorDisabled) {
+      clearInterval(timer);
+      if (lastCapture) {
+        diagLog('interceptor', 'slow recovery driver: capture arrived, stopping');
+      } else if (slowAttempts >= SLOW_MAX_RETRIES) {
+        diagLog('interceptor', 'slow recovery driver: max retries reached, giving up');
+      }
+      return;
+    }
+    diagLog('interceptor', 'slow recovery driver: attempt', slowAttempts, '/', SLOW_MAX_RETRIES);
+    ensureCaptionModuleLoaded();
+  }, SLOW_INTERVAL_MS);
 }
 
 /**
@@ -649,6 +675,7 @@ function ensureCaptionModuleLoaded(): void {
   // M2-22 第三層：發送軌道信息給 content script（content script 無法訪問播放器 API，
   // 當 DOM stale 時需要這些信息來構建字幕軌列表）。
   emitTrackInfo(tracklist);
+  diagLog('interceptor', 'proceeding to pickTargetTrack with', tracklist.length, 'tracks');
   
   // 增強診斷 + 異常捕獲：包裹 pickTargetTrack 在 try-catch 中，避免未捕獲異常導致函數提前退出。
   let track: YtCaptionTrack;
@@ -784,6 +811,13 @@ function install(): void {
     resetAndRedriveCaptionModule();
   };
   document.addEventListener(EXTENSION_ENABLED_EVENT, onExtensionEnabled);
+  // 廣告場景修復：接收 content-script 的晚捕獲主動觸發信號（管線降級後播放器仍未發請求時）。
+  const onRedriveCaptions = (): void => {
+    if (interceptorDisabled) return;
+    diagLog('interceptor', 'Received redrive-captions from content-script, re-driving caption module');
+    resetAndRedriveCaptionModule();
+  };
+  document.addEventListener(REDRIVE_CAPTIONS_EVENT, onRedriveCaptions);
   // 即使未收到語言消息也啟動一次驅動（用第一/人工軌），避免消息時序問題導致完全不驅動。
   startCaptionModuleDriver();
   // 調試輔助（M1-27 真實環境驗證）：暴露計數器與最近捕獲對象到 window。

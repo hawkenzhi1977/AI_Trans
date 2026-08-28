@@ -3713,6 +3713,8 @@ Output example:
       maxRetries: MAX_LATE_CAPTURE_RETRIES,
       cooldownMs: LATE_CAPTURE_RETRY_COOLDOWN_MS
     });
+    // 廣告場景修復：晚捕獲主動觸發定時器（管線降級後播放器仍未發請求時觸發重新驅動）。
+    lateCaptureRedriveTimer = null;
     pendingMountObserver = null;
     mountWaitTimer = null;
     // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
@@ -3858,6 +3860,10 @@ Output example:
       this.unsubscribeCapture?.();
       this.unsubscribeCapture = null;
       this.lateCaptureRetry.disarm();
+      if (this.lateCaptureRedriveTimer !== null) {
+        clearTimeout(this.lateCaptureRedriveTimer);
+        this.lateCaptureRedriveTimer = null;
+      }
       this.bridge.stop();
       this.orchestrator?.stop();
       this.orchestrator = null;
@@ -3983,6 +3989,7 @@ Output example:
         const videoId = extractVideoId(this.currentUrl());
         this.lateCaptureRetry.arm(videoId || null);
         diagLog("content", "no-caption-strategy: arming late-capture retry for videoId:", videoId);
+        this.scheduleLateCaptureRedrive();
       }
       diagLog("content", "onEvent received", e.type, e.type === "engine-degraded" ? e.reason : "");
       void recordDiagnostic(e);
@@ -4020,6 +4027,16 @@ Output example:
       diagLog("content", "retryAfterLateCapture: re-running strategy chain for", url);
       await this.orchestrator.start(url);
       diagLog("content", "retryAfterLateCapture: completed");
+    }
+    /** 廣告場景修復：管線降級後 10 秒主動觸發播放器重新驅動字幕模組。 */
+    scheduleLateCaptureRedrive() {
+      if (this.lateCaptureRedriveTimer !== null) return;
+      this.lateCaptureRedriveTimer = setTimeout(() => {
+        this.lateCaptureRedriveTimer = null;
+        if (!this.lateCaptureRetry.isAwaiting) return;
+        diagLog("content", "lateCaptureRedrive: no capture arrived after 10s, re-triggering player caption module");
+        document.dispatchEvent(new CustomEvent("ai-trans:redrive-captions"));
+      }, 1e4);
     }
     /** 播放器就緒後自動掛載覆蓋層；未就緒時等待 DOM 出現（YouTube 播放器異步加載）。 */
     async ensureMounted() {
