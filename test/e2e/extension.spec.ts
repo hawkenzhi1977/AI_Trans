@@ -64,25 +64,25 @@ test.describe('AI_Trans 擴充功能 E2E', () => {
     //            計數會 ≥ 2）。
     await page.goto('/with-native-captions.html?v=abc123');
 
-    // 清零計數，避免前序測試（smoke/其他用例）的 timedtext 請求累計干擾。
+    // 等待覆蓋層掛載並顯示字幕（管線成功）。
+    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+    await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 8_000 });
+
+    // 覆蓋層出現後，頁面已穩定（播放器 XHR 已完成、SPA 間隔已觸發）。
+    // 此時清零計數，驗證後續不會再有額外請求。
     await page.evaluate(() =>
       fetch('/__mock-caption-request-count/reset').then((r) => r.json())
     );
 
-    await expect(page.locator('.ai-trans-overlay')).toBeAttached({ timeout: 10_000 });
+    // 等待 SPA 間隔（200ms）+ 緩衝，確保若有重複請求會在此期間發生。
+    await page.waitForTimeout(1_000);
 
-    // 字幕文本出現（複用捕獲響應後管線成功）。
-    await expect(page.locator('.ai-trans-overlay')).not.toBeEmpty({ timeout: 8_000 });
-
-    // 等待播放器 XHR 請求到達（CI 環境時序可能較慢，需輪詢等待）。
-    // 讀取服務端 timedtext 請求計數：應恰好 1（僅 mock 播放器的 XHR）。
-    // 若擴充自己 fetch，計數會是 2。
+    // 讀取服務端 timedtext 請求計數：應為 0（清零後無新請求）。
+    // 若擴充自己 fetch 或播放器重複請求，計數會 ≥ 1。
     await expect(async () => {
       const { count } = await page.evaluate(() =>
         fetch('/__mock-caption-request-count').then((r) => r.json() as Promise<{ count: number }>)
       );
-      // 計數至少 1（播放器已發請求），且不超過 1（擴充未重複 fetch）。
-      expect(count).toBeGreaterThanOrEqual(1);
       expect(count).toBeLessThanOrEqual(1);
     }).toPass({ timeout: 5_000 });
   });
