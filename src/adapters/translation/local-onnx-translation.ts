@@ -29,6 +29,10 @@ interface LocalOnnxTranslateResponse {
   notDownloaded?: boolean;
   /** 該 chunk 是否被判定為回顯原文（低質量輸出，Offscreen 端判定，供診斷統計）。 */
   echoed?: boolean;
+  /** 該 chunk 是否被判定為退化輸出（token 重複亂碼，Offscreen 端判定，供診斷統計）。 */
+  degenerate?: boolean;
+  /** 該 chunk 是否被判定為語言錯誤（目標語言為中文但輸出無中文，Offscreen 端判定）。 */
+  wrongLanguage?: boolean;
 }
 
 /** 本地 ONNX 翻譯適配器配置。 */
@@ -168,11 +172,11 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
    * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
    * 將 Offscreen 返回的單一結果拆分回各 segment。
    * 模型依行號解析，少於輸入行數時缺行回退原文。
-    */
+     */
   private async translateChunk(
     chunk: SubtitleSegment[],
     targetLang: string
-  ): Promise<{ segments: SubtitleSegment[]; echoed: boolean }> {
+  ): Promise<{ segments: SubtitleSegment[]; echoed: boolean; degenerate: boolean; wrongLanguage: boolean }> {
     const combinedText = chunk.map((s) => s.sourceText).join('\n');
 
     diagLog('local-onnx', `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
@@ -189,6 +193,9 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     const res = await this.requestTranslate(request);
     
     const rawOutput = res.translatedText ?? '';
+    const isEchoed = res.echoed === true;
+    const isDegenerate = res.degenerate === true;
+    const isWrongLanguage = res.wrongLanguage === true;
     
     // 解析翻譯結果——將單一結果拆分回各 segment。
     let translatedTexts: string[];
@@ -221,10 +228,21 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
       translatedTexts = outputLines;
     }
 
+    // 當檢測到 echo、退化輸出或語言錯誤時，回退原文（避免顯示亂碼或錯誤語言）
+    const shouldFallbackToSource = isEchoed || isDegenerate || isWrongLanguage;
+    if (shouldFallbackToSource) {
+      const reasons: string[] = [];
+      if (isEchoed) reasons.push('echo');
+      if (isDegenerate) reasons.push('degenerate');
+      if (isWrongLanguage) reasons.push('wrong language');
+      diagLog('local-onnx', `translateChunk: fallback to source text due to ${reasons.join(' and ')} output`);
+    }
+
     const segments = chunk.map((seg, j) => ({
       ...seg,
       // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
-      translatedText: translatedTexts[j]?.trim() || seg.sourceText,
+      // echo、退化輸出或語言錯誤時，所有 segment 回退原文（避免顯示亂碼或錯誤語言）。
+      translatedText: shouldFallbackToSource ? seg.sourceText : (translatedTexts[j]?.trim() || seg.sourceText),
     }));
     
     // 更新模型統計
@@ -243,7 +261,7 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         `fallbacks=${modelStats.totalFallbacks}`);
     }
     
-    return { segments, echoed: res.echoed === true };
+    return { segments, echoed: isEchoed, degenerate: isDegenerate, wrongLanguage: isWrongLanguage };
   }
 
   /**
@@ -359,13 +377,15 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
    * 
    * Fix D: 最大翻譯時限保護——連續翻譯超過 10 分鐘主動中斷，避免 Offscreen 長時間運行不穩定。
    */
-  async translateStream(
+   async translateStream(
     req: TranslationRequest,
     emit: (r: TranslationResult) => void
   ): Promise<void> {
     const targetLang = req.targetLang ?? this.defaultTargetLang;
     const accumulated: SubtitleSegment[] = [];
     let echoedChunks = 0;
+    let degenerateChunks = 0;
+    let wrongLanguageChunks = 0;
     const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
     const streamStartedAt = performance.now();
 
@@ -401,6 +421,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
       const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
       accumulated.push(...chunkResult.segments);
       if (chunkResult.echoed) echoedChunks += 1;
+      if (chunkResult.degenerate) degenerateChunks += 1;
+      if (chunkResult.wrongLanguage) wrongLanguageChunks += 1;
 
       // D5：記錄 chunk 計時與翻譯速度。
       const totalElapsedMs = Math.round(performance.now() - streamStartedAt);
@@ -411,6 +433,10 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         accumulated.length,
         'segments, echoed:',
         chunkResult.echoed,
+        'degenerate:',
+        chunkResult.degenerate,
+        'wrongLanguage:',
+        chunkResult.wrongLanguage,
         `| total: ${totalElapsedMs}ms, speed: ${segmentsPerSec} seg/s`
       );
 
@@ -422,6 +448,8 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
     }
 
     this.recordEchoSummary(echoedChunks, totalChunks);
+    this.recordDegenerateSummary(degenerateChunks, totalChunks);
+    this.recordWrongLanguageSummary(wrongLanguageChunks, totalChunks);
   }
 
   /**
@@ -438,6 +466,44 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
         recoverable: true,
         cause: new Error(
           `local ONNX model echoed input in ${echoedChunks}/${totalChunks} chunks (low quality output)`
+        ),
+      },
+    });
+  }
+
+  /**
+   * 結束時若有 chunk 被判定為退化輸出（token 重複亂碼）→ 記聚合診斷（§5.6 留痕）。
+   * 純診斷行為，不做任何降級/回退（回退已在 translateChunk 中完成）。
+   */
+  private recordDegenerateSummary(degenerateChunks: number, totalChunks: number): void {
+    if (degenerateChunks === 0) return;
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-degenerate-chunks',
+        recoverable: true,
+        cause: new Error(
+          `local ONNX model produced degenerate output in ${degenerateChunks}/${totalChunks} chunks (token repetition/low quality)`
+        ),
+      },
+    });
+  }
+
+  /**
+   * 結束時若有 chunk 被判定為語言錯誤（目標語言為中文但輸出無中文）→ 記聚合診斷（§5.6 留痕）。
+   * 純診斷行為，不做任何降級/回退（回退已在 translateChunk 中完成）。
+   */
+  private recordWrongLanguageSummary(wrongLanguageChunks: number, totalChunks: number): void {
+    if (wrongLanguageChunks === 0) return;
+    recordDiagnostic({
+      type: 'pipeline-error',
+      error: {
+        port: 'translation',
+        code: 'local-onnx-wrong-language-chunks',
+        recoverable: true,
+        cause: new Error(
+          `local ONNX model produced wrong language output in ${wrongLanguageChunks}/${totalChunks} chunks (target: Chinese, output: no Chinese)`
         ),
       },
     });

@@ -2082,17 +2082,17 @@
       if (missingIndices?.length) {
         userContent += `
 
-CRITICAL: Previous attempt only output ${missingIndices.length}/${chunk.length} lines. You MUST output ALL ${chunk.length} lines with their indices.`;
+MISSING indices: ${missingIndices.join(",")}. Output ALL ${chunk.length} lines.`;
       }
       if (duplicateRetry) {
         userContent += `
 
-IMPORTANT: Your previous output had duplicate translations for different indices. Each line MUST have a unique translation matching its source text.`;
+ERROR: Previous output had duplicate translations. Each index needs UNIQUE translation.`;
       }
       if (languageRetry) {
         userContent += `
 
-CRITICAL: Your previous output contained translations in the WRONG LANGUAGE. You MUST output ALL translations in ${req.targetLang} ONLY. Do NOT use any other language (no Spanish, no Korean, no Japanese, no English unless targetLang is English).`;
+ERROR: Previous output mixed languages. Use ONLY ${req.targetLang}.`;
       }
       const body = {
         model: this.opts.model,
@@ -2101,20 +2101,20 @@ CRITICAL: Your previous output contained translations in the WRONG LANGUAGE. You
         messages: [
           {
             role: "system",
-            content: `You are a subtitle translator. Translate each numbered line to ${req.targetLang}.
+            content: `Translate ${chunk.length} subtitle lines to ${req.targetLang}.
 
-CRITICAL RULES:
-1. Output EXACTLY ${chunk.length} lines (one per input line, no more, no less)
-2. Format: "index\\ttranslation" for each line (e.g., "0\\t\u4F60\u597D")
-3. ALL translations MUST be in ${req.targetLang} only \u2014 do NOT output in any other language
-4. Do NOT copy the same translation for different indices unless the source text is identical
-5. Do NOT skip any line \u2014 every index from 0 to ${chunk.length - 1} must appear
+RULES:
+- Output EXACTLY ${chunk.length} lines
+- Format: index<TAB>translation (e.g., 0<TAB>\u4F60\u597D)
+- Use ONLY ${req.targetLang}, no English mixed in
+- Each line must have DIFFERENT translation matching its source
+- Indices 0 to ${chunk.length - 1}, each exactly once
 
-Input example:
+Example input:
 0	Hello world
 1	Good morning
 
-Output example:
+Example output:
 0	\u4F60\u597D\u4E16\u754C
 1	\u65E9\u4E0A\u597D`
           },
@@ -2160,9 +2160,49 @@ Output example:
       const content = stripReasoning(choice.message.content);
       diagLog("llm", "content after stripReasoning =", content);
       const map = /* @__PURE__ */ new Map();
+      const expectedIndices = new Set(chunk.map((_, i) => String(i)));
+      const unparsedLines = [];
+      const usedIndices = /* @__PURE__ */ new Set();
+      let lastIndex = null;
       for (const line of content.split("\n")) {
-        const m = /^(\d+)\t(.+)$/.exec(line.trim());
-        if (m) map.set(m[1], m[2]);
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (isMetaText(trimmed)) continue;
+        const patterns = [
+          /^(\d+)\t(.+)$/,
+          /^(\d+)\\t(.+)$/,
+          /^(\d+)\s{2,}(\D.+)$/,
+          /^(\d+)\s+(\D.+)$/,
+          /^(\d+)[.)\]:]\s*(.+)$/,
+          /^(\d+)[、。：），；？！]\s*(.+)$/,
+          /^(\d+)[\-–—]\s*(.+)$/
+        ];
+        let patternMatched = false;
+        for (const pattern of patterns) {
+          const m = pattern.exec(trimmed);
+          if (m) {
+            patternMatched = true;
+            const index = m[1];
+            const translation = m[2].trim();
+            if (expectedIndices.has(index) && translation.length > 0 && !usedIndices.has(index)) {
+              map.set(index, translation);
+              usedIndices.add(index);
+              lastIndex = index;
+            }
+            break;
+          }
+        }
+        if (!patternMatched && trimmed.length > 0) {
+          if (lastIndex !== null && map.has(lastIndex)) {
+            const existing = map.get(lastIndex);
+            map.set(lastIndex, existing + trimmed);
+          } else {
+            unparsedLines.push(trimmed.substring(0, 60));
+          }
+        }
+      }
+      if (unparsedLines.length > 0 && map.size < chunk.length) {
+        diagLog("llm", `unparsed lines (${unparsedLines.length}):`, unparsedLines.slice(0, 5));
       }
       diagLog("llm", "parsed map size =", map.size, ", map =", Object.fromEntries(map));
       const valueCounts = /* @__PURE__ */ new Map();
@@ -2262,6 +2302,24 @@ Output example:
   var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   function stripReasoning(raw) {
     return raw.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").replace(/^\s+/, "");
+  }
+  function isMetaText(line) {
+    const metaPatterns = [
+      /^CRITICAL:/i,
+      /^IMPORTANT:/i,
+      /^NOTE:/i,
+      /As per the instructions/i,
+      /every index from \d+ to \d+ must appear/i,
+      /此輸入與先前的問題相符/i,
+      /此輸入不符合要求/i,
+      /確保每個索引都有正確的翻譯/i,
+      /重新生成完整內容/i,
+      /以上為所有 \d+ 行/i,
+      /符合要求/i,
+      /^Output example:/i,
+      /^Input example:/i
+    ];
+    return metaPatterns.some((p) => p.test(line));
   }
 
   // src/adapters/translation/mt-translation.ts
@@ -2393,7 +2451,7 @@ Output example:
      * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
      * 將 Offscreen 返回的單一結果拆分回各 segment。
      * 模型依行號解析，少於輸入行數時缺行回退原文。
-      */
+       */
     async translateChunk(chunk, targetLang) {
       const combinedText = chunk.map((s) => s.sourceText).join("\n");
       diagLog("local-onnx", `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
@@ -2407,6 +2465,9 @@ Output example:
       diagLog("local-onnx", `requestTranslate: sending request`);
       const res = await this.requestTranslate(request);
       const rawOutput = res.translatedText ?? "";
+      const isEchoed = res.echoed === true;
+      const isDegenerate = res.degenerate === true;
+      const isWrongLanguage = res.wrongLanguage === true;
       let translatedTexts;
       const outputLines = rawOutput.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
       diagLog("local-onnx", `translateChunk: received response, rawOutput length=${rawOutput.length}, outputLines=${outputLines.length}`);
@@ -2427,10 +2488,19 @@ Output example:
       } else {
         translatedTexts = outputLines;
       }
+      const shouldFallbackToSource = isEchoed || isDegenerate || isWrongLanguage;
+      if (shouldFallbackToSource) {
+        const reasons = [];
+        if (isEchoed) reasons.push("echo");
+        if (isDegenerate) reasons.push("degenerate");
+        if (isWrongLanguage) reasons.push("wrong language");
+        diagLog("local-onnx", `translateChunk: fallback to source text due to ${reasons.join(" and ")} output`);
+      }
       const segments = chunk.map((seg, j) => ({
         ...seg,
         // 空譯文（''）亦視為無效，回退原文（避免渲染空行）。
-        translatedText: translatedTexts[j]?.trim() || seg.sourceText
+        // echo、退化輸出或語言錯誤時，所有 segment 回退原文（避免顯示亂碼或錯誤語言）。
+        translatedText: shouldFallbackToSource ? seg.sourceText : translatedTexts[j]?.trim() || seg.sourceText
       }));
       modelStats.totalChunks++;
       if (outputLines.length < chunk.length) {
@@ -2442,7 +2512,7 @@ Output example:
       if (modelStats.totalChunks % 10 === 0) {
         diagLog("local-onnx", `model-stats: chunks=${modelStats.totalChunks}, merged=${modelStats.mergedChunks}, perfect=${modelStats.perfectChunks}, fallbacks=${modelStats.totalFallbacks}`);
       }
-      return { segments, echoed: res.echoed === true };
+      return { segments, echoed: isEchoed, degenerate: isDegenerate, wrongLanguage: isWrongLanguage };
     }
     /**
      * 按句子邊界分割文本——用於 Small model 輸出行數少於輸入行數的情況。
@@ -2542,6 +2612,8 @@ Output example:
       const targetLang = req.targetLang ?? this.defaultTargetLang;
       const accumulated = [];
       let echoedChunks = 0;
+      let degenerateChunks = 0;
+      let wrongLanguageChunks = 0;
       const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
       const streamStartedAt = performance.now();
       for (let i = 0; i < req.segments.length; i += this.chunkSize) {
@@ -2572,6 +2644,8 @@ Output example:
         const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
         accumulated.push(...chunkResult.segments);
         if (chunkResult.echoed) echoedChunks += 1;
+        if (chunkResult.degenerate) degenerateChunks += 1;
+        if (chunkResult.wrongLanguage) wrongLanguageChunks += 1;
         const totalElapsedMs = Math.round(performance.now() - streamStartedAt);
         const segmentsPerSec = (accumulated.length / (totalElapsedMs / 1e3)).toFixed(2);
         diagLog(
@@ -2580,6 +2654,10 @@ Output example:
           accumulated.length,
           "segments, echoed:",
           chunkResult.echoed,
+          "degenerate:",
+          chunkResult.degenerate,
+          "wrongLanguage:",
+          chunkResult.wrongLanguage,
           `| total: ${totalElapsedMs}ms, speed: ${segmentsPerSec} seg/s`
         );
         emit({
@@ -2590,6 +2668,8 @@ Output example:
         });
       }
       this.recordEchoSummary(echoedChunks, totalChunks);
+      this.recordDegenerateSummary(degenerateChunks, totalChunks);
+      this.recordWrongLanguageSummary(wrongLanguageChunks, totalChunks);
     }
     /**
      * 結束時若有 chunk 被判定為回顯原文 → 記聚合診斷（§5.6 留痕，popup「最近失敗」可見）。
@@ -2605,6 +2685,42 @@ Output example:
           recoverable: true,
           cause: new Error(
             `local ONNX model echoed input in ${echoedChunks}/${totalChunks} chunks (low quality output)`
+          )
+        }
+      });
+    }
+    /**
+     * 結束時若有 chunk 被判定為退化輸出（token 重複亂碼）→ 記聚合診斷（§5.6 留痕）。
+     * 純診斷行為，不做任何降級/回退（回退已在 translateChunk 中完成）。
+     */
+    recordDegenerateSummary(degenerateChunks, totalChunks) {
+      if (degenerateChunks === 0) return;
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-degenerate-chunks",
+          recoverable: true,
+          cause: new Error(
+            `local ONNX model produced degenerate output in ${degenerateChunks}/${totalChunks} chunks (token repetition/low quality)`
+          )
+        }
+      });
+    }
+    /**
+     * 結束時若有 chunk 被判定為語言錯誤（目標語言為中文但輸出無中文）→ 記聚合診斷（§5.6 留痕）。
+     * 純診斷行為，不做任何降級/回退（回退已在 translateChunk 中完成）。
+     */
+    recordWrongLanguageSummary(wrongLanguageChunks, totalChunks) {
+      if (wrongLanguageChunks === 0) return;
+      recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "translation",
+          code: "local-onnx-wrong-language-chunks",
+          recoverable: true,
+          cause: new Error(
+            `local ONNX model produced wrong language output in ${wrongLanguageChunks}/${totalChunks} chunks (target: Chinese, output: no Chinese)`
           )
         }
       });

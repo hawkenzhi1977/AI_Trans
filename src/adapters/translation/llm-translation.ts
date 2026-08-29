@@ -431,13 +431,13 @@ export class LLMTranslationProvider implements TranslationProvider {
 
     let userContent = lines.join('\n');
     if (missingIndices?.length) {
-      userContent += `\n\nCRITICAL: Previous attempt only output ${missingIndices.length}/${chunk.length} lines. You MUST output ALL ${chunk.length} lines with their indices.`;
+      userContent += `\n\nMISSING indices: ${missingIndices.join(',')}. Output ALL ${chunk.length} lines.`;
     }
     if (duplicateRetry) {
-      userContent += `\n\nIMPORTANT: Your previous output had duplicate translations for different indices. Each line MUST have a unique translation matching its source text.`;
+      userContent += `\n\nERROR: Previous output had duplicate translations. Each index needs UNIQUE translation.`;
     }
     if (languageRetry) {
-      userContent += `\n\nCRITICAL: Your previous output contained translations in the WRONG LANGUAGE. You MUST output ALL translations in ${req.targetLang} ONLY. Do NOT use any other language (no Spanish, no Korean, no Japanese, no English unless targetLang is English).`;
+      userContent += `\n\nERROR: Previous output mixed languages. Use ONLY ${req.targetLang}.`;
     }
 
     const body = {
@@ -448,19 +448,15 @@ export class LLMTranslationProvider implements TranslationProvider {
         {
           role: 'system',
           content:
-            `You are a subtitle translator. Translate each numbered line to ${req.targetLang}.\n\n` +
-            `CRITICAL RULES:\n` +
-            `1. Output EXACTLY ${chunk.length} lines (one per input line, no more, no less)\n` +
-            `2. Format: "index\\ttranslation" for each line (e.g., "0\\t你好")\n` +
-            `3. ALL translations MUST be in ${req.targetLang} only — do NOT output in any other language\n` +
-            `4. Do NOT copy the same translation for different indices unless the source text is identical\n` +
-            `5. Do NOT skip any line — every index from 0 to ${chunk.length - 1} must appear\n\n` +
-            `Input example:\n` +
-            `0\tHello world\n` +
-            `1\tGood morning\n\n` +
-            `Output example:\n` +
-            `0\t你好世界\n` +
-            `1\t早上好`,
+            `Translate ${chunk.length} subtitle lines to ${req.targetLang}.\n\n` +
+            `RULES:\n` +
+            `- Output EXACTLY ${chunk.length} lines\n` +
+            `- Format: index<TAB>translation (e.g., 0<TAB>你好)\n` +
+            `- Use ONLY ${req.targetLang}, no English mixed in\n` +
+            `- Each line must have DIFFERENT translation matching its source\n` +
+            `- Indices 0 to ${chunk.length - 1}, each exactly once\n\n` +
+            `Example input:\n0\tHello world\n1\tGood morning\n\n` +
+            `Example output:\n0\t你好世界\n1\t早上好`,
         },
         ...(req.context?.length
           ? [{ role: 'user', content: `Context: ${req.context.join('\n')}` }]
@@ -520,11 +516,57 @@ export class LLMTranslationProvider implements TranslationProvider {
     const content = stripReasoning(choice.message.content);
     diagLog('llm', 'content after stripReasoning =', content);
 
-    // 解析 "ID<TAB>translation" 行。
     const map = new Map<string, string>();
+    const expectedIndices = new Set(chunk.map((_, i) => String(i)));
+    const unparsedLines: string[] = [];
+    const usedIndices = new Set<string>();
+    let lastIndex: string | null = null;
+
     for (const line of content.split('\n')) {
-      const m = /^(\d+)\t(.+)$/.exec(line.trim());
-      if (m) map.set(m[1], m[2]);
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      if (isMetaText(trimmed)) continue;
+
+      const patterns = [
+        /^(\d+)\t(.+)$/,
+        /^(\d+)\\t(.+)$/,
+        /^(\d+)\s{2,}(\D.+)$/,
+        /^(\d+)\s+(\D.+)$/,
+        /^(\d+)[.)\]:]\s*(.+)$/,
+        /^(\d+)[、。：），；？！]\s*(.+)$/,
+        /^(\d+)[\-–—]\s*(.+)$/,
+      ];
+
+      let patternMatched = false;
+      for (const pattern of patterns) {
+        const m = pattern.exec(trimmed);
+        if (m) {
+          patternMatched = true;
+          const index = m[1];
+          const translation = m[2].trim();
+
+          if (expectedIndices.has(index) && translation.length > 0 && !usedIndices.has(index)) {
+            map.set(index, translation);
+            usedIndices.add(index);
+            lastIndex = index;
+          }
+          break;
+        }
+      }
+
+      if (!patternMatched && trimmed.length > 0) {
+        if (lastIndex !== null && map.has(lastIndex)) {
+          const existing = map.get(lastIndex)!;
+          map.set(lastIndex, existing + trimmed);
+        } else {
+          unparsedLines.push(trimmed.substring(0, 60));
+        }
+      }
+    }
+
+    if (unparsedLines.length > 0 && map.size < chunk.length) {
+      diagLog('llm', `unparsed lines (${unparsedLines.length}):`, unparsedLines.slice(0, 5));
     }
     diagLog('llm', 'parsed map size =', map.size, ', map =', Object.fromEntries(map));
     // §5.6：LLM 重複翻譯檢測——小模型可能在長輸出中「迷失」，對不同 index 輸出相同翻譯，
@@ -651,12 +693,36 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 /**
  * 剝離 reasoning 模型可能混入 content 的思考塊——防禦性容錯。
  * OpenAI 兼容服務通常把思考分離到 reasoning_content（我們只讀 content 故不受影響），
- * 但部分 MLX/本地服務會把  <think>... </think> 直接塞進 content，需剝離避免污染字幕解析。
- * 移除成對  <think>..</think>，並清掉殘留的開/閉標籤與由此產生的前導空行。
+ * 但部分 MLX/本地服務會把   <think>...  </think> 直接塞進 content，需剝離避免污染字幕解析。
+ * 移除成對   <think>..</think>，並清掉殘留的開/閉標籤與由此產生的前導空行。
  */
 export function stripReasoning(raw: string): string {
   return raw
     .replace(/<think>[\s\S]*?<\/think>/gi, '') // 成對思考塊
     .replace(/<\/?think>/gi, '') // 殘留單邊標籤
     .replace(/^\s+/, ''); // 剝離後可能的前導空白
+}
+
+/**
+ * M2-49：偵測 LLM 輸出的元文本（指令性內容）。
+ * 小模型有時會輸出「CRITICAL: ...」「確保每個索引...」等指令性內容而非翻譯，
+ * 這些行應被過濾掉避免污染字幕。
+ */
+export function isMetaText(line: string): boolean {
+  const metaPatterns = [
+    /^CRITICAL:/i,
+    /^IMPORTANT:/i,
+    /^NOTE:/i,
+    /As per the instructions/i,
+    /every index from \d+ to \d+ must appear/i,
+    /此輸入與先前的問題相符/i,
+    /此輸入不符合要求/i,
+    /確保每個索引都有正確的翻譯/i,
+    /重新生成完整內容/i,
+    /以上為所有 \d+ 行/i,
+    /符合要求/i,
+    /^Output example:/i,
+    /^Input example:/i,
+  ];
+  return metaPatterns.some((p) => p.test(line));
 }

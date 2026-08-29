@@ -49834,7 +49834,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const generatedText = result[0]?.generated_text ?? "";
       console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
       console.log("[AI_Trans:local-onnx] generated_text.length:", generatedText.length, "tail:", JSON.stringify(generatedText.slice(-500)));
-      const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
+      const { translatedLines, echoed, parsedCount, similarCount, degenerate, wrongLanguage } = parseNumberedOutput(generatedText, sourceLines, targetLang);
       if (echoed) {
         console.log("[AI_Trans:local-onnx] ECHO DETECTED!");
         console.log("[AI_Trans:local-onnx] similarCount:", similarCount, "/", sourceLines.length);
@@ -49857,6 +49857,43 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           }
         });
       }
+      if (degenerate) {
+        console.log("[AI_Trans:local-onnx] DEGENERATE OUTPUT DETECTED!");
+        console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
+        const elapsedMs = Math.round(performance.now() - inferStartedAt);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-degenerate-output",
+            recoverable: true,
+            cause: new Error(
+              `local ONNX degenerate output detected (took ${elapsedMs}ms); raw output: ${JSON.stringify(
+                generatedText.slice(0, 200)
+              )}`
+            )
+          }
+        });
+      }
+      if (wrongLanguage) {
+        console.log("[AI_Trans:local-onnx] WRONG LANGUAGE DETECTED!");
+        console.log("[AI_Trans:local-onnx] targetLang:", targetLang);
+        console.log("[AI_Trans:local-onnx] generated_text (full):", JSON.stringify(generatedText));
+        const elapsedMs = Math.round(performance.now() - inferStartedAt);
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "translation",
+            code: "local-onnx-wrong-language-output",
+            recoverable: true,
+            cause: new Error(
+              `local ONNX output wrong language (target: ${targetLang}, no Chinese in output, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+                generatedText.slice(0, 200)
+              )}`
+            )
+          }
+        });
+      }
       let finalText = translatedLines.join("\n");
       if (targetLang === "zh-Hant") {
         finalText = s2tConverter(finalText);
@@ -49865,7 +49902,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         type: "local-onnx:translate-result",
         ok: true,
         translatedText: finalText,
-        echoed
+        echoed,
+        degenerate,
+        wrongLanguage
       };
     } catch (err) {
       const error = toReadableError(err);
@@ -50014,9 +50053,10 @@ ${numbered}
 <|im_start|>assistant
 `;
   }
-  function parseNumberedOutput(generated, sourceLines) {
+  function parseNumberedOutput(generated, sourceLines, targetLang) {
     console.log("[AI_Trans:local-onnx] parseNumberedOutput: starting, generated length:", generated.length);
     console.log("[AI_Trans:local-onnx] parseNumberedOutput: sourceLines count:", sourceLines.length);
+    console.log("[AI_Trans:local-onnx] parseNumberedOutput: targetLang:", targetLang);
     const parsed = /* @__PURE__ */ new Map();
     for (const line of generated.split("\n")) {
       const m2 = line.match(/^\s*(\d+)[.)]?\s+(.+)$/);
@@ -50027,14 +50067,30 @@ ${numbered}
       }
     }
     console.log("[AI_Trans:local-onnx] parseNumberedOutput: parsed numbered lines count:", parsed.size);
+    const sourceText = sourceLines.join("\n");
+    const lengthRatio = generated.length / Math.max(sourceText.length, 1);
+    const shortOutputDegenerate = lengthRatio < 0.2 && generated.length < 100;
+    if (shortOutputDegenerate) {
+      console.log("[AI_Trans:local-onnx] parseNumberedOutput: short output detected, lengthRatio:", lengthRatio.toFixed(3));
+    }
+    const ngramRatio = calcUniqueNgramRatio(generated, 3);
+    const ngramDegenerate = ngramRatio < 0.2 && generated.length > 50;
+    if (ngramDegenerate) {
+      console.log("[AI_Trans:local-onnx] parseNumberedOutput: degenerate output detected, ngramRatio:", ngramRatio.toFixed(3));
+    }
+    const isTargetChinese = targetLang === "zh-Hant" || targetLang === "zh-Hans";
+    const hasChinese = /[\u4e00-\u9fff]/.test(generated);
+    const wrongLanguage = isTargetChinese && !hasChinese && parsed.size > 0;
+    if (wrongLanguage) {
+      console.log("[AI_Trans:local-onnx] parseNumberedOutput: WRONG LANGUAGE detected - target is Chinese but output has no Chinese characters");
+    }
     if (parsed.size === 0) {
-      const hasChinese = /[\u4e00-\u9fff]/.test(generated);
       console.log("[AI_Trans:local-onnx] parseNumberedOutput: no numbered lines, hasChinese:", hasChinese);
       if (hasChinese) {
         const rawLines = generated.split("\n").map((l2) => l2.trim()).filter((l2) => l2.length > 0);
         const translatedLines2 = sourceLines.map((src, i2) => rawLines[i2] || src);
         console.log("[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation, rawLines count:", rawLines.length);
-        return { translatedLines: translatedLines2, echoed: false, parsedCount: 0, similarCount: 0 };
+        return { translatedLines: translatedLines2, echoed: false, parsedCount: 0, similarCount: 0, degenerate: shortOutputDegenerate || ngramDegenerate, wrongLanguage: false };
       } else {
         console.log("[AI_Trans:local-onnx] parseNumberedOutput: no Chinese detected, will fallback to source");
       }
@@ -50063,8 +50119,9 @@ ${numbered}
         }
       }
     }
-    const echoed = parsed.size > 0 && similarCount > parsed.size * 0.8;
-    return { translatedLines, echoed, parsedCount: parsed.size, similarCount };
+    const echoed = parsed.size > 0 && similarCount > parsed.size * 0.4;
+    const degenerate = shortOutputDegenerate || ngramDegenerate;
+    return { translatedLines, echoed, parsedCount: parsed.size, similarCount, degenerate, wrongLanguage };
   }
   function getLanguageName(langCode) {
     const map = {

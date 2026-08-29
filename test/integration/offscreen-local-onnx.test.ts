@@ -259,7 +259,8 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
   it('parseNumberedOutput：行號對齊還原譯文', () => {
     const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '1. 你好\n2. 世界',
-      ['Hello', 'World']
+      ['Hello', 'World'],
+      'zh-Hant'
     );
     expect(translatedLines).toEqual(['你好', '世界']);
     expect(echoed).toBe(false);
@@ -270,7 +271,7 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     const { translatedLines, parsedCount } = _testExports.parseNumberedOutput('2. 世界', [
       'Hello',
       'World',
-    ]);
+    ], 'zh-Hant');
     expect(translatedLines).toEqual(['Hello', '世界']);
     expect(parsedCount).toBe(1);
   });
@@ -278,7 +279,8 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
   it('parseNumberedOutput：全部回顯原文標記 echo', () => {
     const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '1. Hello\n2. World',
-      ['Hello', 'World']
+      ['Hello', 'World'],
+      'zh-Hant'
     );
     expect(translatedLines).toEqual(['Hello', 'World']);
     expect(echoed).toBe(true);
@@ -288,12 +290,34 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
   it('parseNumberedOutput：無行號輸出但包含中文 → 使用中文作為翻譯（F6 回退解析器）', () => {
     const { translatedLines, echoed, parsedCount } = _testExports.parseNumberedOutput(
       '你好\n世界',
-      ['Hello', 'World']
+      ['Hello', 'World'],
+      'zh-Hant'
     );
     // F6: 當沒有編號但輸出包含中文時，使用中文作為翻譯
     expect(translatedLines).toEqual(['你好', '世界']);
     expect(echoed).toBe(false);
     expect(parsedCount).toBe(0);
+  });
+
+  it('parseNumberedOutput：目標語言為中文但輸出無中文 → 標記 wrongLanguage', () => {
+    const { translatedLines, wrongLanguage, parsedCount } = _testExports.parseNumberedOutput(
+      '1. keyboard\n2. monitor',
+      ['Hello', 'World'],
+      'zh-Hant'
+    );
+    expect(parsedCount).toBe(2);
+    expect(wrongLanguage).toBe(true);
+    expect(translatedLines).toEqual(['keyboard', 'monitor']);
+  });
+
+  it('parseNumberedOutput：目標語言為英文且輸出無中文 → 不標記 wrongLanguage', () => {
+    const { wrongLanguage, parsedCount } = _testExports.parseNumberedOutput(
+      '1. keyboard\n2. monitor',
+      ['Hello', 'World'],
+      'en'
+    );
+    expect(parsedCount).toBe(2);
+    expect(wrongLanguage).toBe(false);
   });
 
   it('runInference：mock 返回行號譯文 → 按行序回傳，prompt 含 ChatML/行號', async () => {
@@ -319,7 +343,8 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
       { generated_text: '1. Hello\n2. World' },
     ]);
 
-    const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
+    // 使用英文作為目標語言，避免觸發 wrongLanguage 檢測
+    const res = await _testExports.runInference('Hello\nWorld', 'en', undefined);
 
     expect(res.ok).toBe(true);
     expect((res as { echoed?: boolean }).echoed).toBe(true);
@@ -330,6 +355,23 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     expect(stored.lastDiagnostic.message).toContain('parsed 2/2 lines');
     expect(stored.lastDiagnostic.message).toContain('raw output:');
     expect(stored.lastDiagnostic.message).toContain('1. Hello\\n2. World');
+  });
+
+  it('runInference：目標語言為中文但輸出英文 → 落 wrongLanguage 診斷', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => [
+      { generated_text: '1. keyboard\n2. monitor' },
+    ]);
+
+    const res = await _testExports.runInference('Hello\nWorld', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    expect((res as { wrongLanguage?: boolean }).wrongLanguage).toBe(true);
+    expect(chrome.storage.local.set).toHaveBeenCalled();
+    const stored = await chrome.storage.local.get('lastDiagnostic');
+    expect(stored.lastDiagnostic.message).toContain('wrong language');
+    expect(stored.lastDiagnostic.message).toContain('target: zh-Hant');
+    expect(stored.lastDiagnostic.message).toContain('raw output:');
   });
 
   it('runInference：無回顯（正常翻譯）不寫 echo 診斷', async () => {

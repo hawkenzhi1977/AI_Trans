@@ -8,6 +8,7 @@ import {
   llmCacheSize,
   ensureLlmCacheInvalidationHook,
   BODY_TIMEOUT_MS,
+  isMetaText,
 } from '../../src/adapters/translation/llm-translation';
 import type { TranslationRequest } from '../../src/domain/models/translation';
 import type { TranslationResult } from '../../src/domain/models/translation';
@@ -540,6 +541,358 @@ describe('LLMTranslationProvider — §5.6 LLM 輸出不完整診斷', () => {
       expect.stringContaining('duplicate translations detected')
     );
     warnSpy.mockRestore();
+  });
+});
+
+describe('LLMTranslationProvider — M2-48 寬鬆解析格式', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('解析字面 \\t 分隔（LLM 輸出兩個字符 \\ 和 t 而非實際 TAB）', async () => {
+    const body = {
+      choices: [{ message: { content: '0\\t譯文零\n1\\t譯文一\n2\\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('解析空格分隔（多個空格）', async () => {
+    const body = {
+      choices: [{ message: { content: '0  譯文零\n1   譯文一\n2    譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('解析英文標點分隔（. ) : ]）', async () => {
+    const body = {
+      choices: [{ message: { content: '0. 譯文零\n1) 譯文一\n2: 譯文二\n3] 譯文三' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2), seg(3)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+    expect(result.segments[3].translatedText).toBe('譯文三');
+  });
+
+  it('解析中文標點分隔（、 。 ： ））', async () => {
+    const body = {
+      choices: [{ message: { content: '0、譯文零\n1。譯文一\n2：譯文二\n3）譯文三' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2), seg(3)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+    expect(result.segments[3].translatedText).toBe('譯文三');
+  });
+
+  it('忽略超出範圍的索引', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t譯文零\n99\t超出範圍\n1\t譯文一\n2\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('避免重複索引（保留第一個）', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t第一個\n0\t第二個\n1\t譯文一\n2\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('第一個');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('忽略空翻譯', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t\n1\t譯文一\n2\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    // 空翻譯應回退原文
+    expect(result.segments[0].translatedText).toBe('line-0');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('混合格式也能正確解析', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t譯文零\n1. 譯文一\n2、譯文二\n3  譯文三' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2), seg(3)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+    expect(result.segments[3].translatedText).toBe('譯文三');
+  });
+});
+
+describe('LLMTranslationProvider — M2-49 增強解析', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('解析中文全形逗號分隔（，）', async () => {
+    const body = {
+      choices: [{ message: { content: '0，譯文零\n1，譯文一\n2，譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('續行追加到上一索引', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t譯文零\n的延續部分\n1\t譯文一\n2\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零的延續部分');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('過濾元文本（CRITICAL: / 確保每個索引等）', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t譯文零\nCRITICAL: This is meta text\n1\t譯文一\n確保每個索引都有正確的翻譯\n2\t譯文二' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+    expect(result.segments[2].translatedText).toBe('譯文二');
+  });
+
+  it('過濾「以上為所有 N 行」元文本', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t譯文零\n1\t譯文一\n以上為所有 15 行，符合要求。' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('譯文零');
+    expect(result.segments[1].translatedText).toBe('譯文一');
+  });
+
+  it('複雜場景：混合分隔符 + 續行 + 元文本', async () => {
+    const body = {
+      choices: [{ message: { content: '0\t蘋果剛剛發布了一個驚喜\n1，而且我指的是真正的驚喜\n沒有風聲\n2、沒有倒計時\nCRITICAL: Output all lines\n3。新的Mac Mini\n4\t和新的Mac Studio' } }],
+    };
+    const fetchMock = vi.fn(async () => okResponse(body));
+
+    const provider = new LLMTranslationProvider({
+      engineId: 'llm',
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-x',
+      apiKey: 'sk',
+      fetchFn: fetchMock,
+    });
+
+    const result = await provider.translate({
+      segments: [seg(0), seg(1), seg(2), seg(3), seg(4)],
+      targetLang: 'zh-Hant',
+    });
+
+    expect(result.segments[0].translatedText).toBe('蘋果剛剛發布了一個驚喜');
+    expect(result.segments[1].translatedText).toBe('而且我指的是真正的驚喜沒有風聲');
+    expect(result.segments[2].translatedText).toBe('沒有倒計時');
+    expect(result.segments[3].translatedText).toBe('新的Mac Mini');
+    expect(result.segments[4].translatedText).toBe('和新的Mac Studio');
+  });
+});
+
+describe('isMetaText', () => {
+  it('偵測英文元文本', () => {
+    expect(isMetaText('CRITICAL: Output all lines')).toBe(true);
+    expect(isMetaText('IMPORTANT: Do not skip')).toBe(true);
+    expect(isMetaText('As per the instructions, every index must appear')).toBe(true);
+    expect(isMetaText('Output example:')).toBe(true);
+    expect(isMetaText('Input example:')).toBe(true);
+  });
+
+  it('偵測中文元文本', () => {
+    expect(isMetaText('此輸入與先前的問題相符')).toBe(true);
+    expect(isMetaText('此輸入不符合要求，應重新生成完整內容。')).toBe(true);
+    expect(isMetaText('確保每個索引都有正確的翻譯')).toBe(true);
+    expect(isMetaText('以上為所有 15 行，符合要求。')).toBe(true);
+  });
+
+  it('正常翻譯不被誤判', () => {
+    expect(isMetaText('0\t蘋果發布了新產品')).toBe(false);
+    expect(isMetaText('這是測試翻譯')).toBe(false);
+    expect(isMetaText('1，而且我指的是真正的驚喜')).toBe(false);
   });
 });
 

@@ -36,7 +36,7 @@ type OffscreenResponse =
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number; fileCount?: number; completedFiles?: number }
   | { type: 'local-onnx:download-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:cache-cleared'; ok: boolean }
-  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean }
+  | { type: 'local-onnx:translate-result'; ok: boolean; translatedText?: string; error?: string; notDownloaded?: boolean; echoed?: boolean; degenerate?: boolean; wrongLanguage?: boolean }
   | { type: 'asr-whisper:status'; downloaded: boolean; modelId: string; downloading?: boolean }
   | { type: 'asr-whisper:download-progress'; progress: number; loaded: number; total: number; fileCount?: number; completedFiles?: number }
   | { type: 'asr-whisper:download-complete'; ok: boolean; error?: string }
@@ -1601,7 +1601,7 @@ async function runInference(
     console.log('[AI_Trans:local-onnx] generated_text:', JSON.stringify(generatedText.slice(0, 500)));
     console.log('[AI_Trans:local-onnx] generated_text.length:', generatedText.length, 'tail:', JSON.stringify(generatedText.slice(-500)));
 
-    const { translatedLines, echoed, parsedCount, similarCount } = parseNumberedOutput(generatedText, sourceLines);
+    const { translatedLines, echoed, parsedCount, similarCount, degenerate, wrongLanguage } = parseNumberedOutput(generatedText, sourceLines, targetLang);
 
     // 當檢測到 echo 時，輸出詳細診斷信息
     if (echoed) {
@@ -1628,6 +1628,49 @@ async function runInference(
       });
     }
 
+    // 當檢測到退化輸出時，記錄診斷
+    if (degenerate) {
+      console.log('[AI_Trans:local-onnx] DEGENERATE OUTPUT DETECTED!');
+      console.log('[AI_Trans:local-onnx] generated_text (full):', JSON.stringify(generatedText));
+      
+      const elapsedMs = Math.round(performance.now() - inferStartedAt);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-degenerate-output',
+          recoverable: true,
+          cause: new Error(
+            `local ONNX degenerate output detected (took ${elapsedMs}ms); raw output: ${JSON.stringify(
+              generatedText.slice(0, 200)
+            )}`
+          ),
+        },
+      });
+    }
+
+    // 當檢測到語言錯誤時，記錄診斷
+    if (wrongLanguage) {
+      console.log('[AI_Trans:local-onnx] WRONG LANGUAGE DETECTED!');
+      console.log('[AI_Trans:local-onnx] targetLang:', targetLang);
+      console.log('[AI_Trans:local-onnx] generated_text (full):', JSON.stringify(generatedText));
+      
+      const elapsedMs = Math.round(performance.now() - inferStartedAt);
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'translation',
+          code: 'local-onnx-wrong-language-output',
+          recoverable: true,
+          cause: new Error(
+            `local ONNX output wrong language (target: ${targetLang}, no Chinese in output, took ${elapsedMs}ms); raw output: ${JSON.stringify(
+              generatedText.slice(0, 200)
+            )}`
+          ),
+        },
+      });
+    }
+
     let finalText = translatedLines.join('\n');
     // 簡繁轉換安全網：即使 prompt 已要求輸出繁體，部分模型仍可能輸出簡體，
     // 對 zh-Hant 目標統一轉換（對已是繁體的內容為冪等操作）。
@@ -1640,6 +1683,8 @@ async function runInference(
       ok: true,
       translatedText: finalText,
       echoed,
+      degenerate,
+      wrongLanguage,
     } satisfies OffscreenResponse;
   } catch (err) {
     // §5.6：推理失敗必須落診斷。
@@ -1832,17 +1877,22 @@ ${numbered}
 }
 
 /**
- * 解析模型的「行號 → 譯文」輸出，按輸入行序還原譯文數組。
- * 缺行/無效行以原文兜底；全部回顯原文時標記低質量（echo），供調用方留診斷。
- * 返回 parsedCount（實際解析到譯文的行數），讓 echo 診斷能分辨「模型回顯」vs
- * 「模型輸出了譯文但未帶行號/行號格式不符導致解析不到」（§5.6 不誤判）。
+ * 解析帶行號的模型輸出，並檢測 echo（回顯原文）、退化輸出（token 重複亂碼）和語言錯誤。
+ * 
+ * 檢測邏輯：
+ * 1. Echo 檢測：已解析行與原文相似度 > 40% 視為 echo
+ * 2. 退化檢測：3-gram 唯一率 < 0.2 視為退化（token 重複亂碼）
+ * 3. 短輸出檢測：輸出長度 / 輸入長度 < 0.2 視為退化
+ * 4. 語言錯誤檢測：目標語言為中文但輸出無中文字符視為語言錯誤
  */
 function parseNumberedOutput(
   generated: string,
-  sourceLines: string[]
-): { translatedLines: string[]; echoed: boolean; parsedCount: number; similarCount: number } {
+  sourceLines: string[],
+  targetLang: string
+): { translatedLines: string[]; echoed: boolean; parsedCount: number; similarCount: number; degenerate: boolean; wrongLanguage: boolean } {
   console.log('[AI_Trans:local-onnx] parseNumberedOutput: starting, generated length:', generated.length);
   console.log('[AI_Trans:local-onnx] parseNumberedOutput: sourceLines count:', sourceLines.length);
+  console.log('[AI_Trans:local-onnx] parseNumberedOutput: targetLang:', targetLang);
   
   const parsed = new Map<number, string>();
   for (const line of generated.split('\n')) {
@@ -1855,9 +1905,31 @@ function parseNumberedOutput(
   }
   console.log('[AI_Trans:local-onnx] parseNumberedOutput: parsed numbered lines count:', parsed.size);
   
+  // 退化檢測 1：短輸出（輸出長度 / 輸入長度 < 0.2）
+  const sourceText = sourceLines.join('\n');
+  const lengthRatio = generated.length / Math.max(sourceText.length, 1);
+  const shortOutputDegenerate = lengthRatio < 0.2 && generated.length < 100;
+  if (shortOutputDegenerate) {
+    console.log('[AI_Trans:local-onnx] parseNumberedOutput: short output detected, lengthRatio:', lengthRatio.toFixed(3));
+  }
+  
+  // 退化檢測 2：3-gram 唯一率（檢測 token 重複亂碼）
+  const ngramRatio = calcUniqueNgramRatio(generated, 3);
+  const ngramDegenerate = ngramRatio < 0.2 && generated.length > 50;
+  if (ngramDegenerate) {
+    console.log('[AI_Trans:local-onnx] parseNumberedOutput: degenerate output detected, ngramRatio:', ngramRatio.toFixed(3));
+  }
+  
+  // 語言錯誤檢測：目標語言為中文但輸出無中文字符
+  const isTargetChinese = targetLang === 'zh-Hant' || targetLang === 'zh-Hans';
+  const hasChinese = /[\u4e00-\u9fff]/.test(generated);
+  const wrongLanguage = isTargetChinese && !hasChinese && parsed.size > 0;
+  if (wrongLanguage) {
+    console.log('[AI_Trans:local-onnx] parseNumberedOutput: WRONG LANGUAGE detected - target is Chinese but output has no Chinese characters');
+  }
+  
   // F6: 回退解析器——如果沒有編號行但輸出包含中文，直接使用原始輸出
   if (parsed.size === 0) {
-    const hasChinese = /[\u4e00-\u9fff]/.test(generated);
     console.log('[AI_Trans:local-onnx] parseNumberedOutput: no numbered lines, hasChinese:', hasChinese);
     if (hasChinese) {
       // 使用原始輸出作為翻譯（按行分割）
@@ -1865,7 +1937,7 @@ function parseNumberedOutput(
       // 映射到源行（如果行數不足則回退到原文）
       const translatedLines = sourceLines.map((src, i) => rawLines[i] || src);
       console.log('[AI_Trans:local-onnx] Fallback: using raw Chinese output as translation, rawLines count:', rawLines.length);
-      return { translatedLines, echoed: false, parsedCount: 0, similarCount: 0 };
+      return { translatedLines, echoed: false, parsedCount: 0, similarCount: 0, degenerate: shortOutputDegenerate || ngramDegenerate, wrongLanguage: false };
     } else {
       console.log('[AI_Trans:local-onnx] parseNumberedOutput: no Chinese detected, will fallback to source');
     }
@@ -1903,9 +1975,11 @@ function parseNumberedOutput(
     }
   }
   
-  // 如果超過 80% 的已解析行都相似，認為是 echo
-  const echoed = parsed.size > 0 && similarCount > parsed.size * 0.8;
-  return { translatedLines, echoed, parsedCount: parsed.size, similarCount };
+  // 如果超過 40% 的已解析行都相似，認為是 echo（降低閾值從 80% 到 40%）
+  const echoed = parsed.size > 0 && similarCount > parsed.size * 0.4;
+  const degenerate = shortOutputDegenerate || ngramDegenerate;
+  
+  return { translatedLines, echoed, parsedCount: parsed.size, similarCount, degenerate, wrongLanguage };
 }
 
 /** 語言代碼映射為語言名稱（用於 Prompt）。 */

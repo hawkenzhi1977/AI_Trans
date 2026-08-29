@@ -240,7 +240,7 @@ describe('LocalONNXTranslationProvider', () => {
     expect((provider as unknown as { port: unknown }).port).toBeNull();
   });
 
-  it('回顯輸出 → 返回翻譯結果 + 記錄診斷', async () => {
+  it('回顯輸出 → 回退原文 + 記錄診斷', async () => {
     const provider = new LocalONNXTranslationProvider({
       modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
       chunkSize: 4,
@@ -270,10 +270,47 @@ describe('LocalONNXTranslationProvider', () => {
     const segments = [seg(0), seg(1), seg(2)];
     const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
 
-    // 驗證返回翻譯結果（即使 echoed，仍返回翻譯結果）
+    // 驗證回退原文（echoed 時不使用模型輸出，避免顯示亂碼）
     expect(result.segments).toHaveLength(3);
-    expect(result.segments[0].translatedText).toBe('Hello');
-    expect(result.segments[1].translatedText).toBe('World');
-    expect(result.segments[2].translatedText).toBe('Test');
+    expect(result.segments[0].translatedText).toBe('line-0');
+    expect(result.segments[1].translatedText).toBe('line-1');
+    expect(result.segments[2].translatedText).toBe('line-2');
+  });
+
+  it('語言錯誤輸出 → 回退原文 + 記錄診斷', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      chunkSize: 4,
+    });
+
+    // 注入 mock port
+    (provider as unknown as { port: unknown }).port = mockPort;
+
+    // 模擬 port 返回語言錯誤輸出（目標是中文但輸出英文）
+    mockPort.postMessage.mockImplementation((msg: unknown) => {
+      setTimeout(() => {
+        const msgObj = msg as { topic?: string; messageId?: string };
+        if (msgObj.topic === 'local-onnx:translate') {
+          const response = {
+            messageId: msgObj.messageId,
+            result: {
+              ok: true,
+              translatedText: '1. keyboard\n2. monitor\n3. mouse',
+              wrongLanguage: true,
+            },
+          };
+          mockPort._simulateMessage(response);
+        }
+      }, 0);
+    });
+
+    const segments = [seg(0), seg(1), seg(2)];
+    const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+    // 驗證回退原文（wrongLanguage 時不使用模型輸出，避免顯示錯誤語言）
+    expect(result.segments).toHaveLength(3);
+    expect(result.segments[0].translatedText).toBe('line-0');
+    expect(result.segments[1].translatedText).toBe('line-1');
+    expect(result.segments[2].translatedText).toBe('line-2');
   });
 });
