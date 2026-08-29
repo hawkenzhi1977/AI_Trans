@@ -535,7 +535,7 @@ export class LLMTranslationProvider implements TranslationProvider {
         /^(\d+)\s+(\D.+)$/,
         /^(\d+)[.)\]:]\s*(.+)$/,
         /^(\d+)[、。：），；？！]\s*(.+)$/,
-        /^(\d+)[\-–—]\s*(.+)$/,
+        /^(\d+)[-–—]\s*(.+)$/,
       ];
 
       let patternMatched = false;
