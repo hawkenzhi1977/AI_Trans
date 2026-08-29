@@ -3,6 +3,7 @@ import { NativeCaptionStrategy } from '../../src/application/strategies/native-c
 import type { StrategyContext } from '../../src/domain/ports/caption-strategy';
 import type { PlatformAdapter } from '../../src/domain/ports/platform-adapter';
 import type { TranslationProvider } from '../../src/domain/ports/translation-provider';
+import type { ASRProvider } from '../../src/domain/ports/asr-provider';
 import type { CaptionTrack, SubtitleSegment } from '../../src/domain/models/subtitle';
 import type { PipelineEvent } from '../../src/domain/models/events';
 
@@ -291,12 +292,13 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
         performanceProfile: 'balanced',
         falseSeekThresholdMs: 10000,
       },
-      asr: {} as any,
+      asr: {} as ASRProvider,
       translation: {} as TranslationProvider,
       diagnostics: [],
     } as StrategyContext;
     
     // 手動設置 ctx（模擬 run() 已執行）
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (s as any).ctx = ctx;
     
     // 模擬虛假 seek 到 0ms
@@ -319,11 +321,12 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
         performanceProfile: 'balanced',
         falseSeekThresholdMs: 10000,
       },
-      asr: {} as any,
+      asr: {} as ASRProvider,
       translation: {} as TranslationProvider,
       diagnostics: [],
     } as StrategyContext;
     
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (s as any).ctx = ctx;
     
     // 模擬 seek 到 0ms（此時當前位置 5s < 閾值 10s，應接受）
@@ -347,11 +350,12 @@ describe('NativeCaptionStrategy — Seek 響應與動態優先級', () => {
         performanceProfile: 'balanced',
         falseSeekThresholdMs: 10000,
       },
-      asr: {} as any,
+      asr: {} as ASRProvider,
       translation: {} as TranslationProvider,
       diagnostics: [],
     } as StrategyContext;
     
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (s as any).ctx = ctx;
     
     // 模擬真實 seek 到 30s（非 0，應接受）
