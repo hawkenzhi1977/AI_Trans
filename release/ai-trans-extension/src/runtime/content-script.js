@@ -2175,7 +2175,7 @@ Example output:
           /^(\d+)\s+(\D.+)$/,
           /^(\d+)[.)\]:]\s*(.+)$/,
           /^(\d+)[、。：），；？！]\s*(.+)$/,
-          /^(\d+)[\-–—]\s*(.+)$/
+          /^(\d+)[-–—]\s*(.+)$/
         ];
         let patternMatched = false;
         for (const pattern of patterns) {
