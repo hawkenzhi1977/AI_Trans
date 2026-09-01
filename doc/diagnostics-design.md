@@ -590,6 +590,18 @@
 - **開發者響應**: 開啟 Options「調試日誌 → local-onnx」查看 `small-model-degenerate` 麵包屑；對照 Offscreen console `ngramRatio` 值確認退化程度；若生成參數增強後仍退化，可能需考慮更換模型或量化方案
 - **代碼落點**: src/runtime/offscreen.ts（`calcUniqueNgramRatio` + `runInference` 退化檢測分支）、src/adapters/translation/local-onnx-translation.ts（`translateChunk` 退化響應處理 + `consecutiveDegenerateCount` + `recordDiagnostic`）
 
+### 4.24 本地 ONNX 慢推理保護（低配機器中文字幕不顯示）
+
+- **診斷碼**: `local-onnx-slow-inference`
+- **port / kind**: `translation` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: Error: local ONNX inference too slow: N chunks exceeded 15s each. Consider switching to cloud translation (LLM/MT) for better performance on this device.」；字幕顯示原文（未翻譯）
+- **觸發條件**: `LocalONNXTranslationProvider.translateChunk()` 連續 3 個 chunk 推理時間超過 15 秒（`modelStats.slowChunks >= 3`）
+- **根因**: 低配 Windows 機器無 WebGPU 加速，ONNX 模型降級至 WASM/CPU 推理，單 chunk 推理耗時 50-60 秒（日誌 `took 56663ms`），觸發幻覺輸出（`"the model the model..."`）→ `wrongLanguage: true` → 翻譯失敗回退原文 → 無中文字幕
+- **修復措施**: ①**單 chunk 超時保護**——`PER_CHUNK_TIMEOUT_MS = 30_000`（30 秒），`requestTranslateWithTimeout()` 包裝器在超時時快速失敗，讓 pipeline 有機會 fallback 到其他引擎；②**慢推理診斷**——新增 `modelStats.slowChunks` 計數，連續 3 個 chunk 超過 15 秒時落 `local-onnx-slow-inference` 診斷，建議用戶切換雲端翻譯引擎；③**chrome.offscreen 紅線修復**——`TabCaptureAudioSource` 不再直接調用 `chrome.offscreen.createDocument()`（content-script 中為 undefined），改為通過 `chrome.runtime.sendMessage({ topic: 'offscreen:ensure-created' })` 路由至 Service Worker 執行
+- **用戶響應**: popup「最近失敗」顯示慢推理提示；建議在 Options 中切換到雲端翻譯引擎（LLM/MT）以獲得更好性能
+- **開發者響應**: 開啟 Options「調試日誌 → local-onnx」查看 `slow-chunk-warning` 麵包屑（`took Nms, slowChunks=N`）；對照 Offscreen console `took Nms` 確認推理耗時；若持續慢推理，建議用戶切換雲端引擎
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`requestTranslateWithTimeout` + `PER_CHUNK_TIMEOUT_MS` + `modelStats.slowChunks` + `recordDiagnostic`）、src/adapters/audio/tab-capture-source.ts（`ensureOffscreenViaServiceWorker`）、src/runtime/service-worker.ts（`offscreen:ensure-created` 處理器）
+
 
 ---
 

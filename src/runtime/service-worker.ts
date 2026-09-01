@@ -192,15 +192,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // Content-script 請求確保 Offscreen Document 存在（chrome.offscreen 僅在 SW 可用）。
+  if (msg.topic === 'offscreen:ensure-created') {
+    void ensureOffscreenDocument()
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: `offscreen:ensure-created failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+      );
+    return true;
+  }
+
   // Offscreen 空閒超時 → 關閉 document（釋放 WASM 模型 + 音頻資源）。
   // 背景：offscreen 與 popup 共享 extension 渲染進程，空閒不關閉會導致進程被佔滿，
   // popup 無法創建（真實環境「播放後 popup 彈不出」根因修復，M2-25）。
   if (msg.topic === 'offscreen:idle-close') {
-    chrome.offscreen
+    void chrome.offscreen
       .closeDocument()
       .then(() => {
         offscreenPort = null;
         console.warn('[AI_Trans] offscreen document closed after idle timeout');
+        sendResponse({ ok: true });
       })
       .catch((err) => {
         // §5.6：關閉失敗必須落診斷（不靜默）。
@@ -215,8 +229,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             cause,
           },
         });
+        sendResponse({ ok: true });
       });
-    return false;
+    return true;
   }
 
   // 本地 ONNX 翻譯模型相關消息——轉發給 Offscreen Document。

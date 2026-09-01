@@ -97,7 +97,7 @@ describe('Service Worker — offscreen 空閒關閉（M2-25）', () => {
     await loadWorker();
     const listener = getListener();
     const closeDocMock = chrome.offscreen.closeDocument as ReturnType<typeof vi.fn>;
-    expect(listener({ topic: 'offscreen:idle-close' }, {}, vi.fn())).toBe(false);
+    expect(listener({ topic: 'offscreen:idle-close' }, {}, vi.fn())).toBe(true); // M2-45: 改為異步響應
     await new Promise((r) => setTimeout(r, 20));
     expect(closeDocMock).toHaveBeenCalledTimes(1);
   });
@@ -178,5 +178,49 @@ describe('Service Worker — chrome.commands 未定義仍可求值（M2-26 補�
   it('SW 模組頂層求值不依賴 chrome.commands（不拋 TypeError）', async () => {
     expect((chrome as unknown as { commands?: unknown }).commands).toBeUndefined();
     await expect(loadWorker()).resolves.not.toThrow();
+  });
+});
+
+// M2-45：Content-script 透過 SW 創建 Offscreen Document（chrome.offscreen 僅在 SW 可用）。
+describe('Service Worker — offscreen:ensure-created（M2-45）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+  });
+
+  function getListener(): (msg: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => boolean {
+    const chromeMock = chrome as unknown as {
+      runtime: {
+        onMessage: {
+          addListener: ReturnType<typeof vi.fn>;
+        };
+      };
+    };
+    return chromeMock.runtime.onMessage.addListener.mock.calls[0][0];
+  }
+
+  it('offscreen:ensure-created → 調用 chrome.offscreen.createDocument 並響應 ok', async () => {
+    await loadWorker();
+    const listener = getListener();
+    const createDocMock = chrome.offscreen.createDocument as ReturnType<typeof vi.fn>;
+    const sendResponse = vi.fn();
+    const keep = listener({ topic: 'offscreen:ensure-created' }, {}, sendResponse);
+    expect(keep).toBe(true); // 異步響應
+    await new Promise((r) => setTimeout(r, 20));
+    expect(createDocMock).toHaveBeenCalledTimes(1);
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('offscreen:ensure-created 失敗 → sendResponse({ok:false, error})', async () => {
+    await loadWorker();
+    const listener = getListener();
+    (chrome.offscreen.createDocument as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('offscreen create failed')
+    );
+    const sendResponse = vi.fn();
+    listener({ topic: 'offscreen:ensure-created' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: false, error: expect.stringContaining('offscreen create failed') })
+    );
   });
 });

@@ -2349,14 +2349,17 @@ Example output:
 
   // src/adapters/translation/local-onnx-translation.ts
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
+  var PER_CHUNK_TIMEOUT_MS = 3e4;
   var modelStats = {
     totalChunks: 0,
     mergedChunks: 0,
     // 輸出行數 < 輸入行數的 chunks
     perfectChunks: 0,
     // 輸出行數 = 輸入行數的 chunks
-    totalFallbacks: 0
+    totalFallbacks: 0,
     // 回退原文的行數
+    slowChunks: 0
+    // 推理超過 15 秒的 chunks（低配機器警告）
   };
   var LocalONNXTranslationProvider = class {
     engineId = "local-onnx";
@@ -2448,10 +2451,10 @@ Example output:
       };
     }
     /**
-     * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
-     * 將 Offscreen 返回的單一結果拆分回各 segment。
-     * 模型依行號解析，少於輸入行數時缺行回退原文。
-       */
+      * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
+      * 將 Offscreen 返回的單一結果拆分回各 segment。
+      * 模型依行號解析，少於輸入行數時缺行回退原文。
+        */
     async translateChunk(chunk, targetLang) {
       const combinedText = chunk.map((s) => s.sourceText).join("\n");
       diagLog("local-onnx", `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
@@ -2463,7 +2466,26 @@ Example output:
         }
       };
       diagLog("local-onnx", `requestTranslate: sending request`);
-      const res = await this.requestTranslate(request);
+      const chunkStartedAt = Date.now();
+      const res = await this.requestTranslateWithTimeout(request, PER_CHUNK_TIMEOUT_MS);
+      const elapsedMs = Date.now() - chunkStartedAt;
+      if (elapsedMs > 15e3) {
+        modelStats.slowChunks++;
+        diagLog("local-onnx", `slow-chunk-warning: took ${elapsedMs}ms, slowChunks=${modelStats.slowChunks}`);
+        if (modelStats.slowChunks >= 3) {
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "translation",
+              code: "local-onnx-slow-inference",
+              recoverable: true,
+              cause: new Error(
+                `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded 15s each. Consider switching to cloud translation (LLM/MT) for better performance on this device.`
+              )
+            }
+          });
+        }
+      }
       const rawOutput = res.translatedText ?? "";
       const isEchoed = res.echoed === true;
       const isDegenerate = res.degenerate === true;
@@ -2531,9 +2553,27 @@ Example output:
       return weakSplit.length > 0 ? weakSplit : [text];
     }
     /**
-     * 發送單次翻譯請求並校驗結果——使用 port 長連接。
-     * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
+     * 帶超時的翻譯請求包裝器——低配機器 CPU 推理過慢時快速失敗。
+     * 超時後拋錯，讓 pipeline 有機會 fallback 到其他引擎。
      */
+    async requestTranslateWithTimeout(request, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`local-onnx chunk timeout: inference exceeded ${timeoutMs}ms`));
+        }, timeoutMs);
+        this.requestTranslate(request).then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        }).catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+    }
+    /**
+      * 發送單次翻譯請求並校驗結果——使用 port 長連接。
+      * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
+      */
     async requestTranslate(request) {
       try {
         const port = this.ensurePort();
@@ -2856,7 +2896,6 @@ Example output:
   }
 
   // src/adapters/audio/tab-capture-source.ts
-  var OFFSCREEN_URL = "src/runtime/offscreen.html";
   var CHROME_API_TIMEOUT_MS = 5e3;
   var seqCounter = 0;
   function withTimeout(promise, timeoutMs, message) {
@@ -2875,6 +2914,13 @@ Example output:
         }
       );
     });
+  }
+  async function ensureOffscreenViaServiceWorker() {
+    const response = await chrome.runtime.sendMessage({ topic: "offscreen:ensure-created" });
+    const res = response;
+    if (!res.ok) {
+      throw new Error(res.error ?? "offscreen:ensure-created failed");
+    }
   }
   var TabCaptureAudioSource = class {
     kind = "tab-capture";
@@ -2896,28 +2942,22 @@ Example output:
       if (!this.offscreenCreated) {
         try {
           await withTimeout(
-            chrome.offscreen.createDocument({
-              url: OFFSCREEN_URL,
-              reasons: [chrome.offscreen.Reason.USER_MEDIA],
-              justification: "ASR audio processing: tabCapture + PCM extraction"
-            }),
+            ensureOffscreenViaServiceWorker(),
             CHROME_API_TIMEOUT_MS,
-            "chrome.offscreen.createDocument"
+            "offscreen:ensure-created"
           );
           this.offscreenCreated = true;
         } catch (err) {
-          if (!(err instanceof Error && err.message.includes("only one"))) {
-            recordDiagnostic({
-              type: "pipeline-error",
-              error: {
-                port: "audio",
-                code: "offscreen-create-failed",
-                recoverable: true,
-                cause: err instanceof Error ? err : new Error(String(err))
-              }
-            });
-            throw err;
-          }
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "audio",
+              code: "offscreen-create-failed",
+              recoverable: true,
+              cause: err instanceof Error ? err : new Error(String(err))
+            }
+          });
+          throw err;
         }
       }
       this.port = chrome.runtime.connect({ name: "offscreen-asr" });
@@ -2963,7 +3003,7 @@ Example output:
       }
       if (this.offscreenCreated) {
         try {
-          await chrome.offscreen.closeDocument();
+          await chrome.runtime.sendMessage({ topic: "offscreen:idle-close" });
         } catch {
         }
         this.offscreenCreated = false;

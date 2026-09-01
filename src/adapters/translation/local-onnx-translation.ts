@@ -50,12 +50,16 @@ export interface LocalOnnxTranslationConfig {
 /** 單次翻譯會話的最大時限（毫秒）：超過此時間主動中斷，避免 Offscreen 長時間運行不穩定。 */
 const MAX_SESSION_DURATION_MS = 10 * 60 * 1000; // 10 分鐘
 
+/** 單個 chunk 推理的最大時限（毫秒）：低配機器 CPU 推理過慢時快速失敗，避免阻塞整個管線。 */
+const PER_CHUNK_TIMEOUT_MS = 30_000; // 30 秒
+
 /** 翻譯質量統計（用於後續優化分析）。 */
 const modelStats = {
   totalChunks: 0,
   mergedChunks: 0,      // 輸出行數 < 輸入行數的 chunks
   perfectChunks: 0,     // 輸出行數 = 輸入行數的 chunks
   totalFallbacks: 0,    // 回退原文的行數
+  slowChunks: 0,        // 推理超過 15 秒的 chunks（低配機器警告）
 };
 
 /**
@@ -169,28 +173,52 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
-   * 將 Offscreen 返回的單一結果拆分回各 segment。
-   * 模型依行號解析，少於輸入行數時缺行回退原文。
-     */
-  private async translateChunk(
-    chunk: SubtitleSegment[],
-    targetLang: string
-  ): Promise<{ segments: SubtitleSegment[]; echoed: boolean; degenerate: boolean; wrongLanguage: boolean }> {
-    const combinedText = chunk.map((s) => s.sourceText).join('\n');
-
-    diagLog('local-onnx', `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
-
-    const request: LocalOnnxTranslateRequest = {
-      topic: 'local-onnx:translate',
-      payload: {
-        text: combinedText,
-        targetLang,
-      },
-    };
-
-    diagLog('local-onnx', `requestTranslate: sending request`);
-    const res = await this.requestTranslate(request);
+    * 翻譯單一 chunk——合併 sourceText 為單一請求（減少推理次數），
+    * 將 Offscreen 返回的單一結果拆分回各 segment。
+    * 模型依行號解析，少於輸入行數時缺行回退原文。
+      */
+   private async translateChunk(
+     chunk: SubtitleSegment[],
+     targetLang: string
+   ): Promise<{ segments: SubtitleSegment[]; echoed: boolean; degenerate: boolean; wrongLanguage: boolean }> {
+     const combinedText = chunk.map((s) => s.sourceText).join('\n');
+ 
+     diagLog('local-onnx', `translateChunk: chunkSize=${chunk.length}, targetLang=${targetLang}`);
+ 
+     const request: LocalOnnxTranslateRequest = {
+       topic: 'local-onnx:translate',
+       payload: {
+         text: combinedText,
+         targetLang,
+       },
+     };
+ 
+     diagLog('local-onnx', `requestTranslate: sending request`);
+     const chunkStartedAt = Date.now();
+     
+     // 單個 chunk 超時保護：低配機器 CPU 推理過慢時快速失敗（30 秒）。
+     const res = await this.requestTranslateWithTimeout(request, PER_CHUNK_TIMEOUT_MS);
+     
+     const elapsedMs = Date.now() - chunkStartedAt;
+     if (elapsedMs > 15_000) {
+       modelStats.slowChunks++;
+       diagLog('local-onnx', `slow-chunk-warning: took ${elapsedMs}ms, slowChunks=${modelStats.slowChunks}`);
+       if (modelStats.slowChunks >= 3) {
+         // 連續 3 個 chunk 超過 15 秒 → 落診斷，建議用戶切換雲端引擎。
+         recordDiagnostic({
+           type: 'pipeline-error',
+           error: {
+             port: 'translation',
+             code: 'local-onnx-slow-inference',
+             recoverable: true,
+             cause: new Error(
+               `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded 15s each. ` +
+               `Consider switching to cloud translation (LLM/MT) for better performance on this device.`
+             ),
+           },
+         });
+       }
+     }
     
     const rawOutput = res.translatedText ?? '';
     const isEchoed = res.echoed === true;
@@ -287,12 +315,37 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   }
 
   /**
-   * 發送單次翻譯請求並校驗結果——使用 port 長連接。
-   * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
+   * 帶超時的翻譯請求包裝器——低配機器 CPU 推理過慢時快速失敗。
+   * 超時後拋錯，讓 pipeline 有機會 fallback 到其他引擎。
    */
-  private async requestTranslate(
-    request: LocalOnnxTranslateRequest
+  private async requestTranslateWithTimeout(
+    request: LocalOnnxTranslateRequest,
+    timeoutMs: number
   ): Promise<LocalOnnxTranslateResponse> {
+    return new Promise<LocalOnnxTranslateResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`local-onnx chunk timeout: inference exceeded ${timeoutMs}ms`));
+      }, timeoutMs);
+      
+      this.requestTranslate(request)
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    });
+  }
+
+  /**
+    * 發送單次翻譯請求並校驗結果——使用 port 長連接。
+    * §5.6：模型未下載/推理失敗/通信失敗都必須落診斷。
+    */
+   private async requestTranslate(
+     request: LocalOnnxTranslateRequest
+   ): Promise<LocalOnnxTranslateResponse> {
     try {
       const port = this.ensurePort();
       const messageId = `msg-${++this.messageIdCounter}-${Date.now()}`;

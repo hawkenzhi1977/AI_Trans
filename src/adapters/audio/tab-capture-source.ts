@@ -19,9 +19,6 @@ type OffscreenResponse =
   | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
   | { type: 'error'; message: string };
 
-/** Offscreen Document URL（相對路徑，Chrome 會解析為擴充內部 URL）。 */
-const OFFSCREEN_URL = 'src/runtime/offscreen.html';
-
 /** M2-44：超時時間（毫秒）：Chrome API 調用超時保護。 */
 const CHROME_API_TIMEOUT_MS = 5_000;
 
@@ -47,6 +44,18 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
+/**
+ * 通過 Service Worker 確保 Offscreen Document 存在。
+ * chrome.offscreen API 僅在 Service Worker 中可用，content-script 必須透過消息路由。
+ */
+async function ensureOffscreenViaServiceWorker(): Promise<void> {
+  const response = await chrome.runtime.sendMessage({ topic: 'offscreen:ensure-created' });
+  const res = response as { ok: boolean; error?: string };
+  if (!res.ok) {
+    throw new Error(res.error ?? 'offscreen:ensure-created failed');
+  }
+}
+
 export class TabCaptureAudioSource implements AudioSourceProvider {
   readonly kind = 'tab-capture' as const;
   private port: chrome.runtime.Port | null = null;
@@ -67,35 +76,27 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
 
   /** 創建 Offscreen Document 並建立 port 連接。 */
   private async start(): Promise<void> {
-    // 創建 Offscreen Document（MV3 同時只允許一個，重複創建會拋錯）。
+    // 通過 Service Worker 創建 Offscreen Document（chrome.offscreen 僅在 SW 可用）。
     if (!this.offscreenCreated) {
       try {
-        // M2-44：增加超時機制，防止 Chrome API 掛起導致策略鏈卡住。
         await withTimeout(
-          chrome.offscreen.createDocument({
-            url: OFFSCREEN_URL,
-            reasons: [chrome.offscreen.Reason.USER_MEDIA],
-            justification: 'ASR audio processing: tabCapture + PCM extraction',
-          }),
+          ensureOffscreenViaServiceWorker(),
           CHROME_API_TIMEOUT_MS,
-          'chrome.offscreen.createDocument'
+          'offscreen:ensure-created'
         );
         this.offscreenCreated = true;
       } catch (err) {
-        // 已存在時忽略（MV3 限制），但仍嘗試建立 port。
-        if (!(err instanceof Error && err.message.includes('only one'))) {
-          // §5.6：超時或其他錯誤必須落診斷。
-          recordDiagnostic({
-            type: 'pipeline-error',
-            error: {
-              port: 'audio',
-              code: 'offscreen-create-failed',
-              recoverable: true,
-              cause: err instanceof Error ? err : new Error(String(err)),
-            },
-          });
-          throw err;
-        }
+        // §5.6：創建失敗必須落診斷。
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: {
+            port: 'audio',
+            code: 'offscreen-create-failed',
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err)),
+          },
+        });
+        throw err;
       }
     }
 
@@ -148,8 +149,9 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
       this.port = null;
     }
     if (this.offscreenCreated) {
+      // 通過 Service Worker 關閉 Offscreen Document（chrome.offscreen 僅在 SW 可用）。
       try {
-        await chrome.offscreen.closeDocument();
+        await chrome.runtime.sendMessage({ topic: 'offscreen:idle-close' });
       } catch {
         // 已關閉時忽略。
       }

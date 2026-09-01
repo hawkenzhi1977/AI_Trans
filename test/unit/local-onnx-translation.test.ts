@@ -313,4 +313,39 @@ describe('LocalONNXTranslationProvider', () => {
     expect(result.segments[1].translatedText).toBe('line-1');
     expect(result.segments[2].translatedText).toBe('line-2');
   });
+
+  // M2-45：慢推理保護——單個 chunk 超過 30 秒時快速失敗。
+  it('單個 chunk 推理超過 30 秒 → 超時拋錯（不阻塞整個管線）', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      chunkSize: 4,
+    });
+
+    // 注入 mock port，但永遠不響應（模擬 CPU 推理極慢）
+    (provider as unknown as { port: unknown }).port = mockPort;
+    mockPort.postMessage.mockImplementation(() => {
+      // 不調用 _simulateMessage，模擬推理卡住
+    });
+
+    // 使用真實計時器但 mock setTimeout 來加速測試
+    const originalSetTimeout = globalThis.setTimeout;
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    vi.stubGlobal('setTimeout', (callback: () => void, delay?: number) => {
+      timers.push({ callback, delay: delay ?? 0 });
+      return originalSetTimeout(callback, 0); // 立即執行以便測試可以控制
+    });
+
+    const translatePromise = provider.translate(req());
+    
+    // 找到超時 timer 並手動觸發
+    const timeoutTimer = timers.find((t) => t.delay === 30000);
+    expect(timeoutTimer).toBeDefined();
+    
+    // 觸發超時
+    timeoutTimer!.callback();
+    
+    await expect(translatePromise).rejects.toThrow('local-onnx chunk timeout');
+    
+    vi.unstubAllGlobals();
+  });
 });

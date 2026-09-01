@@ -267,10 +267,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     );
     return true;
   }
+  if (msg.topic === "offscreen:ensure-created") {
+    void ensureOffscreenDocument().then(() => sendResponse({ ok: true })).catch(
+      (err) => sendResponse({
+        ok: false,
+        error: `offscreen:ensure-created failed: ${err instanceof Error ? err.message : String(err)}`
+      })
+    );
+    return true;
+  }
   if (msg.topic === "offscreen:idle-close") {
-    chrome.offscreen.closeDocument().then(() => {
+    void chrome.offscreen.closeDocument().then(() => {
       offscreenPort = null;
       console.warn("[AI_Trans] offscreen document closed after idle timeout");
+      sendResponse({ ok: true });
     }).catch((err) => {
       const cause = err instanceof Error ? err : new Error(String(err));
       console.warn("[AI_Trans] offscreen closeDocument failed:", cause);
@@ -283,8 +293,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           cause
         }
       });
+      sendResponse({ ok: true });
     });
-    return false;
+    return true;
   }
   if (msg.topic?.startsWith("local-onnx:")) {
     void sendToOffscreen(msg).then((result) => sendResponse({ ok: true, result })).catch(
