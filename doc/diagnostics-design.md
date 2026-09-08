@@ -602,6 +602,30 @@
 - **開發者響應**: 開啟 Options「調試日誌 → local-onnx」查看 `slow-chunk-warning` 麵包屑（`took Nms, slowChunks=N`）；對照 Offscreen console `took Nms` 確認推理耗時；若持續慢推理，建議用戶切換雲端引擎
 - **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`requestTranslateWithTimeout` + `PER_CHUNK_TIMEOUT_MS` + `modelStats.slowChunks` + `recordDiagnostic`）、src/adapters/audio/tab-capture-source.ts（`ensureOffscreenViaServiceWorker`）、src/runtime/service-worker.ts（`offscreen:ensure-created` 處理器）
 
+### 4.25 tabCapture.getMediaStreamId 跨 render process 失敗（M2-52）
+
+- **診斷碼**: `asr-get-stream-id-failed`
+- **port / kind**: `asr` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: asr:get-stream-id failed: \<錯誤訊息\>」；ASR 無法啟動，字幕不出現
+- **觸發條件**: Service Worker 處理 `asr:get-stream-id` 消息時，`chrome.tabCapture.getMediaStreamId` callback 中 `chrome.runtime.lastError` 有值，或調用本身拋出例外
+- **根因**: Chrome 116+ 將 `getMediaStreamId` 返回的 streamId 限定在同一 render process；若直接在 popup 中調用，取得的 streamId 無法在 offscreen document（不同 render process）中使用，導致 `getUserMedia` 拋 `AbortError: Error starting tab capture`。修復後調用已移至 SW，但 SW 仍可能因 tabCapture 權限未授予或 API 不可用而失敗
+- **修復措施**: Popup 改為透過 `chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' })` 路由至 SW；SW 以 callback 風格包裝 `chrome.tabCapture.getMediaStreamId({}, cb)`，對 `lastError` 與例外做防禦並回傳 `{ ok: false, error }` （§5.6 不靜默）
+- **用戶響應**: 確認 tabCapture 權限已授予（popup「啟用 ASR」流程）；若錯誤持續，重新啟動 ASR 授權流程
+- **開發者響應**: 確認 `manifest.json` 中 `tabCapture` 權限存在；確認 SW 中 `asr:get-stream-id` 處理器正確返回 `true`（異步響應）；查看 popup console 的 `sendMessage` 回傳值是否含 `ok: false`
+- **代碼落點**: src/runtime/service-worker.ts（`asr:get-stream-id` 處理器，callback 風格包裝 + lastError/例外防禦）、src/runtime/popup/popup.ts（`sendMessage({ topic: 'asr:get-stream-id' })` IPC 調用）
+
+### 4.26 重複授權後 streamId restart 失敗（M2-53）
+
+- **診斷碼**: `asr-stream-id-restart-failed`
+- **port / kind**: `asr` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: asr-stream-id-restart-failed: \<錯誤訊息\>」；重複點擊「啟用 ASR」後字幕仍不出現
+- **觸發條件**: `content-script.ts` 的 `onMessage asr:stream-id` handler 在收到有效 streamId 後觸發 `restart()`，restart 過程中拋出例外
+- **根因**: 重複授權時 `chrome.storage.local.tabCaptureAuthorized` 值不變（仍為 true），Chrome `storage.onChanged` 不觸發，導致舊管線持續以 `enableAsr: false` 或未注入 deps 運行，`realtimeStrategy.inject()` 不被調用 → `dependencies not injected`。修復後每次 `asr:stream-id` 到達都強制 restart 以重建管線
+- **修復措施**: `content-script.ts` `onMessage asr:stream-id` handler 收到 streamId 後，除 `provide(streamId)` 外，立即更新 `this.tabCaptureAuthorized = true` 並以 `void this.restart().catch(e => recordDiagnostic('asr-stream-id-restart-failed', ...))` 觸發管線重建（§5.5/§5.6）
+- **用戶響應**: 重新點擊 popup「啟用 ASR」；若仍失敗，重整頁面後再授權
+- **開發者響應**: 查看 popup「最近失敗」的 `asr-stream-id-restart-failed` 診斷；確認 `InMemoryTabStreamIdProvider.consumeStreamId()` 在 restart 後能正確返回 string（有效 id）
+- **代碼落點**: src/runtime/content-script.ts（`onMessage asr:stream-id` handler，`restart()` 觸發 + catch 落診斷）
+
 
 ---
 
@@ -835,11 +859,12 @@ DiagnosticRecord 結構:
 
 - **診斷碼**: tab-capture-not-authorized
 - **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture not authorized — user denied or not triggered (<timestamp>)
-- **觸發條件**: `chrome.tabCapture.getMediaStream` 被用戶拒絕或未經用戶手勢觸發
+- **觸發條件**: `chrome.tabCapture.getMediaStream` 被用戶拒絕或未經用戶手勢觸發；或 `consumeStreamId()` 返回 undefined（未授權且無複用流）
 - **根因**: 用戶點擊「拒絕」授權對話框；Popup 按鈕未以用戶手勢觸發
+- **M2-54 根因補充**: `tab-capture-source.ts` 原本在此路徑直接呼叫 `chrome.storage.local.set({ tabCaptureAuthorized: false })`，觸發 `onAsrAuthChanged`（newValue=false）引發競態 restart，把記憶體授權值覆蓋回 false → `Orchestrator` 以 `enableAsr: false` 建立 → `inject()` 不被調用。M2-54 修復後：adapter 層只落診斷不寫 storage；授權狀態重置由 `content-script.ts` `onEvent` 統一管理——先設 `this.tabCaptureAuthorized = false`（記憶體先行），再寫 storage，確保 `onAsrAuthChanged` 收到 newValue=false 時命中 `newValue === this.tabCaptureAuthorized` 保護條件直接 return，不觸發競態 restart。
 - **用戶響應**: 點擊 Popup「啟用 ASR」按鈕重新授權；確認瀏覽器未全局禁用 tabCapture
-- **開發者響應**: 確認 `chrome.tabCapture.getMediaStream` 在用戶手勢（click）事件處理器中調用；檢查 manifest `tabCapture` 權限
-- **代碼落點**: src/adapters/audio/tab-capture-source.ts（`open()` catch 分支）
+- **開發者響應**: 確認 `chrome.tabCapture.getMediaStreamId` 在 Service Worker 用戶手勢（click）事件處理器中調用（M2-52）；檢查 manifest `tabCapture` 權限；確認 `onEvent tab-capture-not-authorized` 分支記憶體先行重置邏輯（content-script.ts:586-598）
+- **代碼落點**: src/adapters/audio/tab-capture-source.ts（`start()` consumeStreamId 未授權分支，僅落診斷）；src/runtime/content-script.ts（`onEvent` :586-598，記憶體先行重置 + storage 寫入）
 
 ### 11.2 tabCapture 捕獲失敗
 

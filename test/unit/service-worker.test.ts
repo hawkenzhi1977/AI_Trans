@@ -181,6 +181,86 @@ describe('Service Worker — chrome.commands 未定義仍可求值（M2-26 補�
   });
 });
 
+// M2-52：asr:get-stream-id 在 SW 中調用 tabCapture.getMediaStreamId（Chrome 116+ render process 限制）。
+describe('Service Worker — asr:get-stream-id（M2-52）', () => {
+  beforeEach(() => {
+    resetChromeMock();
+  });
+
+  function getListener(): (msg: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => boolean {
+    const chromeMock = chrome as unknown as {
+      runtime: { onMessage: { addListener: ReturnType<typeof vi.fn> } };
+    };
+    return chromeMock.runtime.onMessage.addListener.mock.calls[0][0];
+  }
+
+  it('成功 → sendResponse({ ok: true, streamId }) 並返回 true（異步響應）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    const getStreamIdMock = (chrome as unknown as { tabCapture: { getMediaStreamId: ReturnType<typeof vi.fn> } })
+      .tabCapture.getMediaStreamId;
+    // callback 風格：mock 實現直接調用第二個參數（callback）
+    getStreamIdMock.mockImplementationOnce((_opts: unknown, cb: (id: string) => void) => {
+      cb('test-stream-id-abc');
+    });
+    const sendResponse = vi.fn();
+    const keep = listener({ topic: 'asr:get-stream-id' }, {}, sendResponse);
+    expect(keep).toBe(true); // 異步響應
+    await new Promise((r) => setTimeout(r, 20));
+    expect(getStreamIdMock).toHaveBeenCalledWith({}, expect.any(Function));
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true, streamId: 'test-stream-id-abc' });
+  });
+
+  it('getMediaStreamId 失敗（lastError 設置）→ sendResponse({ ok: false, error })（§5.6 不靜默掛起）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    const getStreamIdMock = (chrome as unknown as { tabCapture: { getMediaStreamId: ReturnType<typeof vi.fn> } })
+      .tabCapture.getMediaStreamId;
+    // 模擬 chrome.runtime.lastError 設置的失敗情境
+    getStreamIdMock.mockImplementationOnce((_opts: unknown, cb: (id: string) => void) => {
+      // 設置 lastError 後再調用 callback（Chrome API 慣例）
+      Object.defineProperty(chrome.runtime, 'lastError', {
+        value: { message: 'tabCapture permission denied' },
+        configurable: true,
+      });
+      cb('');
+      // callback 返回後清除 lastError
+      Object.defineProperty(chrome.runtime, 'lastError', {
+        value: undefined,
+        configurable: true,
+      });
+    });
+    const sendResponse = vi.fn();
+    listener({ topic: 'asr:get-stream-id' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ok: false,
+        error: expect.stringContaining('tabCapture permission denied'),
+      })
+    );
+  });
+
+  it('getMediaStreamId 拋出例外 → sendResponse({ ok: false, error })（§5.6 不靜默掛起）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    const getStreamIdMock = (chrome as unknown as { tabCapture: { getMediaStreamId: ReturnType<typeof vi.fn> } })
+      .tabCapture.getMediaStreamId;
+    getStreamIdMock.mockImplementationOnce(() => {
+      throw new Error('API not available');
+    });
+    const sendResponse = vi.fn();
+    listener({ topic: 'asr:get-stream-id' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ok: false,
+        error: expect.stringContaining('API not available'),
+      })
+    );
+  });
+});
+
 // M2-45：Content-script 透過 SW 創建 Offscreen Document（chrome.offscreen 僅在 SW 可用）。
 describe('Service Worker — offscreen:ensure-created（M2-45）', () => {
   beforeEach(() => {

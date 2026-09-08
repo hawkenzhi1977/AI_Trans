@@ -47,23 +47,15 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   }
 
   async isApplicable(ctx: StrategyContext): Promise<boolean> {
-    // 檢查 ASR 配置與 tabCapture 授權狀態。
+    // 檢查 ASR 配置。
     if (ctx.config.asr.type === 'none') {
       ctx.diagnostics?.push?.('realtime-asr: ASR disabled (config.asr.type = none)');
       return false;
     }
 
-    // 檢查 tabCapture 授權（content-script 會寫入 chrome.storage.local）。
-    try {
-      const authState = await chrome.storage.local.get('tabCaptureAuthorized');
-      if (!authState.tabCaptureAuthorized) {
-        ctx.diagnostics?.push?.('realtime-asr: tabCapture not authorized');
-        return false;
-      }
-    } catch {
-      // 非擴充環境（測試）→ 允許（mock 授權）。
-    }
-
+    // M2-46：tabCapture 授權由 content-script 持有的 InMemoryTabStreamIdProvider 判定，
+    // 不再讀 chrome.storage（避免依賴 TTL 已過期的持久化狀態）。
+    // 此處僅檢查 deps 注入與 ASR 配置，授權與流可用性由 start() 時消費 streamId 確認。
     if (!this.deps) {
       ctx.diagnostics?.push?.('realtime-asr: dependencies not injected');
       return false;

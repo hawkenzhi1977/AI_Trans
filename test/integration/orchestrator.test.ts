@@ -219,6 +219,43 @@ describe('Orchestrator 集成：M2 ASR 依賴注入（§5.6 不靜默）', () =>
     expect(degraded).toBeDefined();
     expect((degraded as { reason: string }).reason).toContain('warmup exploded');
   });
+
+  it('M2-53 回歸：enableAsr=true 時 RealtimeASRStrategy.inject() 被調用（記憶體授權值能正確傳遞）', async () => {
+    // 回歸測試：修復 start() 無條件從 storage 重讀 tabCaptureAuthorized 的問題。
+    // 場景：restart() 觸發方已把 this.tabCaptureAuthorized = true，
+    // 若 start() 再從 storage 讀到 false 並覆蓋，Orchestrator 就以 enableAsr: false 建立，
+    // inject() 不被調用 → dependencies not injected。
+    // 此測試直接驗證 Orchestrator 收到 enableAsr: true 時確實調用了 inject()（warmup 被觸發即代理）。
+    const asrStub = new StubASRProvider({ engineId: 'test-asr' });
+    const asrMap = new Map<string, ASRProvider>([['test-asr', asrStub]]);
+    const registry = buildTestRegistry({ asr: asrMap });
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: true },
+      () => {}
+    );
+
+    await orch.start(WATCH_URL);
+
+    // inject() 被調用 → ASR warmup 被觸發（warmed=true）
+    expect(asrStub.warmed).toBe(true);
+  });
+
+  it('M2-53 回歸：enableAsr=false 時 inject() 不被調用（warmup 不觸發）', async () => {
+    // 與上一個測試配對：確認 enableAsr=false 時 inject() 不被調用。
+    // 若 start() 錯誤地把記憶體 true 覆蓋為 false，這個測試就能捕獲到反向錯誤。
+    const asrStub = new StubASRProvider({ engineId: 'test-asr' });
+    const asrMap = new Map<string, ASRProvider>([['test-asr', asrStub]]);
+    const registry = buildTestRegistry({ asr: asrMap });
+    const orch = new Orchestrator(
+      { registry, getConfig: async () => DEFAULT_CONFIG, enableAsr: false },
+      () => {}
+    );
+
+    await orch.start(WATCH_URL);
+
+    // inject() 未調用 → warmup 未觸發
+    expect(asrStub.warmed).toBe(false);
+  });
 });
 
 describe('Orchestrator 集成：M2-24 補充修復十三 翻譯引擎預熱', () => {

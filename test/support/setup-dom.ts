@@ -82,6 +82,13 @@ onMessage: { addListener: onMessageAdd, removeListener: onMessageRemove },
     sendMessage: vi.fn(),
     reload: vi.fn(async () => {}),
   },
+  // M2-52：tabCapture mock——getMediaStreamId 在 SW 中調用（Chrome 116+ render process 限制）。
+  // 實現為 callback 風格，與 Chrome Extension API 類型定義一致。
+  tabCapture: {
+    getMediaStreamId: vi.fn((_options: unknown, callback: (streamId: string) => void) => {
+      callback('mock-stream-id-12345');
+    }),
+  },
 };
 
 // @ts-expect-error 注入全局 chrome

@@ -268,23 +268,41 @@ function bindActions(config: EngineConfig): void {
     }
   });
 
-  // M2-14：tabCapture 授權按鈕——用戶點擊後觸發 tabCapture.getMediaStreamId（需用戶手勢）。
-  // 授權成功後寫入 chrome.storage.local['tabCaptureAuthorized'] = true，
-  // content-script 監聽 storage.onChanged 後啟用 ASR 策略。
+  // M2-46：tabCapture 授權按鈕——用戶點擊後觸發 tabCapture.getMediaStreamId（需用戶手勢）。
+  // 授權成功後透過 tabs.sendMessage 將 streamId 送入 content-script 記憶體（不落 storage）；
+  // 同時寫入 tabCaptureAuthorized=true 讓 content-script 的 storage 監聽觸發熱重啟。
   $('btn-asr').addEventListener('click', async () => {
     const connEl = $('status-connection');
     connEl.textContent = 'ASR 授權: 請求中…';
     connEl.classList.remove('warn', 'ok');
     try {
-      // 觸發 tabCapture 授權對話框（需用戶手勢觸發，popup 按鈕符合條件）。
-      // getMediaStreamId 會彈出授權對話框，用戶點擊「允許」後返回 streamId。
-      // @ts-expect-error Chrome extension API: getMediaStreamId signature varies by version.
-      const streamId = await chrome.tabCapture.getMediaStreamId({});
-      // 授權成功 → 記錄 streamId（實際捕獲由 Offscreen Document 使用）。
-      await chrome.storage.local.set({
-        tabCaptureAuthorized: true,
-        tabCaptureStreamId: streamId,
-      });
+      // getMediaStreamId 必須在 SW 中執行——Chrome 116+ render process 限制：
+      // popup 與 offscreen document 屬不同 render process，popup 直接獲取的 streamId 無法在 offscreen 中使用。
+      // SW 與 offscreen 共享 extension context，由 SW 取得的 streamId 可跨進程傳給 offscreen 消費。
+      const swResult = await chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' }) as
+        { ok: true; streamId: string } | { ok: false; error: string };
+      if (!swResult.ok) throw new Error(swResult.error);
+      const streamId = swResult.streamId;
+
+      // M2-46：streamId 是一次性 TTL token，不落 storage 避免過期後被重複消費。
+      // 直接透過 tabs.sendMessage 交付給 content-script 記憶體（InMemoryTabStreamIdProvider）。
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs[0];
+      if (tab?.id != null) {
+        try {
+          await chrome.tabs.sendMessage(tab.id, {
+            topic: 'asr:stream-id',
+            streamId,
+          });
+        } catch {
+          // content-script 可能尚未就緒（頁面剛加載），sendMessage 失敗不阻斷授權流程；
+          // streamId 會在 content-script 啟動並調用 start() 時透過 storage 的 authorized=true 觸發重試。
+        }
+      }
+
+      // 寫入 tabCaptureAuthorized=true，觸發 content-script 的 storage.onChanged 熱重啟。
+      // 不再持久化 streamId——只寫授權標誌。
+      await chrome.storage.local.set({ tabCaptureAuthorized: true });
       connEl.textContent = 'ASR 授權: 成功';
       connEl.classList.add('ok');
       await updateAsrButton();

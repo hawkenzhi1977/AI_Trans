@@ -481,7 +481,24 @@ export interface AudioSourceProvider {
 
 **插拔說明**：二級 `BufferedAudioSource` 若因 YouTube 改版失效 → 上層策略鏈捕獲異常 → 降級到三級 `TabCaptureAudioSource`。二者輸出同為 `AudioChunk`，下游 ASR 管線完全不變。
 
-> **TabCaptureAudioSource 實裝設計（M2-04）**：`src/adapters/audio/tab-capture-source.ts` 實現 `AudioSourceProvider`（`kind: 'tab-capture'`）。`open()` 通過 content-script → port 向 Offscreen Document 發 `{ type: 'start', tabId }` → Offscreen 調 `chrome.tabCapture.getMediaStream({ tabId, audio: true, video: false })` → 建 `AudioContext` → `MediaStreamAudioSourceNode` → `ScriptProcessorNode`（或 `AudioWorklet`）按 200ms 窗口分塊 → 推送 `AudioChunk`（`seq` 單調遞增、`pcm: Float32Array`、`isSpeech` 由 VAD 標記）。`stop()` 關閉 MediaStream + AudioContext + 向 Offscreen 發 `{ type: 'stop' }`。§5.4：所有訂閱/定時器在 `stop()` 解除；§5.1：`chrome.runtime.connect` 等宿主方法 `.bind(globalThis)`。
+> **TabCaptureAudioSource 實裝設計（M2-04）**：`src/adapters/audio/tab-capture-source.ts` 實現 `AudioSourceProvider`（`kind: 'tab-capture'`）。`open()` 通過 content-script → port 向 Offscreen Document 發 `{ type: 'start', tabId }` → Offscreen 調 `chrome.tabCapture.getMediaStream({ tabId, audio: true, video: false })` → 建 `AudioContext` → `MediaStreamAudioSourceNode` → `ScriptProcessorNode`（或 `AudioWorklet`）按 200ms 窗口分塊 → 推送 `AudioChunk`（`seq` 單調遞增、`pcm: Float32Array`、`isSpeech` 由 VAD 標記）。`stop()` 軟停止（detach ScriptProcessor + close AudioContext + 清 currentPort，保留 `mediaStream` 供複用）；空閒完整釋放才 stop tracks + null mediaStream + 通知 SW 關 offscreen document。§5.4：所有訂閱/定時器在 `stop()` 解除；§5.1：`chrome.runtime.connect` 等宿主方法 `.bind(globalThis)`。
+
+> **tabCapture.getMediaStreamId 必須在 Service Worker 中調用（M2-52）**：Chrome 116+ 將 `chrome.tabCapture.getMediaStreamId()` 返回的 streamId 限定在同一 render process——popup 取得的 streamId 只能在 popup 自身的 render process 中使用，無法跨進程傳遞給 offscreen document（屬不同 render process），導致 offscreen 調用 `getUserMedia(streamId)` 時拋 `AbortError: Error starting tab capture`。Service Worker 與 offscreen document 共享同一 extension context，SW 取得的 streamId 可在 offscreen 中正常使用。**正確架構**：Popup 不直接調用 `getMediaStreamId`，改為 `chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' })` → SW 處理器以 callback 風格調用 `chrome.tabCapture.getMediaStreamId({}, cb)` → 回傳 `{ ok: true, streamId }` → Popup 再透過 `chrome.tabs.sendMessage` 交付至 content-script。SW 處理器同時須對 `chrome.runtime.lastError` 與例外做防禦（§5.6 不靜默）。
+
+> **tabCapture streamId 交付機制（M2-51）**：`streamId` 是 `chrome.tabCapture.capture()` 返回的一次性 TTL 憑證，不得持久化到 `chrome.storage`。正確架構：**Popup 授權後立即透過 `chrome.tabs.sendMessage(tabId, { topic: 'asr:stream-id', streamId })` 投遞至目標 tab 的 content-script 記憶體**（IPC 交付）。Content-script 的 `InMemoryTabStreamIdProvider` 實作 `TabStreamIdProvider` 介面接收並管理 id：
+>
+> ```typescript
+> export interface TabStreamIdProvider {
+>   /** 三態消費：string（有效 id）/ undefined（未授權）/ null（已消費且無 active stream） */
+>   consumeStreamId(): string | undefined | null;
+>   /** offscreen 成功建立 MediaStream 後調用；標記 activeStream=true，清 pendingStreamId */
+>   onStreamEstablished(): void;
+>   /** 空閒完整釋放後調用；清 activeStream */
+>   onStreamReleased(): void;
+> }
+> ```
+>
+> `InMemoryTabStreamIdProvider`（`src/runtime/content-script.ts`）持有 `pendingStreamId`（一次性）與 `activeStream`（複用旗標）雙欄位。`TabCaptureAudioSource.start()` 調用 `consumeStreamId()`：返回 string 時以新 id 建立 capture；返回 null 且 offscreen 有存活 `mediaStream` 時直接複用（`startCapture` 缺 id 路徑）；返回 undefined 時落 `tab-capture-no-stream-id` 診斷並設 `tabCaptureAuthorized=false`（§5.6 留痕，popup 回到「啟用 ASR」狀態）。§5.4：content-script `onMessage 'asr:stream-id'` 監聽器在 `stop/cleanup` 中解除，restart 後不累積。
 
 > **Offscreen Document 通信協議（M2-09）**：content-script ↔ Offscreen 用 `chrome.runtime.connect` port 長連接（避免 SW 掛起問題，M1-48 教訓）。消息類型：`{ type: 'start', tabId }` → Offscreen 啟動 tabCapture；`{ type: 'audio-chunk', chunk: AudioChunk }` ← Offscreen 推送音頻塊；`{ type: 'stop' }` → Offscreen 停止捕獲；`{ type: 'error', message }` ← Offscreen 報告錯誤。Offscreen 生命週期由 content-script 管理（`chrome.offscreen.createDocument` / `chrome.offscreen.deleteDocument`），MV3 同時只允許一個 Offscreen 文檔（§13 開放問題 #2）。
 

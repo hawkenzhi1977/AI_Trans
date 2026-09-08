@@ -20,6 +20,7 @@ import type { TranslationProvider } from '../domain/ports/translation-provider';
 import type { AudioSourceProvider } from '../domain/ports/audio-source';
 import type { ASRProvider } from '../domain/ports/asr-provider';
 import type { ApiKeyStore } from '../domain/ports/config-store';
+import type { TabStreamIdProvider } from '../adapters/audio/tab-capture-source';
 
 export interface BuildRegistryOptions {
   /** 組裝時解析 API 密鑰所需的安全存儲。 */
@@ -28,6 +29,11 @@ export interface BuildRegistryOptions {
   platformWatchRe?: RegExp;
   /** MAIN world 播放器 timedtext 響應捕獲提供者（注入給 FetchCaptionSource 優先複用）。 */
   captionCaptureProvider?: CaptionCaptureProvider;
+  /**
+   * M2-46：in-memory streamId 提供者（content-script 從 popup 消息接收並持有）。
+   * 注入給 TabCaptureAudioSource，避免 TTL token 落 storage 被重複消費。
+   */
+  tabStreamIdProvider?: TabStreamIdProvider;
 }
 
 /**
@@ -56,7 +62,11 @@ export async function buildDefaultRegistry(
 
   // M2-04：註冊音頻源（tabCapture）。
   const audioSources = new Map<string, AudioSourceProvider>();
-  audioSources.set('tab-capture', new TabCaptureAudioSource());
+  const tabCaptureSource = new TabCaptureAudioSource();
+  if (opts.tabStreamIdProvider) {
+    tabCaptureSource.setStreamIdProvider(opts.tabStreamIdProvider);
+  }
+  audioSources.set('tab-capture', tabCaptureSource);
 
   // M2-05/06：註冊 ASR providers（本地 Whisper + 雲端 ASR）。
   const asr = await buildASRProviders(config, opts.apiKeyStore);

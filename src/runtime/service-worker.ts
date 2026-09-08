@@ -192,6 +192,35 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // tabCapture.getMediaStreamId 必須在 SW 中調用，才能讓 offscreen document 消費 streamId。
+  // Chrome 116+ 跨 render process 限制：popup 中獲取的 streamId 僅限同一 render process，
+  // 但 popup 與 offscreen 屬不同進程；SW 與 offscreen 共享 extension context，可跨進程使用。
+  if (msg.topic === 'asr:get-stream-id') {
+    // TS 類型定義為 callback 風格（返回 void），需手動包裝為 Promise。
+    // Chrome 116+ 跨 render process 限制：必須在 SW 中調用才能讓 offscreen 消費 streamId。
+    new Promise<string>((resolve, reject) => {
+      try {
+        chrome.tabCapture.getMediaStreamId({}, (streamId: string) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message ?? 'getMediaStreamId failed'));
+          } else {
+            resolve(streamId);
+          }
+        });
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    })
+      .then((streamId) => sendResponse({ ok: true, streamId }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+      );
+    return true; // 異步響應
+  }
+
   // Content-script 請求確保 Offscreen Document 存在（chrome.offscreen 僅在 SW 可用）。
   if (msg.topic === 'offscreen:ensure-created') {
     void ensureOffscreenDocument()

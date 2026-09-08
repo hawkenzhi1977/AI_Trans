@@ -13,9 +13,51 @@ import { isWatchPage } from './watch-url';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
 import type { EngineConfig } from '../domain/models/config';
+import type { TabStreamIdProvider } from '../adapters/audio/tab-capture-source';
 
 /** 內容腳本側的播放器容器選擇器（YouTube + Mock 站點）。 */
 const PLAYER_SELECTOR = 'div#movie_player, .html5-video-player, #mock-player';
+
+/**
+ * M2-46：in-memory streamId 提供者實現。
+ * popup 透過 tabs.sendMessage 送入 streamId（一次性 TTL token），
+ * content-script 持有並在 TabCaptureAudioSource.start() 時一次性消費，
+ * 後續複用已有 MediaStream 時直接返回 null，完全繞開 TTL 重複消費問題。
+ */
+class InMemoryTabStreamIdProvider implements TabStreamIdProvider {
+  private pendingStreamId: string | null = null;
+  private activeStream = false;
+
+  /** popup 送入新 streamId（覆蓋上一個未消費的 id）。 */
+  provide(streamId: string): void {
+    this.pendingStreamId = streamId;
+  }
+
+  consumeStreamId(): string | null | undefined {
+    if (this.pendingStreamId !== null) {
+      const id = this.pendingStreamId;
+      this.pendingStreamId = null; // 消費後清除——一次性 TTL token
+      return id;
+    }
+    if (this.activeStream) {
+      return null; // 複用已有 MediaStream，不需要 streamId
+    }
+    return undefined; // 未授權且無複用流
+  }
+
+  hasActiveStream(): boolean {
+    return this.activeStream;
+  }
+
+  onStreamEstablished(): void {
+    this.activeStream = true;
+  }
+
+  onStreamReleased(): void {
+    this.activeStream = false;
+    this.pendingStreamId = null;
+  }
+}
 
 /** 從 watch URL 提取視頻 ID（`/watch?v=` 的 v 參數）；非 watch 頁或無參數返回空串。 */
 function extractVideoId(url: string): string {
@@ -69,6 +111,8 @@ class SubtitleController {
   private mountWaitTimer: ReturnType<typeof setTimeout> | null = null;
   // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
   private debugFlagRelayTimer: ReturnType<typeof setInterval> | null = null;
+  // M2-46：in-memory streamId 提供者（防 TTL 重複消費）。
+  private readonly streamIdProvider = new InMemoryTabStreamIdProvider();
   // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
   private tabCaptureAuthorized = false;
   // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
@@ -149,6 +193,58 @@ class SubtitleController {
     };
     chrome.storage.onChanged.addListener(onAsrAuthChanged);
     this.unsubscribeAsrAuth = () => chrome.storage.onChanged.removeListener(onAsrAuthChanged);
+
+    // M2-46：監聽 popup 透過 tabs.sendMessage 送入的 asr:stream-id 消息。
+    // streamId 是一次性 TTL token，popup 授權後立即送入記憶體，不落 storage，
+    // 避免過期後被重複消費（根因修復）。
+    // §5.4：onMessage 監聽器必須在 dispose 時解除。
+    const onMessage = (
+      msg: unknown,
+      _sender: chrome.runtime.MessageSender,
+      sendResponse: (response?: unknown) => void
+    ): boolean | undefined => {
+      if (
+        typeof msg === 'object' &&
+        msg !== null &&
+        (msg as Record<string, unknown>).topic === 'asr:stream-id'
+      ) {
+        const streamId = (msg as Record<string, unknown>).streamId;
+        if (typeof streamId === 'string') {
+          this.streamIdProvider.provide(streamId);
+          diagLog('content', 'asr:stream-id received, streamId stored in memory');
+          // M2-53：streamId 到達即代表 tabCapture 授權成功，立即更新授權狀態並熱重啟。
+          // 場景：popup 重複授權時 storage 的 tabCaptureAuthorized 值不變（仍為 true），
+          // Chrome storage.onChanged 不觸發，舊的 onAsrAuthChanged 路徑靜默跳過，
+          // 導致 restart() 不被調用，streamId 躺在 provider 裡無人消費、deps 無人注入。
+          // 修復：直接在此處驅動授權狀態更新 + restart，確保每次 streamId 到達都能重建管線。
+          if (!this.tabCaptureAuthorized) {
+            this.tabCaptureAuthorized = true;
+          }
+          // §5.5/R6：restart 拋錯必須落診斷，不許未捕獲懸掛 Promise 靜默消失。
+          void this.restart().catch((err) => {
+            recordDiagnostic({
+              type: 'pipeline-error',
+              error: {
+                port: 'platform',
+                code: 'asr-stream-id-restart-failed',
+                recoverable: true,
+                cause: err instanceof Error ? err : new Error(String(err)),
+              },
+            });
+          });
+        }
+        sendResponse({ ok: true });
+        return true;
+      }
+      return undefined;
+    };
+    chrome.runtime.onMessage.addListener(onMessage);
+    // R4：保存解除句柄，dispose 時清理。
+    const prevUnsubscribeAsrAuth = this.unsubscribeAsrAuth;
+    this.unsubscribeAsrAuth = () => {
+      prevUnsubscribeAsrAuth();
+      chrome.runtime.onMessage.removeListener(onMessage);
+    };
   }
 
   /** 加載配置 → 組裝 → 掛載 → 啟動 Orchestrator。 */
@@ -164,8 +260,15 @@ class SubtitleController {
     document.dispatchEvent(new CustomEvent('ai-trans:enable'));
 
     // M2-14：讀取 tabCapture 授權狀態（初始值，後續由 storage.onChanged 監聽更新）。
-    const authState = await chrome.storage.local.get('tabCaptureAuthorized');
-    this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
+    // M2-53 修復：若記憶體值已是 true（由 onMessage asr:stream-id 或 onAsrAuthChanged 在
+    // restart() 的 stop() 之後、start() 之前設定），直接沿用，不讓 storage 異步讀取覆蓋它。
+    // 場景：restart() 觸發方已把 this.tabCaptureAuthorized = true，若此處無條件重讀 storage，
+    // 而 storage 讀取到的值仍是 false（上一輪 tab-capture-source 失敗後寫入的 false），
+    // Orchestrator 就以 enableAsr: false 建立，inject() 不被調用 → dependencies not injected。
+    if (!this.tabCaptureAuthorized) {
+      const authState = await chrome.storage.local.get('tabCaptureAuthorized');
+      this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
+    }
 
     // M1-51：套用調試日誌分類開關（content-script 側），並中繼給 MAIN world 攔截器
     // （interceptor 無法訪問 chrome.storage，靠 CustomEvent 同步旗標）。
@@ -218,6 +321,7 @@ class SubtitleController {
       apiKeyStore: store,
       platformWatchRe,
       captionCaptureProvider: this.bridge,
+      tabStreamIdProvider: this.streamIdProvider,
     });
     // M2-14：enableAsr 由 tabCapture 授權狀態驅動（Popup「啟用 ASR」按鈕觸發授權）。
     this.orchestrator = new Orchestrator(
@@ -478,6 +582,19 @@ class SubtitleController {
       diagLog('content', 'cues updated, count:', this.cues.length, 'calling scheduleDraw');
       this.scheduleDraw();
       return;
+    }
+    // M2-54：tabCapture 未授權時，重置記憶體授權狀態。
+    // 不在 adapter 層寫 chrome.storage（會觸發 onAsrAuthChanged 競態 restart），
+    // 改在此處直接更新記憶體值，讓 popup 下次可重新授權。
+    if (e.type === 'pipeline-error' && e.error.code === 'tab-capture-not-authorized') {
+      if (this.tabCaptureAuthorized) {
+        this.tabCaptureAuthorized = false;
+        diagLog('content', 'tab-capture-not-authorized: reset tabCaptureAuthorized to false in memory');
+        // 同步寫 storage，讓 popup 顯示「啟用 ASR」而非「ASR 已啟用」。
+        // 此時記憶體值已先設為 false，onAsrAuthChanged 收到 newValue=false 時
+        // 因 newValue === this.tabCaptureAuthorized（都是 false）會直接 return，不觸發 restart。
+        void chrome.storage.local.set({ tabCaptureAuthorized: false });
+      }
     }
     // M2-24 補充修復十四：全鏈無策略接管（含 native 捕獲晚到/超時）時，
     // 置位晚捕獲重試等待——pot 捕獲常晚於 15s 窗口到達，需等後續捕獲到達再重試。

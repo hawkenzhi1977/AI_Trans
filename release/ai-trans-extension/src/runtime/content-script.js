@@ -471,14 +471,6 @@
         ctx.diagnostics?.push?.("realtime-asr: ASR disabled (config.asr.type = none)");
         return false;
       }
-      try {
-        const authState = await chrome.storage.local.get("tabCaptureAuthorized");
-        if (!authState.tabCaptureAuthorized) {
-          ctx.diagnostics?.push?.("realtime-asr: tabCapture not authorized");
-          return false;
-        }
-      } catch {
-      }
       if (!this.deps) {
         ctx.diagnostics?.push?.("realtime-asr: dependencies not injected");
         return false;
@@ -2927,6 +2919,11 @@ Example output:
     port = null;
     chunkCallback = null;
     offscreenCreated = false;
+    streamIdProvider = null;
+    /** 注入 in-memory streamId 提供者（由 composition.ts 在組裝時傳入）。 */
+    setStreamIdProvider(provider) {
+      this.streamIdProvider = provider;
+    }
     async open(_platform) {
       return {
         kind: "tab-capture",
@@ -2937,7 +2934,7 @@ Example output:
     onChunk(cb) {
       this.chunkCallback = cb;
     }
-    /** 創建 Offscreen Document 並建立 port 連接。 */
+    /** 創建 Offscreen Document 並建立 port 連接，交付 streamId（或複用已有流）。 */
     async start() {
       if (!this.offscreenCreated) {
         try {
@@ -2960,6 +2957,34 @@ Example output:
           throw err;
         }
       }
+      let streamId;
+      if (this.streamIdProvider) {
+        const consumed = this.streamIdProvider.consumeStreamId();
+        if (consumed === void 0) {
+          const err = new Error("tabCapture not authorized: no streamId and no active stream");
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "audio",
+              code: "tab-capture-not-authorized",
+              recoverable: true,
+              cause: err
+            }
+          });
+          throw err;
+        }
+        streamId = consumed;
+      } else {
+        const authState = await withTimeout(
+          chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]),
+          CHROME_API_TIMEOUT_MS,
+          "chrome.storage.local.get"
+        );
+        if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
+          throw new Error("tabCapture not authorized or streamId missing");
+        }
+        streamId = authState.tabCaptureStreamId;
+      }
       this.port = chrome.runtime.connect({ name: "offscreen-asr" });
       this.port.onMessage.addListener((msg) => {
         this.handleMessage(msg);
@@ -2981,38 +3006,27 @@ Example output:
         }
         this.port = null;
       });
-      const authState = await withTimeout(
-        chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]),
-        CHROME_API_TIMEOUT_MS,
-        "chrome.storage.local.get"
-      );
-      if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
-        throw new Error("tabCapture not authorized or streamId missing");
-      }
       this.port.postMessage({
         type: "startCapture",
-        streamId: authState.tabCaptureStreamId
+        streamId
       });
     }
-    /** 停止音頻捕獲並清理資源。 */
+    /** 軟停止：detach 生產鏈，保留 MediaStream 供複用（不發 offscreen:idle-close）。 */
     async stop() {
       if (this.port) {
         this.port.postMessage({ type: "stopCapture" });
         this.port.disconnect();
         this.port = null;
       }
-      if (this.offscreenCreated) {
-        try {
-          await chrome.runtime.sendMessage({ topic: "offscreen:idle-close" });
-        } catch {
-        }
-        this.offscreenCreated = false;
-      }
       seqCounter = 0;
     }
     /** 處理來自 Offscreen Document 的消息。 */
     handleMessage(msg) {
       switch (msg.type) {
+        case "captureStarted": {
+          this.streamIdProvider?.onStreamEstablished();
+          break;
+        }
         case "audioChunk": {
           if (!this.chunkCallback) return;
           const chunk = {
@@ -3042,7 +3056,6 @@ Example output:
           });
           break;
         }
-        case "captureStarted":
         case "captureStopped":
           break;
       }
@@ -3472,7 +3485,11 @@ Example output:
     const translation = await buildTranslationProviders(config, opts.apiKeyStore);
     ensureLlmCacheInvalidationHook();
     const audioSources = /* @__PURE__ */ new Map();
-    audioSources.set("tab-capture", new TabCaptureAudioSource());
+    const tabCaptureSource = new TabCaptureAudioSource();
+    if (opts.tabStreamIdProvider) {
+      tabCaptureSource.setStreamIdProvider(opts.tabStreamIdProvider);
+    }
+    audioSources.set("tab-capture", tabCaptureSource);
     const asr = await buildASRProviders(config, opts.apiKeyStore);
     return {
       platforms: [youtube],
@@ -3836,6 +3853,35 @@ Example output:
 
   // src/runtime/content-script.ts
   var PLAYER_SELECTOR = "div#movie_player, .html5-video-player, #mock-player";
+  var InMemoryTabStreamIdProvider = class {
+    pendingStreamId = null;
+    activeStream = false;
+    /** popup 送入新 streamId（覆蓋上一個未消費的 id）。 */
+    provide(streamId) {
+      this.pendingStreamId = streamId;
+    }
+    consumeStreamId() {
+      if (this.pendingStreamId !== null) {
+        const id = this.pendingStreamId;
+        this.pendingStreamId = null;
+        return id;
+      }
+      if (this.activeStream) {
+        return null;
+      }
+      return void 0;
+    }
+    hasActiveStream() {
+      return this.activeStream;
+    }
+    onStreamEstablished() {
+      this.activeStream = true;
+    }
+    onStreamReleased() {
+      this.activeStream = false;
+      this.pendingStreamId = null;
+    }
+  };
   function extractVideoId(url) {
     try {
       return new URL(url).searchParams.get("v") ?? "";
@@ -3895,6 +3941,38 @@ Example output:
       };
       chrome.storage.onChanged.addListener(onAsrAuthChanged);
       this.unsubscribeAsrAuth = () => chrome.storage.onChanged.removeListener(onAsrAuthChanged);
+      const onMessage = (msg, _sender, sendResponse) => {
+        if (typeof msg === "object" && msg !== null && msg.topic === "asr:stream-id") {
+          const streamId = msg.streamId;
+          if (typeof streamId === "string") {
+            this.streamIdProvider.provide(streamId);
+            diagLog("content", "asr:stream-id received, streamId stored in memory");
+            if (!this.tabCaptureAuthorized) {
+              this.tabCaptureAuthorized = true;
+            }
+            void this.restart().catch((err) => {
+              recordDiagnostic({
+                type: "pipeline-error",
+                error: {
+                  port: "platform",
+                  code: "asr-stream-id-restart-failed",
+                  recoverable: true,
+                  cause: err instanceof Error ? err : new Error(String(err))
+                }
+              });
+            });
+          }
+          sendResponse({ ok: true });
+          return true;
+        }
+        return void 0;
+      };
+      chrome.runtime.onMessage.addListener(onMessage);
+      const prevUnsubscribeAsrAuth = this.unsubscribeAsrAuth;
+      this.unsubscribeAsrAuth = () => {
+        prevUnsubscribeAsrAuth();
+        chrome.runtime.onMessage.removeListener(onMessage);
+      };
     }
     config;
     renderer = new OverlayRenderer();
@@ -3923,6 +4001,8 @@ Example output:
     mountWaitTimer = null;
     // M1-51：調試旗標中繼重播定時器（跨 world 監聽器晚就位場景），restart/stop 清理（R4）。
     debugFlagRelayTimer = null;
+    // M2-46：in-memory streamId 提供者（防 TTL 重複消費）。
+    streamIdProvider = new InMemoryTabStreamIdProvider();
     // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
     tabCaptureAuthorized = false;
     // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
@@ -3946,8 +4026,10 @@ Example output:
         return;
       }
       document.dispatchEvent(new CustomEvent("ai-trans:enable"));
-      const authState = await chrome.storage.local.get("tabCaptureAuthorized");
-      this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
+      if (!this.tabCaptureAuthorized) {
+        const authState = await chrome.storage.local.get("tabCaptureAuthorized");
+        this.tabCaptureAuthorized = authState.tabCaptureAuthorized === true;
+      }
       this.applyDebugFlags();
       this.bridge.inject();
       this.bridge.start();
@@ -3971,7 +4053,8 @@ Example output:
       const registry = await buildDefaultRegistry(this.config, {
         apiKeyStore: store,
         platformWatchRe,
-        captionCaptureProvider: this.bridge
+        captionCaptureProvider: this.bridge,
+        tabStreamIdProvider: this.streamIdProvider
       });
       this.orchestrator = new Orchestrator(
         { registry, getConfig: () => store.get(), enableAsr: this.tabCaptureAuthorized },
@@ -4188,6 +4271,13 @@ Example output:
         diagLog("content", "cues updated, count:", this.cues.length, "calling scheduleDraw");
         this.scheduleDraw();
         return;
+      }
+      if (e.type === "pipeline-error" && e.error.code === "tab-capture-not-authorized") {
+        if (this.tabCaptureAuthorized) {
+          this.tabCaptureAuthorized = false;
+          diagLog("content", "tab-capture-not-authorized: reset tabCaptureAuthorized to false in memory");
+          void chrome.storage.local.set({ tabCaptureAuthorized: false });
+        }
       }
       if (e.type === "pipeline-error" && e.error.code === "no-caption-strategy") {
         const videoId = extractVideoId(this.currentUrl());

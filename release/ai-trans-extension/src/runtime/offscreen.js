@@ -48797,9 +48797,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     return false;
   });
   var mediaStream = null;
+  var mediaStreamSource = null;
   var audioContext = null;
   var scriptProcessor = null;
   var currentPort = null;
+  var passthroughContext = null;
+  var passthroughSource = null;
   var IDLE_TIMEOUT_MS = 10 * 60 * 1e3;
   var IDLE_RETRY_MS = 3e4;
   var busyCount = 0;
@@ -48853,21 +48856,39 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     onTimeout: onIdleTimeout
   });
   async function startCapture(streamId, port) {
-    await stopCapture();
     try {
-      const constraints = {
-        audio: {
-          mandatory: {
-            chromeMediaSource: "tab",
-            chromeMediaSourceId: streamId
-          }
-        },
-        video: false
-      };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      mediaStream = stream;
+      if (!mediaStream) {
+        if (!streamId) {
+          const err = new Error("tabCapture: no mediaStream and no streamId provided");
+          port.postMessage({ type: "error", message: err.message });
+          recordDiagnostic({
+            type: "pipeline-error",
+            error: { port: "audio", code: "tab-capture-no-stream-id", recoverable: true, cause: err }
+          });
+          return;
+        }
+        const constraints = {
+          audio: {
+            mandatory: {
+              chromeMediaSource: "tab",
+              chromeMediaSourceId: streamId
+            }
+          },
+          video: false
+        };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        mediaStream = stream;
+        console.warn("[AI_Trans] offscreen: new MediaStream acquired via getUserMedia");
+      } else {
+        console.warn("[AI_Trans] offscreen: reusing existing MediaStream (skipping getUserMedia)");
+      }
+      await detachAudioProcessing();
+      passthroughContext = new AudioContext();
+      passthroughSource = passthroughContext.createMediaStreamSource(mediaStream);
+      passthroughSource.connect(passthroughContext.destination);
       audioContext = new AudioContext({ sampleRate: 16e3 });
       const source = audioContext.createMediaStreamSource(mediaStream);
+      mediaStreamSource = source;
       scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
       scriptProcessor.onaudioprocess = (event) => {
         const portRef = currentPort;
@@ -48900,26 +48921,51 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           cause: err instanceof Error ? err : new Error(String(err))
         }
       });
-      await stopCapture();
+      await detachAudioProcessing();
+      if (mediaStream) {
+        for (const track of mediaStream.getTracks()) track.stop();
+        mediaStream = null;
+      }
     }
   }
-  async function stopCapture() {
-    const portRef = currentPort;
+  async function detachAudioProcessing() {
     if (scriptProcessor) {
       scriptProcessor.disconnect();
       scriptProcessor = null;
     }
+    if (mediaStreamSource) {
+      mediaStreamSource.disconnect();
+      mediaStreamSource = null;
+    }
     if (audioContext) {
-      await audioContext.close();
+      try {
+        await audioContext.close();
+      } catch {
+      }
       audioContext = null;
     }
+    if (passthroughSource) {
+      passthroughSource.disconnect();
+      passthroughSource = null;
+    }
+    if (passthroughContext) {
+      try {
+        await passthroughContext.close();
+      } catch {
+      }
+      passthroughContext = null;
+    }
+    currentPort = null;
+  }
+  async function stopCapture() {
+    const portRef = currentPort;
+    await detachAudioProcessing();
     if (mediaStream) {
       for (const track of mediaStream.getTracks()) {
         track.stop();
       }
       mediaStream = null;
     }
-    currentPort = null;
     if (portRef) {
       portRef.postMessage({ type: "captureStopped" });
     }
@@ -48930,16 +48976,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       markActivity();
       switch (msg.type) {
         case "startCapture":
-          await startCapture(msg.streamId, port);
+          await startCapture(msg.streamId ?? null, port);
           break;
         case "stopCapture":
-          await stopCapture();
+          await detachAudioProcessing();
           port.postMessage({ type: "captureStopped" });
           break;
       }
     });
     port.onDisconnect.addListener(() => {
-      void stopCapture();
+      void detachAudioProcessing();
     });
   });
   chrome.runtime.onMessage.addListener((message, _sender) => {

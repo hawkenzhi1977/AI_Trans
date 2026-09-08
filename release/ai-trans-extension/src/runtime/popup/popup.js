@@ -487,11 +487,21 @@ ${line}` : line;
       connEl.textContent = "ASR \u6388\u6B0A: \u8ACB\u6C42\u4E2D\u2026";
       connEl.classList.remove("warn", "ok");
       try {
-        const streamId = await chrome.tabCapture.getMediaStreamId({});
-        await chrome.storage.local.set({
-          tabCaptureAuthorized: true,
-          tabCaptureStreamId: streamId
-        });
+        const swResult = await chrome.runtime.sendMessage({ topic: "asr:get-stream-id" });
+        if (!swResult.ok) throw new Error(swResult.error);
+        const streamId = swResult.streamId;
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tab = tabs[0];
+        if (tab?.id != null) {
+          try {
+            await chrome.tabs.sendMessage(tab.id, {
+              topic: "asr:stream-id",
+              streamId
+            });
+          } catch {
+          }
+        }
+        await chrome.storage.local.set({ tabCaptureAuthorized: true });
         connEl.textContent = "ASR \u6388\u6B0A: \u6210\u529F";
         connEl.classList.add("ok");
         await updateAsrButton();

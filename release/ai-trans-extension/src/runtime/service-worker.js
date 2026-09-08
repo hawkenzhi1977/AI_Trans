@@ -267,6 +267,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     );
     return true;
   }
+  if (msg.topic === "asr:get-stream-id") {
+    new Promise((resolve, reject) => {
+      try {
+        chrome.tabCapture.getMediaStreamId({}, (streamId) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message ?? "getMediaStreamId failed"));
+          } else {
+            resolve(streamId);
+          }
+        });
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }).then((streamId) => sendResponse({ ok: true, streamId })).catch(
+      (err) => sendResponse({
+        ok: false,
+        error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`
+      })
+    );
+    return true;
+  }
   if (msg.topic === "offscreen:ensure-created") {
     void ensureOffscreenDocument().then(() => sendResponse({ ok: true })).catch(
       (err) => sendResponse({

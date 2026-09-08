@@ -123,3 +123,48 @@ describe('RealtimeASRStrategy — §5.4 資源清理', () => {
     // 不應拋錯到 unhandled rejection
   });
 });
+
+// M2-53：回歸測試——deps 未注入時 isApplicable 回傳 false 並記錄診斷。
+describe('RealtimeASRStrategy — M2-53 deps 未注入回歸', () => {
+  it('未調用 inject() 時 isApplicable 回傳 false 且診斷含 dependencies not injected', async () => {
+    const strategy = new RealtimeASRStrategy();
+    const diag: string[] = [];
+    const ctx: StrategyContext = {
+      platform: {} as never,
+      playback: () => ({ currentTime: 0, playing: true, rate: 1, duration: 100, buffered: [] }),
+      config: {
+        asr: { type: 'local-whisper', modelTier: 'base' },
+        targetLang: 'zh-Hant',
+      } as EngineConfig,
+      asr: {} as never,
+      translation: {} as never,
+      diagnostics: diag,
+    };
+    const result = await strategy.isApplicable(ctx);
+    expect(result).toBe(false);
+    expect(diag.some((d) => d.includes('dependencies not injected'))).toBe(true);
+  });
+
+  it('inject() 後 isApplicable 回傳 true（asr.type 非 none）', async () => {
+    const strategy = new RealtimeASRStrategy();
+    strategy.inject({
+      audioSource: { kind: 'tab-capture', open: vi.fn(), onChunk: vi.fn() } as never,
+      asrProvider: { engineId: 'test', location: 'local', warmup: vi.fn(), transcribe: vi.fn() } as never,
+      translationProvider: { engineId: 'test', location: 'cloud', translate: vi.fn() } as never,
+    });
+    const diag: string[] = [];
+    const ctx: StrategyContext = {
+      platform: {} as never,
+      playback: () => ({ currentTime: 0, playing: true, rate: 1, duration: 100, buffered: [] }),
+      config: {
+        asr: { type: 'local-whisper', modelTier: 'base' },
+        targetLang: 'zh-Hant',
+      } as EngineConfig,
+      asr: {} as never,
+      translation: {} as never,
+      diagnostics: diag,
+    };
+    const result = await strategy.isApplicable(ctx);
+    expect(result).toBe(true);
+  });
+});

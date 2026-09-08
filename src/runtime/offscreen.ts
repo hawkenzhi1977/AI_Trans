@@ -12,7 +12,7 @@ const s2tConverter = OpenCC.Converter({ from: 'cn', to: 't' });
 
 /** Offscreen Document 接收的消息類型（ASR + 本地 ONNX 翻譯）。 */
 type OffscreenRequest =
-  | { type: 'startCapture'; streamId: string }
+  | { type: 'startCapture'; streamId: string | null }
   | { type: 'stopCapture' }
   | { type: 'local-onnx:check-status' }
   | { type: 'local-onnx:warmup' }
@@ -127,9 +127,15 @@ chrome.runtime.onMessage.addListener((message: unknown): boolean => {
 });
 
 let mediaStream: MediaStream | null = null;
+let mediaStreamSource: MediaStreamAudioSourceNode | null = null;
 let audioContext: AudioContext | null = null;
 let scriptProcessor: ScriptProcessorNode | null = null;
 let currentPort: chrome.runtime.Port | null = null;
+// M2-53：tabCapture 聲音回播——Chrome 以非原生採樣率打開 AudioContext 時
+// 不會自動將捕獲流回播到揚聲器，需要獨立的原生採樣率 passthrough context 負責回播，
+// 16kHz 的 audioContext 只負責 ASR PCM 提取。
+let passthroughContext: AudioContext | null = null;
+let passthroughSource: MediaStreamAudioSourceNode | null = null;
 
 // ============================================================
 // 空閒生命週期（M2-25）：offscreen 與 popup 共享 extension 進程，
@@ -218,27 +224,61 @@ const idleTimeout = new IdleTimeout({
   onTimeout: onIdleTimeout,
 });
 
-/** 啟動 tabCapture 音頻捕獲。 */
-async function startCapture(streamId: string, port: chrome.runtime.Port): Promise<void> {
-  // §5.4：啟動前先清理舊 capture（ASR → ASR 視頻切換時可能有多個 MediaStream 同時活躍）。
-  await stopCapture();
+/**
+ * 啟動 tabCapture 音頻捕獲。
+ *
+ * 複用策略（M2-46 根因修復）：
+ * - 已有 mediaStream 時：直接 re-attach AudioContext + ScriptProcessor，不重新 getUserMedia。
+ *   streamId 是一次性 TTL token，複用已有流可完全繞開 TTL 問題。
+ * - 無 mediaStream 且有 streamId：走 getUserMedia 建立新流。
+ * - 無 mediaStream 且無 streamId（缺授權）：拋錯讓調用方處理。
+ */
+async function startCapture(streamId: string | null, port: chrome.runtime.Port): Promise<void> {
   try {
-    // 使用 getMediaStreamId 獲取的 streamId 請求媒體流。
-    const constraints = {
-      audio: {
-        mandatory: {
-          chromeMediaSource: 'tab',
-          chromeMediaSourceId: streamId,
+    if (!mediaStream) {
+      // 尚無流——需要新 streamId 才能 getUserMedia。
+      if (!streamId) {
+        const err = new Error('tabCapture: no mediaStream and no streamId provided');
+        port.postMessage({ type: 'error', message: err.message } satisfies OffscreenResponse);
+        recordDiagnostic({
+          type: 'pipeline-error',
+          error: { port: 'audio', code: 'tab-capture-no-stream-id', recoverable: true, cause: err },
+        });
+        return;
+      }
+      const constraints = {
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: streamId,
+          },
         },
-      },
-      video: false,
-    };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints as MediaStreamConstraints);
-    mediaStream = stream;
+        video: false,
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints as MediaStreamConstraints);
+      mediaStream = stream;
+      console.warn('[AI_Trans] offscreen: new MediaStream acquired via getUserMedia');
+    } else {
+      console.warn('[AI_Trans] offscreen: reusing existing MediaStream (skipping getUserMedia)');
+    }
 
-    // 建立 AudioContext 解碼音頻流。
+    // 軟停止：先 detach 舊的 AudioContext/ScriptProcessor，保留 mediaStream。
+    await detachAudioProcessing();
+
+    // M2-53：建立 passthrough AudioContext（原生採樣率）讓捕獲的音頻回播到揚聲器。
+    // 原因：getUserMedia tabCapture 建立後 tab 的音頻輸出會被路由到 MediaStream，
+    // 若 ASR 的 AudioContext 採樣率（16kHz）與 tab 原生採樣率（44100/48000Hz）不一致，
+    // Chrome 不會自動回播到揚聲器，用戶聽不到聲音。
+    // 解決：用不指定採樣率的 passthrough AudioContext（讓瀏覽器選原生採樣率），
+    // 把 mediaStream 連進去再接回 destination，還原揚聲器輸出。
+    passthroughContext = new AudioContext();
+    passthroughSource = passthroughContext.createMediaStreamSource(mediaStream);
+    passthroughSource.connect(passthroughContext.destination);
+
+    // 建立新 AudioContext 解碼音頻流。
     audioContext = new AudioContext({ sampleRate: 16000 }); // Whisper 輸入 16kHz
     const source = audioContext.createMediaStreamSource(mediaStream);
+    mediaStreamSource = source;
 
     // ScriptProcessorNode 提取 PCM 數據（16kHz mono）。
     // bufferSize 4096 ≈ 256ms @ 16kHz，平衡延遲與 CPU。
@@ -279,29 +319,59 @@ async function startCapture(streamId: string, port: chrome.runtime.Port): Promis
         cause: err instanceof Error ? err : new Error(String(err)),
       },
     });
-    await stopCapture();
+    // 建流失敗時才完整清理（避免把複用流也殺掉）。
+    await detachAudioProcessing();
+    if (mediaStream) {
+      for (const track of mediaStream.getTracks()) track.stop();
+      mediaStream = null;
+    }
   }
 }
 
-/** 停止音頻捕獲並清理資源。 */
-async function stopCapture(): Promise<void> {
-  // §5.4：所有資源必須在 stop 時清理（音頻軌、AudioContext、ScriptProcessor）。
-  const portRef = currentPort;
+/**
+ * 軟停止：detach ScriptProcessor + close AudioContext，保留 mediaStream。
+ * 讓空閒計時恢復（onaudioprocess 不再呼叫 markActivity），但不殺流，
+ * 下次 startCapture 可複用已有 MediaStream，完全繞開 streamId TTL。
+ */
+async function detachAudioProcessing(): Promise<void> {
   if (scriptProcessor) {
     scriptProcessor.disconnect();
     scriptProcessor = null;
   }
+  if (mediaStreamSource) {
+    mediaStreamSource.disconnect();
+    mediaStreamSource = null;
+  }
   if (audioContext) {
-    await audioContext.close();
+    try { await audioContext.close(); } catch { /* 已關閉時忽略 */ }
     audioContext = null;
   }
+  // M2-53：同步清理 passthrough context（§5.4：每次 detach 都必須清理）。
+  if (passthroughSource) {
+    passthroughSource.disconnect();
+    passthroughSource = null;
+  }
+  if (passthroughContext) {
+    try { await passthroughContext.close(); } catch { /* 已關閉時忽略 */ }
+    passthroughContext = null;
+  }
+  currentPort = null;
+}
+
+/**
+ * 完整釋放：停止 MediaStream 所有軌道並銷毀所有音頻資源。
+ * 僅在空閒超時或擴充停用時調用（而非每次視頻切換）。
+ */
+async function stopCapture(): Promise<void> {
+  // §5.4：所有資源必須在 stop 時清理（音頻軌、AudioContext、ScriptProcessor）。
+  const portRef = currentPort;
+  await detachAudioProcessing();
   if (mediaStream) {
     for (const track of mediaStream.getTracks()) {
       track.stop();
     }
     mediaStream = null;
   }
-  currentPort = null;
   if (portRef) {
     portRef.postMessage({ type: 'captureStopped' } satisfies OffscreenResponse);
   }
@@ -316,18 +386,20 @@ chrome.runtime.onConnect.addListener((port) => {
     markActivity();
     switch (msg.type) {
       case 'startCapture':
-        await startCapture(msg.streamId, port);
+        // streamId 可為 null（複用已有流時由 content-script 傳 null）。
+        await startCapture(msg.streamId ?? null, port);
         break;
       case 'stopCapture':
-        await stopCapture();
+        // 軟停止：detach 生產鏈，保留 MediaStream 供下次複用。
+        await detachAudioProcessing();
         port.postMessage({ type: 'captureStopped' } satisfies OffscreenResponse);
         break;
     }
   });
 
   port.onDisconnect.addListener(() => {
-    // port 斷開時清理音頻資源（§5.4）。
-    void stopCapture();
+    // port 斷開：只做軟停止（保留 mediaStream，空閒超時後才完整釋放）。
+    void detachAudioProcessing();
   });
 });
 
