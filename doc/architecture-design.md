@@ -498,9 +498,22 @@ export interface AudioSourceProvider {
 > }
 > ```
 >
-> `InMemoryTabStreamIdProvider`（`src/runtime/content-script.ts`）持有 `pendingStreamId`（一次性）與 `activeStream`（複用旗標）雙欄位。`TabCaptureAudioSource.start()` 調用 `consumeStreamId()`：返回 string 時以新 id 建立 capture；返回 null 且 offscreen 有存活 `mediaStream` 時直接複用（`startCapture` 缺 id 路徑）；返回 undefined 時落 `tab-capture-no-stream-id` 診斷並設 `tabCaptureAuthorized=false`（§5.6 留痕，popup 回到「啟用 ASR」狀態）。§5.4：content-script `onMessage 'asr:stream-id'` 監聽器在 `stop/cleanup` 中解除，restart 後不累積。
+ > `InMemoryTabStreamIdProvider`（`src/runtime/content-script.ts`）持有 `pendingStreamId`（一次性）與 `activeStream`（複用旗標）雙欄位。`TabCaptureAudioSource.start()` 調用 `consumeStreamId()`：返回 string 時以新 id 建立 capture；返回 null 且 offscreen 有存活 `mediaStream` 時直接複用（`startCapture` 缺 id 路徑）；返回 undefined 時落 `tab-capture-no-stream-id` 診斷並設 `tabCaptureAuthorized=false`（§5.6 留痕，popup 回到「啟用 ASR」狀態）。§5.4：content-script `onMessage 'asr:stream-id'` 監聽器在 `stop/cleanup` 中解除，restart 後不累積。
 
-> **Offscreen Document 通信協議（M2-09）**：content-script ↔ Offscreen 用 `chrome.runtime.connect` port 長連接（避免 SW 掛起問題，M1-48 教訓）。消息類型：`{ type: 'start', tabId }` → Offscreen 啟動 tabCapture；`{ type: 'audio-chunk', chunk: AudioChunk }` ← Offscreen 推送音頻塊；`{ type: 'stop' }` → Offscreen 停止捕獲；`{ type: 'error', message }` ← Offscreen 報告錯誤。Offscreen 生命週期由 content-script 管理（`chrome.offscreen.createDocument` / `chrome.offscreen.deleteDocument`），MV3 同時只允許一個 Offscreen 文檔（§13 開放問題 #2）。
+> **tabCapture streamId 自動重取與重新授權（M2-55）**：`streamId` 為一次性 TTL token，頁面重載/SPA 導航/擴充重新加載後過期；此時若 offscreen `mediaStream` 仍存活可複用（繞開 TTL），但 tab 重載會使捕獲軌 `ended`（offscreen `track.onended` → `handleStreamEnded()` 丟棄死串流），複用與消費皆不可行。**新增端口**：
+>
+> ```typescript
+> // src/adapters/audio/tab-capture-source.ts
+> export interface StreamIdAcquirer {
+>   /** 向 SW 請求新 streamId（asr:get-stream-id）；無法取得時返回 null */
+>   acquire(targetTabId?: number): Promise<string | null>;
+> }
+> ```
+>
+> `TabCaptureAudioSource` 新增 `setStreamIdAcquirer()`；`start()` 改為**手勢握手先行**：先 `await offscreen:ensure-created` + port 連接（握手失敗落診斷並直接返回，不拋錯——讓策略層下輪重試），再樂觀探測 `startCapture(null)`。offscreen 回傳結構化錯誤碼 `need-stream-id`（無活串流且無 id）或捕獲中回傳 `stream-ended`（tab 重載）時，調用 acquirer 自動重取：成功 → `provider.provide(newId)` + 二次 `startCapture(newId)`；失敗（acquirer 未注入或返回 null）→ 落 `tab-capture-reauth-needed` 診斷並拋錯。**Chrome 安全約束**：`getMediaStreamId` 必須在用戶手勢事件上下文內調用，content-script 自動重取無手勢 → SW 返回失敗——因此每次會話需用戶在 popup 點一次「重新授權 ASR」（點後 offscreen 持有活 MediaStream，同會話內 reload/SPA 切換可複用）。`content-script.ts` 實作 `ServiceWorkerStreamIdAcquirer`（sendMessage `asr:get-stream-id`，帶 `targetTabId`），經 `composition.ts` `BuildRegistryOptions.tabStreamIdAcquirer` 注入。§5.4：`connectPort()` 以命名回調註冊 `onMessage`/`onDisconnect`，斷開時雙解除（冪等，不累積）；§5.6：所有 `recordDiagnostic` 調用點 `void ...catch(() => {})`（同步回調上下文不接住會成 unhandled rejection）。
+
+
+> **Offscreen Document 通信協議（M2-09）**：content-script ↔ Offscreen 用 `chrome.runtime.connect` port 長連接（避免 SW 掛起問題，M1-48 教訓）。消息類型：`{ type: 'start', tabId }` → Offscreen 啟動 tabCapture；`{ type: 'audio-chunk', chunk: AudioChunk }` ← Offscreen 推送音頻塊；`{ type: 'stop' }` → Offscreen 停止捕獲；`{ type: 'error', message, code? }` ← Offscreen 報告錯誤（M2-55 起 `code` 結構化：`need-stream-id` = 無活串流且無 streamId，需重取；`stream-ended` = 捕獲軌因 tab 重載/導航 ended）。Offscreen 生命週期由 content-script 管理（`chrome.offscreen.createDocument` / `chrome.offscreen.deleteDocument`），MV3 同時只允許一個 Offscreen 文檔（§13 開放問題 #2）。
 
 > **VAD 能量閾值（M2-07）**：`src/infrastructure/vad.ts` 實裝 `EnergyVAD` 類——計算 `AudioChunk.pcm` 的 RMS 能量，低於閾值（`EngineConfig.asr.vadThreshold`，默認 0.01）標記 `isSpeech = false`（靜音，跳過 ASR 節省算力）。靜音連續超過 2s 觸發分段邊界（切分 AudioChunk 送 ASR）。
 

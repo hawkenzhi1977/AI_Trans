@@ -421,6 +421,9 @@
       "504",
       // 權限類
       "tab-capture-not-authorized",
+      "tab-capture-reauth-needed",
+      "re-authorization",
+      "\u91CD\u65B0\u6388\u6B0A",
       "not authorized",
       "permission",
       "access denied",
@@ -497,6 +500,27 @@
           });
         }
       }, 1e4);
+      diagLog("strategy", "realtime-asr: warming up ASR model...");
+      try {
+        await asrProvider.warmup(ctx.config.asr);
+      } catch (err) {
+        recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "asr",
+            code: "asr-warmup-failed",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
+        emit({
+          type: "engine-degraded",
+          port: "asr",
+          reason: `ASR warmup failed: ${err instanceof Error ? err.message : String(err)}`
+        });
+        throw err;
+      }
+      diagLog("strategy", "realtime-asr: ASR warmup complete, opening audio source...");
       diagLog("strategy", "realtime-asr: opening audio source...");
       this.audioHandle = await audioSource.open(ctx.platform);
       diagLog("strategy", "realtime-asr: audio source opened, starting...");
@@ -504,6 +528,7 @@
       diagLog("strategy", "realtime-asr: audio source started successfully");
       audioSource.onChunk(async (chunk) => {
         if (!this.running) return;
+        if (asrProvider.isReady && !asrProvider.isReady()) return;
         this.vad.markChunk(chunk);
         if (!chunk.isSpeech) return;
         try {
@@ -728,13 +753,6 @@
             asrProvider,
             translationProvider: translationPipeline,
             vadThreshold: config.asr.vadThreshold
-          });
-          void asrProvider.warmup(config.asr).catch((err) => {
-            this.onEvent({
-              type: "engine-degraded",
-              port: "asr",
-              reason: `ASR warmup failed: ${err instanceof Error ? err.message : String(err)}`
-            });
           });
         }
       }
@@ -2889,6 +2907,7 @@ Example output:
 
   // src/adapters/audio/tab-capture-source.ts
   var CHROME_API_TIMEOUT_MS = 5e3;
+  var CAPTURE_HANDSHAKE_TIMEOUT_MS = 1e4;
   var seqCounter = 0;
   function withTimeout(promise, timeoutMs, message) {
     return new Promise((resolve, reject) => {
@@ -2920,9 +2939,17 @@ Example output:
     chunkCallback = null;
     offscreenCreated = false;
     streamIdProvider = null;
+    // M2-55：fresh streamId 自動重取器（content-script 注入，向 SW 請求）。
+    streamIdAcquirer = null;
+    // M2-55：待決的捕獲握手 resolver（start() 等待 captureStarted/error；handleMessage 解決它）。
+    pendingStart = null;
     /** 注入 in-memory streamId 提供者（由 composition.ts 在組裝時傳入）。 */
     setStreamIdProvider(provider) {
       this.streamIdProvider = provider;
+    }
+    /** M2-55：注入 fresh streamId 自動重取器（由 composition.ts 在組裝時傳入）。 */
+    setStreamIdAcquirer(acquirer) {
+      this.streamIdAcquirer = acquirer;
     }
     async open(_platform) {
       return {
@@ -2934,7 +2961,10 @@ Example output:
     onChunk(cb) {
       this.chunkCallback = cb;
     }
-    /** 創建 Offscreen Document 並建立 port 連接，交付 streamId（或複用已有流）。 */
+    /**
+     * 創建 Offscreen Document、建立 port 連接並交付 streamId（或複用/自動重取）。
+     * M2-55：改為 await offscreen 握手響應，讓策略鏈能感知捕獲是否真正建立。
+     */
     async start() {
       if (!this.offscreenCreated) {
         try {
@@ -2944,71 +2974,155 @@ Example output:
             "offscreen:ensure-created"
           );
           this.offscreenCreated = true;
-        } catch (err) {
-          recordDiagnostic({
+        } catch (err2) {
+          void recordDiagnostic({
             type: "pipeline-error",
             error: {
               port: "audio",
               code: "offscreen-create-failed",
               recoverable: true,
-              cause: err instanceof Error ? err : new Error(String(err))
+              cause: err2 instanceof Error ? err2 : new Error(String(err2))
             }
           });
-          throw err;
+          throw err2;
         }
       }
-      let streamId;
-      if (this.streamIdProvider) {
-        const consumed = this.streamIdProvider.consumeStreamId();
-        if (consumed === void 0) {
-          const err = new Error("tabCapture not authorized: no streamId and no active stream");
-          recordDiagnostic({
+      this.connectPort();
+      const initialId = await this.resolveInitialStreamId();
+      let result = await this.sendStartCaptureAndWait(initialId);
+      if (result.kind === "need-auth" && this.streamIdAcquirer) {
+        let freshId = null;
+        try {
+          freshId = await withTimeout(
+            this.streamIdAcquirer.acquire(),
+            CHROME_API_TIMEOUT_MS,
+            "streamId acquire"
+          );
+        } catch (err2) {
+          void recordDiagnostic({
             type: "pipeline-error",
             error: {
               port: "audio",
-              code: "tab-capture-not-authorized",
+              code: "tab-capture-reauth-needed",
               recoverable: true,
-              cause: err
+              cause: err2 instanceof Error ? err2 : new Error(String(err2))
             }
           });
-          throw err;
         }
-        streamId = consumed;
-      } else {
-        const authState = await withTimeout(
-          chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]),
-          CHROME_API_TIMEOUT_MS,
-          "chrome.storage.local.get"
-        );
-        if (!authState.tabCaptureAuthorized || !authState.tabCaptureStreamId) {
-          throw new Error("tabCapture not authorized or streamId missing");
+        if (freshId) {
+          result = await this.sendStartCaptureAndWait(freshId);
         }
-        streamId = authState.tabCaptureStreamId;
       }
-      this.port = chrome.runtime.connect({ name: "offscreen-asr" });
-      this.port.onMessage.addListener((msg) => {
-        this.handleMessage(msg);
-      });
-      this.port.onDisconnect.addListener(() => {
-        if (this.port) {
-          const lastError = chrome.runtime.lastError;
-          if (lastError) {
-            recordDiagnostic({
-              type: "pipeline-error",
-              error: {
-                port: "audio",
-                code: "offscreen-communication-failed",
-                recoverable: true,
-                cause: new Error(lastError.message)
-              }
-            });
+      if (result.kind === "started") {
+        return;
+      }
+      if (result.kind === "need-auth") {
+        const err2 = new Error(
+          "tabCapture re-authorization needed: no active stream and streamId acquisition unavailable or failed"
+        );
+        void recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "audio",
+            code: "tab-capture-reauth-needed",
+            recoverable: true,
+            cause: err2
           }
+        });
+        throw err2;
+      }
+      const err = new Error(result.message);
+      void recordDiagnostic({
+        type: "pipeline-error",
+        error: {
+          port: "audio",
+          code: "tab-capture-failed",
+          recoverable: true,
+          cause: err
+        }
+      });
+      throw err;
+    }
+    /**
+     * M2-55：解析初始 streamId。
+     * - provider 路徑：consumeStreamId() 返回 string/null 直接用；undefined → null（樂觀探測）。
+     * - 無 provider（舊路徑兼容）：從 storage 讀取；無則 null（探測 offscreen 是否仍有活串流）。
+     */
+    async resolveInitialStreamId() {
+      if (this.streamIdProvider) {
+        const consumed = this.streamIdProvider.consumeStreamId();
+        return consumed === void 0 ? null : consumed;
+      }
+      const authState = await withTimeout(
+        chrome.storage.local.get(["tabCaptureAuthorized", "tabCaptureStreamId"]),
+        CHROME_API_TIMEOUT_MS,
+        "chrome.storage.local.get"
+      );
+      if (authState.tabCaptureAuthorized && authState.tabCaptureStreamId) {
+        return authState.tabCaptureStreamId;
+      }
+      return null;
+    }
+    /** 建立 port 長連接並註冊監聽（§5.4：onDisconnect 解除監聽 + 落診斷 + 解決待決握手避免懸掛）。 */
+    connectPort() {
+      this.port = chrome.runtime.connect({ name: "offscreen-asr" });
+      const onMessage = (msg) => {
+        this.handleMessage(msg);
+      };
+      const onDisconnect = () => {
+        if (this.port) {
+          this.port.onMessage.removeListener(onMessage);
+          this.port.onDisconnect.removeListener(onDisconnect);
+        }
+        const lastError = chrome.runtime.lastError;
+        if (lastError) {
+          void recordDiagnostic({
+            type: "pipeline-error",
+            error: {
+              port: "audio",
+              code: "offscreen-communication-failed",
+              recoverable: true,
+              cause: new Error(lastError.message)
+            }
+          }).catch(() => {
+          });
         }
         this.port = null;
-      });
-      this.port.postMessage({
-        type: "startCapture",
-        streamId
+        if (this.pendingStart) {
+          this.pendingStart({
+            kind: "error",
+            message: "offscreen port disconnected before capture handshake completed"
+          });
+        }
+      };
+      this.port.onMessage.addListener(onMessage);
+      this.port.onDisconnect.addListener(onDisconnect);
+    }
+    /**
+     * M2-55：發送 startCapture 並等待 offscreen 握手響應。
+     * 解析為 HandshakeResult（started / need-auth / error），帶超時保護避免永久懸掛。
+     */
+    sendStartCaptureAndWait(streamId) {
+      return new Promise((resolve) => {
+        if (!this.port) {
+          resolve({ kind: "error", message: "offscreen port not connected" });
+          return;
+        }
+        const timer = setTimeout(() => {
+          if (this.pendingStart) {
+            this.pendingStart = null;
+            resolve({
+              kind: "error",
+              message: `offscreen capture handshake timeout after ${CAPTURE_HANDSHAKE_TIMEOUT_MS}ms`
+            });
+          }
+        }, CAPTURE_HANDSHAKE_TIMEOUT_MS);
+        this.pendingStart = (r) => {
+          clearTimeout(timer);
+          this.pendingStart = null;
+          resolve(r);
+        };
+        this.port.postMessage({ type: "startCapture", streamId });
       });
     }
     /** 軟停止：detach 生產鏈，保留 MediaStream 供複用（不發 offscreen:idle-close）。 */
@@ -3018,6 +3132,9 @@ Example output:
         this.port.disconnect();
         this.port = null;
       }
+      if (this.pendingStart) {
+        this.pendingStart({ kind: "error", message: "capture stopped before handshake completed" });
+      }
       seqCounter = 0;
     }
     /** 處理來自 Offscreen Document 的消息。 */
@@ -3025,6 +3142,9 @@ Example output:
       switch (msg.type) {
         case "captureStarted": {
           this.streamIdProvider?.onStreamEstablished();
+          if (this.pendingStart) {
+            this.pendingStart({ kind: "started" });
+          }
           break;
         }
         case "audioChunk": {
@@ -3045,19 +3165,72 @@ Example output:
           break;
         }
         case "error": {
-          recordDiagnostic({
-            type: "pipeline-error",
-            error: {
-              port: "audio",
-              code: "tab-capture-failed",
-              recoverable: true,
-              cause: new Error(msg.message)
-            }
-          });
+          if (this.pendingStart) {
+            this.pendingStart(
+              msg.code === "need-stream-id" ? { kind: "need-auth" } : { kind: "error", message: msg.message }
+            );
+          } else {
+            this.handleMidCaptureError(msg);
+          }
           break;
         }
         case "captureStopped":
           break;
+      }
+    }
+    /**
+     * M2-55：處理捕獲中途（無待決握手）的錯誤。
+     * stream-ended（tab 重載/串流失效）：清除複用旗標並 best-effort 自動重取恢復（單次，不循環）。
+     * 其餘：僅落診斷（§5.6 不靜默）。
+     * 全程 try/catch：handleMessage 由 port listener 同步調用，任何異常不得逃逸成
+     * unhandled rejection（§5.6 頂層兜底紅線）。
+     */
+    handleMidCaptureError(msg) {
+      try {
+        const code = msg.code === "stream-ended" ? "tab-capture-stream-ended" : "tab-capture-failed";
+        void recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "audio",
+            code,
+            recoverable: true,
+            cause: new Error(msg.message)
+          }
+        });
+      } catch {
+      }
+      if (msg.code === "stream-ended" && this.streamIdAcquirer) {
+        this.streamIdProvider?.onStreamReleased();
+        void this.tryReacquireAfterStreamEnded().catch(() => {
+        });
+      }
+    }
+    /**
+     * M2-55：stream-ended 後 best-effort 自動重取（單次）。
+     * 成功則重送 startCapture(freshId)，後續 captureStarted 由 handleMessage 處理；
+     * 失敗則落 reauth 診斷（下次 restart 或用戶點擊 popup 再試）。
+     */
+    async tryReacquireAfterStreamEnded() {
+      if (!this.streamIdAcquirer || !this.port) return;
+      try {
+        const freshId = await withTimeout(
+          this.streamIdAcquirer.acquire(),
+          CHROME_API_TIMEOUT_MS,
+          "streamId acquire"
+        );
+        if (freshId && this.port) {
+          this.port.postMessage({ type: "startCapture", streamId: freshId });
+        }
+      } catch (err) {
+        void recordDiagnostic({
+          type: "pipeline-error",
+          error: {
+            port: "audio",
+            code: "tab-capture-reauth-needed",
+            recoverable: true,
+            cause: err instanceof Error ? err : new Error(String(err))
+          }
+        });
       }
     }
   };
@@ -3422,53 +3595,66 @@ Example output:
     }
     /**
      * 流式推理——M2-37：轉發推理請求給 Offscreen Document。
-     * 當前實現：將音頻塊分為 3 段，每段推理後 emit provisional，最後一段 emit final。
+     * M2-56 根因修復：此前將 chunk 切 3 段各 ~85ms 分別推理，Whisper 對如此短的碎片
+     * 產出垃圾/空文本。改為整塊 PCM 一次推理（Whisper 返回帶時間戳的 chunks），
+     * 結果作為 final emit。
      */
     async transcribeStream(req, emit) {
       if (!this.warmedUp) {
         throw new Error("LocalWhisperASR not warmed up. Call warmup() first.");
       }
-      const { chunk } = req;
-      const segmentDuration = chunk.pcm.length / 3;
+      const { chunk, hintLang } = req;
       const sampleRate = chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1e3)) : 16e3;
-      for (let i = 0; i < 3; i++) {
-        const start2 = Math.floor(i * segmentDuration);
-        const end = Math.floor((i + 1) * segmentDuration);
-        const segmentPcm = chunk.pcm.slice(start2, end);
-        const isLast = i === 2;
-        const startTime = performance.now();
-        const response = await chrome.runtime.sendMessage({
-          topic: "asr-whisper:transcribe",
-          payload: {
-            pcm: segmentPcm,
-            sampleRate
-          }
-        });
-        const raw = response;
-        const transcribeResult = "result" in raw && raw.result ? raw.result : raw;
-        if (!transcribeResult?.ok) {
-          throw new Error(transcribeResult?.error ?? "transcribe failed");
+      const startTime = performance.now();
+      const response = await chrome.runtime.sendMessage({
+        topic: "asr-whisper:transcribe",
+        payload: {
+          pcm: chunk.pcm,
+          sampleRate,
+          hintLang
         }
-        const durationMs = performance.now() - startTime;
-        const audioDurationMs = segmentPcm.length / sampleRate * 1e3;
-        const rtf = transcribeResult.rtf ?? durationMs / audioDurationMs;
-        const segment = {
+      });
+      const raw = response;
+      const transcribeResult = "result" in raw && raw.result ? raw.result : raw;
+      if (!transcribeResult?.ok) {
+        throw new Error(transcribeResult?.error ?? "transcribe failed");
+      }
+      const durationMs = performance.now() - startTime;
+      const audioDurationMs = chunk.duration;
+      const rtf = transcribeResult.rtf ?? durationMs / audioDurationMs;
+      const segments = transcribeResult.chunks?.map(
+        (c, i) => ({
           id: `${chunk.seq}-${i}`,
-          sourceText: transcribeResult.text?.trim() ?? "",
+          sourceText: c.text.trim(),
           translatedText: void 0,
-          provisional: !isLast,
-          start: start2 / sampleRate * 1e3,
-          end: end / sampleRate * 1e3,
+          provisional: false,
+          start: (c.timestamp?.[0] ?? 0) * 1e3,
+          end: (c.timestamp?.[1] ?? chunk.duration / 1e3) * 1e3,
           origin: "realtime-asr",
           revision: 0
-        };
-        emit({
-          seq: chunk.seq,
-          segments: [segment],
-          isPartial: !isLast,
-          rtf
-        });
-      }
+        })
+      ) ?? [
+        {
+          id: `${chunk.seq}-0`,
+          sourceText: transcribeResult.text?.trim() ?? "",
+          translatedText: void 0,
+          provisional: false,
+          start: 0,
+          end: chunk.duration,
+          origin: "realtime-asr",
+          revision: 0
+        }
+      ];
+      emit({
+        seq: chunk.seq,
+        segments,
+        isPartial: false,
+        rtf
+      });
+    }
+    /** M2-56：供策略查詢模型是否已載入（避免 chunk 到達時 model 未就緒）。 */
+    isReady() {
+      return this.warmedUp;
     }
   };
 
@@ -3488,6 +3674,9 @@ Example output:
     const tabCaptureSource = new TabCaptureAudioSource();
     if (opts.tabStreamIdProvider) {
       tabCaptureSource.setStreamIdProvider(opts.tabStreamIdProvider);
+    }
+    if (opts.tabStreamIdAcquirer) {
+      tabCaptureSource.setStreamIdAcquirer(opts.tabStreamIdAcquirer);
     }
     audioSources.set("tab-capture", tabCaptureSource);
     const asr = await buildASRProviders(config, opts.apiKeyStore);
@@ -3882,6 +4071,30 @@ Example output:
       this.pendingStreamId = null;
     }
   };
+  var ServiceWorkerStreamIdAcquirer = class {
+    async acquire() {
+      try {
+        const res = await chrome.runtime.sendMessage({ topic: "asr:get-stream-id" });
+        if (res && res.ok && typeof res.streamId === "string" && res.streamId.length > 0) {
+          diagLog("content", "StreamIdAcquirer: acquired fresh streamId from SW");
+          return res.streamId;
+        }
+        diagLog(
+          "content",
+          "StreamIdAcquirer: SW returned no streamId:",
+          res && !res.ok ? res.error : "empty/undefined response"
+        );
+        return null;
+      } catch (err) {
+        diagLog(
+          "content",
+          "StreamIdAcquirer: acquire failed:",
+          err instanceof Error ? err.message : String(err)
+        );
+        return null;
+      }
+    }
+  };
   function extractVideoId(url) {
     try {
       return new URL(url).searchParams.get("v") ?? "";
@@ -4003,6 +4216,8 @@ Example output:
     debugFlagRelayTimer = null;
     // M2-46：in-memory streamId 提供者（防 TTL 重複消費）。
     streamIdProvider = new InMemoryTabStreamIdProvider();
+    // M2-55：fresh streamId 獲取器（SW 向 chrome.tabCapture 申請 streamId）。
+    streamIdAcquirer = new ServiceWorkerStreamIdAcquirer();
     // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
     tabCaptureAuthorized = false;
     // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
@@ -4054,7 +4269,8 @@ Example output:
         apiKeyStore: store,
         platformWatchRe,
         captionCaptureProvider: this.bridge,
-        tabStreamIdProvider: this.streamIdProvider
+        tabStreamIdProvider: this.streamIdProvider,
+        tabStreamIdAcquirer: this.streamIdAcquirer
       });
       this.orchestrator = new Orchestrator(
         { registry, getConfig: () => store.get(), enableAsr: this.tabCaptureAuthorized },
@@ -4278,6 +4494,9 @@ Example output:
           diagLog("content", "tab-capture-not-authorized: reset tabCaptureAuthorized to false in memory");
           void chrome.storage.local.set({ tabCaptureAuthorized: false });
         }
+      }
+      if (e.type === "pipeline-error" && e.error.code === "tab-capture-reauth-needed") {
+        diagLog("content", "tab-capture-reauth-needed: user must click popup re-auth button");
       }
       if (e.type === "pipeline-error" && e.error.code === "no-caption-strategy") {
         const videoId = extractVideoId(this.currentUrl());

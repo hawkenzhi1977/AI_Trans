@@ -123,7 +123,9 @@ export class Orchestrator {
       ? (this.deps.registry.asr.values().next().value ?? NoopASR.instance)
       : NoopASR.instance;
 
-    // M2 修復：注入 RealtimeASRStrategy 依賴並預熱 ASR。
+    // M2 修復：注入 RealtimeASRStrategy 依賴。
+    // M2-56：warmup 由策略 run() 內部 await（不再 fire-and-forget），
+    // 確保音頻塊不會在模型載入期間到達導致 transcribeStream 拋錯。
     const realtimeStrategy = this.deps.registry.strategies.find(
       (s): s is RealtimeASRStrategy => s instanceof RealtimeASRStrategy
     );
@@ -135,14 +137,6 @@ export class Orchestrator {
           asrProvider,
           translationProvider: translationPipeline,
           vadThreshold: config.asr.vadThreshold,
-        });
-        // 預熱 ASR 模型（消除首次推理抖動）。
-        void asrProvider.warmup(config.asr).catch((err) => {
-          this.onEvent({
-            type: 'engine-degraded',
-            port: 'asr',
-            reason: `ASR warmup failed: ${err instanceof Error ? err.message : String(err)}`,
-          });
         });
       }
     }

@@ -866,6 +866,17 @@ DiagnosticRecord 結構:
 - **開發者響應**: 確認 `chrome.tabCapture.getMediaStreamId` 在 Service Worker 用戶手勢（click）事件處理器中調用（M2-52）；檢查 manifest `tabCapture` 權限；確認 `onEvent tab-capture-not-authorized` 分支記憶體先行重置邏輯（content-script.ts:586-598）
 - **代碼落點**: src/adapters/audio/tab-capture-source.ts（`start()` consumeStreamId 未授權分支，僅落診斷）；src/runtime/content-script.ts（`onEvent` :586-598，記憶體先行重置 + storage 寫入）
 
+### 11.1a tabCapture 需重新授權（M2-55）
+
+- **診斷碼**: tab-capture-reauth-needed
+- **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture re-authorization needed: no active stream and streamId acquisition unavailable or failed (<timestamp>)
+- **觸發條件**: `start()` 手勢握手完成後，樂觀探測 `startCapture(null)`（複用 offscreen 已有 MediaStream）失敗且 offscreen 回傳結構化錯誤碼 `need-stream-id`，同時 `StreamIdAcquirer` 未注入或重取返回 null（Chrome 限制：`getMediaStreamId` 必須在用戶手勢事件上下文內調用，content-script 自動重取無手勢 → SW `asr:get-stream-id` 返回失敗）。亦在捕獲中途收到 `stream-ended`（tab 重載/導航致軌 ended）且重取失敗時觸發
+- **根因**: streamId 是一次性 TTL token，頁面重載/SPA 導航/擴充重新加載後過期；offscreen MediaStream 因 tab 重載而 ended 被丟棄（M2-55 #5）；此後無有效 streamId 且自動重取受 Chrome 手勢限制無法成功
+- **與 tab-capture-not-authorized 的區別**: not-authorized = 從未授權或 streamId 三態為 undefined（冷啟動未提供）；reauth-needed = 已授權但 streamId 過期且無活串流可複用（熱路徑失效），需用戶在 popup 再點一次「重新授權 ASR」
+- **用戶響應**: 點擊 Popup「重新授權 ASR」按鈕（每次頁面會話一次；點後 offscreen 持有活 MediaStream，同會話內 reload/SPA 切換可複用不再需要點）
+- **開發者響應**: 確認 popup 以用戶手勢調用 SW `asr:get-stream-id`（M2-52）；確認 offscreen MediaStream 是否因 tab 重載 ended（查 `tab-capture-stream-ended` 診斷）；確認 `ServiceWorkerStreamIdAcquirer` 注入（composition.ts `tabStreamIdAcquirer`）
+- **代碼落點**: src/adapters/audio/tab-capture-source.ts（`start()` 握手探測 + `handleMidCaptureError` need-stream-id/stream-ended 分支，acquirer 重取失敗落診斷+拋錯）；src/runtime/content-script.ts（`ServiceWorkerStreamIdAcquirer` + `onEvent` reauth 分支）；src/runtime/offscreen.ts（`startCapture` need-stream-id 結構化錯誤 + `track.onended` → `handleStreamEnded`）
+
 ### 11.2 tabCapture 捕獲失敗
 
 - **診斷碼**: tab-capture-failed
@@ -876,6 +887,26 @@ DiagnosticRecord 結構:
 - **開發者響應**: 檢查 Offscreen Document 是否成功創建（`chrome.offscreen.createDocument`）；確認 port 連接狀態
 - **代碼落點**: src/runtime/offscreen.ts（tabCapture 錯誤處理）；src/adapters/audio/tab-capture-source.ts（port 錯誤事件）
 
+### 11.2a Offscreen 無 streamId 且無活串流（M2-55）
+
+- **診斷碼**: tab-capture-no-stream-id
+- **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture: no mediaStream and no streamId provided (<timestamp>)
+- **觸發條件**: offscreen `startCapture(null)` 探測時 `mediaStream === null`（無可複用流）且未提供 streamId
+- **根因**: content-script 手勢握手失敗（offscreen 未 createDocument / port 未通）後仍樂觀探測；tab 重載致舊 MediaStream track ended 被丟棄
+- **處理**: offscreen 回傳結構化錯誤碼 `code: 'need-stream-id'`（非一般 error），adapter 據此觸發 `StreamIdAcquirer` 自動重取；重取成功則二次 `startCapture(streamId)`，失敗則升級為 tab-capture-reauth-needed（§11.1a）
+- **開發者響應**: 檢查 offscreen createDocument 時序與 port 握手；查 `tab-capture-stream-ended`（§11.2b）判斷是否 tab 重載所致
+- **代碼落點**: src/runtime/offscreen.ts（`startCapture` 無流無 id 分支）
+
+### 11.2b tabCapture 串流軌結束（M2-55）
+
+- **診斷碼**: tab-capture-stream-ended
+- **用戶可見消息**: 最近失敗: 錯誤: Error: tabCapture MediaStream track ended unexpectedly (tab reloaded/navigated) (<timestamp>)
+- **觸發條件**: offscreen 持有 MediaStream 的任一 AudioTrack `onended`（tab 重載/導航）
+- **根因**: tabCapture 捕獲軌綁定 tab 渲染進程；頁面導航後 Chrome 終止該軌
+- **處理**: `handleStreamEnded()` detach AudioContext + stop tracks + 置空 `mediaStream`（死串流不可複用），並向 content-script postMessage `{ type: 'error', code: 'stream-ended' }`；adapter 捕獲中收到後觸發 acquirer 重取，成功則二次 `startCapture(streamId)`，失敗升級為 tab-capture-reauth-needed（§11.1a）
+- **用戶響應**: 同 §11.1a（popup「重新授權 ASR」）
+- **代碼落點**: src/runtime/offscreen.ts（`track.onended` → `handleStreamEnded()`）；src/adapters/audio/tab-capture-source.ts（`handleMidCaptureError` stream-ended 分支）
+
 ### 11.3 Offscreen Document 通信失敗
 
 - **診斷碼**: offscreen-communication-failed
@@ -884,7 +915,8 @@ DiagnosticRecord 結構:
 - **根因**: Offscreen Document 崩潰；port 被 SW 回收；MV3 同時只允許一個 Offscreen（重複創建衝突）
 - **用戶響應**: 刷新頁面重試
 - **開發者響應**: 檢查 Offscreen Document 生命週期管理（`createDocument` / `deleteDocument`）；確認 port 在 `stop()` 正確斷開
-- **代碼落點**: src/adapters/audio/tab-capture-source.ts（port `onDisconnect` 處理）
+- **M2-55 補充**: 握手探測失敗（createDocument 未成 / port 未通）時 `start()` 落診斷後**直接返回不拋錯**——讓策略層 isApplicable 下一輪重試，避免與「無串流」路徑競態；port 中途斷開（`lastError` 非空）則落診斷並 reject start()/捕獲流程
+- **代碼落點**: src/adapters/audio/tab-capture-source.ts（port `onDisconnect` 處理 + `connectPort()` 命名回調雙解除）
 
 ### 11.3a 音頻 handle 關閉失敗（M2-19）
 
@@ -905,6 +937,16 @@ DiagnosticRecord 結構:
 - **用戶響應**: 切換 ASR 引擎（本地 ↔ 雲端）；檢查雲端 API Key；降低模型檔位（small → base → tiny）
 - **開發者響應**: 檢查 `ASRProvider` 實現；確認 `warmup()` 是否成功；查看 `engine-degraded` 事件詳情
 - **代碼落點**: src/application/asr-pipeline.ts（catch 分支發 `engine-degraded`）
+
+### 11.4a ASR Warmup 失敗（M2-56）
+
+- **診斷碼**: asr-warmup-failed
+- **用戶可見消息**: 最近失敗: 降級: ASR warmup failed: <錯誤> (<timestamp>)
+- **觸發條件**: `RealtimeASRStrategy.run()` 中 `await asrProvider.warmup(ctx.config.asr)` 拋錯
+- **根因**: Whisper 模型未下載 / 網絡錯誤 / offscreen 通信失敗
+- **用戶響應**: 從 Options 頁面下載 ASR 模型；檢查網絡連接
+- **開發者響應**: 查看 catch 中 `recordDiagnostic` 的 cause 鏈；確認 offscreen document 是否存活
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（run() warmup try/catch）
 
 ### 11.5 ASR 性能降檔
 

@@ -13,7 +13,7 @@ import { isWatchPage } from './watch-url';
 import type { RenderableCue } from '../domain/ports/subtitle-renderer';
 import type { PipelineEvent } from '../domain/models/events';
 import type { EngineConfig } from '../domain/models/config';
-import type { TabStreamIdProvider } from '../adapters/audio/tab-capture-source';
+import type { TabStreamIdProvider, StreamIdAcquirer } from '../adapters/audio/tab-capture-source';
 
 /** 內容腳本側的播放器容器選擇器（YouTube + Mock 站點）。 */
 const PLAYER_SELECTOR = 'div#movie_player, .html5-video-player, #mock-player';
@@ -56,6 +56,43 @@ class InMemoryTabStreamIdProvider implements TabStreamIdProvider {
   onStreamReleased(): void {
     this.activeStream = false;
     this.pendingStreamId = null;
+  }
+}
+
+/**
+ * M2-55：StreamIdAcquirer 實現——向 SW 請求 fresh streamId。
+ * SW 用 sender.tab.id（content-script 所在 tab）作 targetTabId 調用 getMediaStreamId。
+ * 用途：tab 重載/SPA 換視頻後 content-script 記憶體 streamId 已重置、offscreen 也無活串流時，
+ * TabCaptureAudioSource 透過此 acquirer 自動重取，無需用戶重新點擊 popup（best-effort：
+ * 若 Chrome activeTab grant 已失效則返回 null，由 adapter 落 reauth 診斷引導用戶點擊）。
+ */
+class ServiceWorkerStreamIdAcquirer implements StreamIdAcquirer {
+  async acquire(): Promise<string | null> {
+    try {
+      const res = (await chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' })) as
+        | { ok: true; streamId: string }
+        | { ok: false; error: string }
+        | undefined;
+      if (res && res.ok && typeof res.streamId === 'string' && res.streamId.length > 0) {
+        diagLog('content', 'StreamIdAcquirer: acquired fresh streamId from SW');
+        return res.streamId;
+      }
+      // §5.6：SW 返回失敗/空——留痕（adapter 據 null 落 reauth 診斷）。
+      diagLog(
+        'content',
+        'StreamIdAcquirer: SW returned no streamId:',
+        res && !res.ok ? res.error : 'empty/undefined response'
+      );
+      return null;
+    } catch (err) {
+      // §5.6：sendMessage 拋錯（SW 不可用等）——留痕後返回 null。
+      diagLog(
+        'content',
+        'StreamIdAcquirer: acquire failed:',
+        err instanceof Error ? err.message : String(err)
+      );
+      return null;
+    }
   }
 }
 
@@ -113,6 +150,8 @@ class SubtitleController {
   private debugFlagRelayTimer: ReturnType<typeof setInterval> | null = null;
   // M2-46：in-memory streamId 提供者（防 TTL 重複消費）。
   private readonly streamIdProvider = new InMemoryTabStreamIdProvider();
+  // M2-55：fresh streamId 獲取器（SW 向 chrome.tabCapture 申請 streamId）。
+  private readonly streamIdAcquirer = new ServiceWorkerStreamIdAcquirer();
   // M2-14：tabCapture 授權狀態（content-script 啟動時讀取，授權變更時熱重啟）。
   private tabCaptureAuthorized = false;
   // SPA 換視頻監聽（M1-45）：YouTube 換視頻走 pushState，content-script 不會重載；
@@ -322,6 +361,7 @@ class SubtitleController {
       platformWatchRe,
       captionCaptureProvider: this.bridge,
       tabStreamIdProvider: this.streamIdProvider,
+      tabStreamIdAcquirer: this.streamIdAcquirer,
     });
     // M2-14：enableAsr 由 tabCapture 授權狀態驅動（Popup「啟用 ASR」按鈕觸發授權）。
     this.orchestrator = new Orchestrator(
@@ -590,11 +630,14 @@ class SubtitleController {
       if (this.tabCaptureAuthorized) {
         this.tabCaptureAuthorized = false;
         diagLog('content', 'tab-capture-not-authorized: reset tabCaptureAuthorized to false in memory');
-        // 同步寫 storage，讓 popup 顯示「啟用 ASR」而非「ASR 已啟用」。
-        // 此時記憶體值已先設為 false，onAsrAuthChanged 收到 newValue=false 時
-        // 因 newValue === this.tabCaptureAuthorized（都是 false）會直接 return，不觸發 restart。
         void chrome.storage.local.set({ tabCaptureAuthorized: false });
       }
+    }
+    // M2-55：tab 重載後 offscreen 無活串流、in-memory streamId 已重置，且 SW auto-reacquire
+    // 也失敗（activeTab grant 未生效）時，adapter 發此事件引導用戶點擊 popup「重新授權 ASR」。
+    // 不寫 storage（tabCaptureAuthorized 仍為 true——用戶之前已授權，只是本次 session 需重新觸發）。
+    if (e.type === 'pipeline-error' && e.error.code === 'tab-capture-reauth-needed') {
+      diagLog('content', 'tab-capture-reauth-needed: user must click popup re-auth button');
     }
     // M2-24 補充修復十四：全鏈無策略接管（含 native 捕獲晚到/超時）時，
     // 置位晚捕獲重試等待——pot 捕獲常晚於 15s 窗口到達，需等後續捕獲到達再重試。

@@ -16,4 +16,6 @@ export interface ASRProvider {
     req: ASRRequest,
     emit: (r: ASRResult) => void
   ): Promise<void>;
+  /** M2-56：可選——查詢模型是否已就緒（warmup 完成）。策略可用於判斷是否延遲處理 chunk。 */
+  isReady?(): boolean;
 }

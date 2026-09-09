@@ -159,7 +159,7 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const msg = message as { topic?: string; payload?: unknown };
 
   // 配置相關消息處理。
@@ -196,11 +196,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // Chrome 116+ 跨 render process 限制：popup 中獲取的 streamId 僅限同一 render process，
   // 但 popup 與 offscreen 屬不同進程；SW 與 offscreen 共享 extension context，可跨進程使用。
   if (msg.topic === 'asr:get-stream-id') {
+    // M2-55（#3）：必須帶 targetTabId，否則空 constraints 在 SW 中無「invoked tab」上下文，
+    // 可能抓錯 tab 或失敗。來源優先級：
+    // - content-script 自動重取：sender.tab.id（content-script 所在 tab，最準確）。
+    // - popup 點擊授權：payload.targetTabId（popup 非 tab，sender.tab 為 undefined，由 popup 傳入）。
+    const payload = (msg.payload ?? {}) as { targetTabId?: number };
+    const targetTabId = sender.tab?.id ?? payload.targetTabId;
+    const constraints: chrome.tabCapture.GetMediaStreamOptions =
+      targetTabId != null ? { targetTabId } : {};
     // TS 類型定義為 callback 風格（返回 void），需手動包裝為 Promise。
     // Chrome 116+ 跨 render process 限制：必須在 SW 中調用才能讓 offscreen 消費 streamId。
     new Promise<string>((resolve, reject) => {
       try {
-        chrome.tabCapture.getMediaStreamId({}, (streamId: string) => {
+        chrome.tabCapture.getMediaStreamId(constraints, (streamId: string) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message ?? 'getMediaStreamId failed'));
           } else {

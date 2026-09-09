@@ -89,6 +89,32 @@ export class RealtimeASRStrategy implements CaptionStrategy {
       }
     }, 10000);
 
+    // M2-56：先 await ASR warmup 完成，再啟動音頻捕獲。
+    // 根因修復：此前 warmup 由 orchestrator fire-and-forget，音頻塊在模型載入期間
+    // 到達時 transcribeStream 因 !warmedUp 拋錯 → 所有 chunk 被靜默丟棄 → 字幕不出現。
+    diagLog('strategy', 'realtime-asr: warming up ASR model...');
+    try {
+      await asrProvider.warmup(ctx.config.asr);
+    } catch (err) {
+      // §5.6：warmup 失敗必須落診斷 + emit degraded（不靜默）。
+      recordDiagnostic({
+        type: 'pipeline-error',
+        error: {
+          port: 'asr',
+          code: 'asr-warmup-failed',
+          recoverable: true,
+          cause: err instanceof Error ? err : new Error(String(err)),
+        },
+      });
+      emit({
+        type: 'engine-degraded',
+        port: 'asr',
+        reason: `ASR warmup failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      throw err; // 讓策略鏈降級到下一策略（或終止）。
+    }
+    diagLog('strategy', 'realtime-asr: ASR warmup complete, opening audio source...');
+
     // 啟動音頻源（保存 handle 供 stop() 關閉，§5.4 洩漏零容忍）。
     // M2-44：增加診斷日誌，方便排查掛起或拋錯。
     diagLog('strategy', 'realtime-asr: opening audio source...');
@@ -100,6 +126,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     // 監聽音頻塊。
     audioSource.onChunk(async (chunk: AudioChunk) => {
       if (!this.running) return;
+
+      // M2-56：若 provider 有 isReady() 且未就緒，跳過（防 warmup 邊界競態）。
+      if (asrProvider.isReady && !asrProvider.isReady()) return;
 
       // VAD 過濾靜音。
       this.vad!.markChunk(chunk);

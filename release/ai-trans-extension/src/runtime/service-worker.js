@@ -113,6 +113,9 @@ function isUserActionable(message) {
     "504",
     // 權限類
     "tab-capture-not-authorized",
+    "tab-capture-reauth-needed",
+    "re-authorization",
+    "\u91CD\u65B0\u6388\u6B0A",
     "not authorized",
     "permission",
     "access denied",
@@ -246,7 +249,7 @@ chrome.runtime.onConnect.addListener((port) => {
     });
   }
 });
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const msg = message;
   if (msg.topic === "config:get") {
     void store.get().then((config) => sendResponse({ ok: true, config })).catch(
@@ -268,9 +271,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (msg.topic === "asr:get-stream-id") {
+    const payload = msg.payload ?? {};
+    const targetTabId = sender.tab?.id ?? payload.targetTabId;
+    const constraints = targetTabId != null ? { targetTabId } : {};
     new Promise((resolve, reject) => {
       try {
-        chrome.tabCapture.getMediaStreamId({}, (streamId) => {
+        chrome.tabCapture.getMediaStreamId(constraints, (streamId) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message ?? "getMediaStreamId failed"));
           } else {

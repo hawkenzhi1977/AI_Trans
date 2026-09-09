@@ -20,7 +20,7 @@ import type { TranslationProvider } from '../domain/ports/translation-provider';
 import type { AudioSourceProvider } from '../domain/ports/audio-source';
 import type { ASRProvider } from '../domain/ports/asr-provider';
 import type { ApiKeyStore } from '../domain/ports/config-store';
-import type { TabStreamIdProvider } from '../adapters/audio/tab-capture-source';
+import type { TabStreamIdProvider, StreamIdAcquirer } from '../adapters/audio/tab-capture-source';
 
 export interface BuildRegistryOptions {
   /** 組裝時解析 API 密鑰所需的安全存儲。 */
@@ -34,6 +34,11 @@ export interface BuildRegistryOptions {
    * 注入給 TabCaptureAudioSource，避免 TTL token 落 storage 被重複消費。
    */
   tabStreamIdProvider?: TabStreamIdProvider;
+  /**
+   * M2-55：fresh streamId 獲取器（SW 向 chrome.tabCapture 申請 streamId）。
+   * 注入給 TabCaptureAudioSource，在 tab 重載後自動重取，無需用戶重新點擊 popup。
+   */
+  tabStreamIdAcquirer?: StreamIdAcquirer;
 }
 
 /**
@@ -65,6 +70,9 @@ export async function buildDefaultRegistry(
   const tabCaptureSource = new TabCaptureAudioSource();
   if (opts.tabStreamIdProvider) {
     tabCaptureSource.setStreamIdProvider(opts.tabStreamIdProvider);
+  }
+  if (opts.tabStreamIdAcquirer) {
+    tabCaptureSource.setStreamIdAcquirer(opts.tabStreamIdAcquirer);
   }
   audioSources.set('tab-capture', tabCaptureSource);
 

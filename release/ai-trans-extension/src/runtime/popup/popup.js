@@ -115,6 +115,9 @@
       "504",
       // 權限類
       "tab-capture-not-authorized",
+      "tab-capture-reauth-needed",
+      "re-authorization",
+      "\u91CD\u65B0\u6388\u6B0A",
       "not authorized",
       "permission",
       "access denied",
@@ -409,15 +412,9 @@ ${line}` : line;
   async function updateAsrButton() {
     const btn = $("btn-asr");
     const authorized = await chrome.storage.local.get("tabCaptureAuthorized");
-    if (authorized.tabCaptureAuthorized) {
-      btn.textContent = "ASR \u5DF2\u555F\u7528";
-      btn.disabled = true;
-      btn.style.opacity = "0.6";
-    } else {
-      btn.textContent = "\u555F\u7528 ASR";
-      btn.disabled = false;
-      btn.style.opacity = "1";
-    }
+    btn.textContent = authorized.tabCaptureAuthorized ? "\u91CD\u65B0\u6388\u6B0A ASR" : "\u555F\u7528 ASR";
+    btn.disabled = false;
+    btn.style.opacity = "1";
   }
   function bindActions(config) {
     const toggle = $("enable-toggle");
@@ -487,19 +484,26 @@ ${line}` : line;
       connEl.textContent = "ASR \u6388\u6B0A: \u8ACB\u6C42\u4E2D\u2026";
       connEl.classList.remove("warn", "ok");
       try {
-        const swResult = await chrome.runtime.sendMessage({ topic: "asr:get-stream-id" });
-        if (!swResult.ok) throw new Error(swResult.error);
-        const streamId = swResult.streamId;
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         const tab = tabs[0];
-        if (tab?.id != null) {
-          try {
-            await chrome.tabs.sendMessage(tab.id, {
-              topic: "asr:stream-id",
-              streamId
-            });
-          } catch {
-          }
+        if (tab?.id == null) {
+          connEl.textContent = "ASR \u6388\u6B0A: \u5931\u6557 \u2014 \u672A\u627E\u5230\u6D3B\u52D5\u6A19\u7C64\u9801";
+          connEl.classList.add("warn");
+          return;
+        }
+        const targetTabId = tab.id;
+        const swResult = await chrome.runtime.sendMessage({
+          topic: "asr:get-stream-id",
+          payload: { targetTabId }
+        });
+        if (!swResult.ok) throw new Error(swResult.error);
+        const streamId = swResult.streamId;
+        try {
+          await chrome.tabs.sendMessage(targetTabId, {
+            topic: "asr:stream-id",
+            streamId
+          });
+        } catch {
         }
         await chrome.storage.local.set({ tabCaptureAuthorized: true });
         connEl.textContent = "ASR \u6388\u6B0A: \u6210\u529F";

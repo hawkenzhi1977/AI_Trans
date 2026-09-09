@@ -144,36 +144,89 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     await expect(asr.transcribe(req)).rejects.toThrow('transcribe failed');
   });
 
-  it('transcribeStream 分段轉發推理請求', async () => {
+  it('transcribeStream M2-56：整塊 PCM 一次推理，結果為 final', async () => {
     // 先 warmup
     mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
     const asr = new LocalWhisperASR({ modelTier: 'base' });
     await asr.warmup(mockConfig);
 
-    // 模擬 3 段推理結果
-    mockSendMessage
-      .mockResolvedValueOnce({ ok: true, result: { ok: true, text: 'part1', rtf: 0.3 } })
-      .mockResolvedValueOnce({ ok: true, result: { ok: true, text: 'part2', rtf: 0.3 } })
-      .mockResolvedValueOnce({ ok: true, result: { ok: true, text: 'part3', rtf: 0.3 } });
+    // 模擬整塊推理結果（帶 chunks 時間戳）
+    mockSendMessage.mockResolvedValueOnce({
+      ok: true,
+      result: {
+        ok: true,
+        text: 'full sentence',
+        rtf: 0.25,
+        chunks: [
+          { text: 'full sentence', timestamp: [0.1, 2.5] },
+        ],
+      },
+    });
 
     const chunk = makeChunk(1);
     const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: true };
-    const emitted: Array<{ text: string; provisional: boolean }> = [];
+    const emitted: Array<{ segments: number; partial: boolean }> = [];
 
     await asr.transcribeStream(req, (r) => {
-      emitted.push({ text: r.segments[0].sourceText, provisional: r.isPartial });
+      emitted.push({ segments: r.segments.length, partial: r.isPartial });
     });
 
-    // 應該發送 3 次推理請求
+    // 應該只發送 1 次推理請求（整塊）
     const transcribeCalls = mockSendMessage.mock.calls.filter(
       (call) => call[0]?.topic === 'asr-whisper:transcribe'
     );
-    expect(transcribeCalls).toHaveLength(3);
+    expect(transcribeCalls).toHaveLength(1);
 
-    // 前 2 段是 provisional，最後一段是 final
-    expect(emitted).toHaveLength(3);
-    expect(emitted[0].provisional).toBe(true);
-    expect(emitted[1].provisional).toBe(true);
-    expect(emitted[2].provisional).toBe(false);
+    // 結果為 final（非 partial），含 1 段
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].partial).toBe(false);
+    expect(emitted[0].segments).toBe(1);
+  });
+
+  it('transcribeStream M2-56：無 chunks 時回退為單段 final', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // 無 chunks 字段，僅有 text
+    mockSendMessage.mockResolvedValueOnce({
+      ok: true,
+      result: { ok: true, text: 'fallback text', rtf: 0.3 },
+    });
+
+    const chunk = makeChunk(2);
+    const req: ASRRequest = { chunk, hintLang: undefined, allowPartial: true };
+    const emitted: Array<{ text: string; partial: boolean }> = [];
+
+    await asr.transcribeStream(req, (r) => {
+      emitted.push({ text: r.segments[0].sourceText, partial: r.isPartial });
+    });
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].text).toBe('fallback text');
+    expect(emitted[0].partial).toBe(false);
+  });
+
+  it('transcribeStream M2-56：未 warmup 時拋錯', async () => {
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    // 不調用 warmup
+
+    const chunk = makeChunk(3);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: true };
+
+    await expect(asr.transcribeStream(req, () => {})).rejects.toThrow('not warmed up');
+  });
+
+  it('isReady() M2-56：warmup 前後狀態正確', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+
+    // warmup 前
+    expect(asr.isReady()).toBe(false);
+
+    await asr.warmup(mockConfig);
+
+    // warmup 後
+    expect(asr.isReady()).toBe(true);
   });
 });

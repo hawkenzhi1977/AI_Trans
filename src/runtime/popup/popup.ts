@@ -180,19 +180,17 @@ async function init(): Promise<void> {
   stopInitWatchdog(); // M2-26：init 完成，停止 slow/timeout 計時（避免誤報）
 }
 
-/** 更新 ASR 按鈕狀態（已授權顯示「ASR 已啟用」，未授權顯示「啟用 ASR」）。 */
+/** 更新 ASR 按鈕狀態。
+ *  M2-55（#4）：按鈕永遠可點擊——authorized=true 時標籤「重新授權 ASR」，否則「啟用 ASR」。
+ *  原因：tabCaptureAuthorized 持久化但串流能力（streamId / 活 MediaStream）是 ephemeral，
+ *  tab 重載/offscreen 空閒釋放/串流失效後可能需要重新投遞 fresh streamId；
+ *  舊版禁用按鈕會讓用戶無法手動恢復（字幕永久不出現的根因之一）。 */
 async function updateAsrButton(): Promise<void> {
   const btn = $('btn-asr') as HTMLButtonElement;
   const authorized = await chrome.storage.local.get('tabCaptureAuthorized');
-  if (authorized.tabCaptureAuthorized) {
-    btn.textContent = 'ASR 已啟用';
-    btn.disabled = true;
-    btn.style.opacity = '0.6';
-  } else {
-    btn.textContent = '啟用 ASR';
-    btn.disabled = false;
-    btn.style.opacity = '1';
-  }
+  btn.textContent = authorized.tabCaptureAuthorized ? '重新授權 ASR' : '啟用 ASR';
+  btn.disabled = false;
+  btn.style.opacity = '1';
 }
 
 /** 綁定 popup 按鈕事件（config 讀取失敗時以默認值佔位，不影響手動操作）。 */
@@ -271,33 +269,44 @@ function bindActions(config: EngineConfig): void {
   // M2-46：tabCapture 授權按鈕——用戶點擊後觸發 tabCapture.getMediaStreamId（需用戶手勢）。
   // 授權成功後透過 tabs.sendMessage 將 streamId 送入 content-script 記憶體（不落 storage）；
   // 同時寫入 tabCaptureAuthorized=true 讓 content-script 的 storage 監聽觸發熱重啟。
+  // M2-55（#4）：按鈕永遠可點擊（authorized=true 時為「重新授權 ASR」），讓串流失效後可手動恢復。
   $('btn-asr').addEventListener('click', async () => {
     const connEl = $('status-connection');
     connEl.textContent = 'ASR 授權: 請求中…';
     connEl.classList.remove('warn', 'ok');
     try {
+      // M2-55（#3）：先取目標 tab，把 targetTabId 傳給 SW 的 getMediaStreamId。
+      // popup 非 tab（sender.tab 為 undefined），SW 無法自行推斷目標 tab，必須由 popup 傳入；
+      // 空 constraints 在 SW 中無「invoked tab」上下文，可能抓錯 tab 或失敗。
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs[0];
+      if (tab?.id == null) {
+        connEl.textContent = 'ASR 授權: 失敗 — 未找到活動標籤頁';
+        connEl.classList.add('warn');
+        return;
+      }
+      const targetTabId = tab.id;
+
       // getMediaStreamId 必須在 SW 中執行——Chrome 116+ render process 限制：
       // popup 與 offscreen document 屬不同 render process，popup 直接獲取的 streamId 無法在 offscreen 中使用。
       // SW 與 offscreen 共享 extension context，由 SW 取得的 streamId 可跨進程傳給 offscreen 消費。
-      const swResult = await chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' }) as
-        { ok: true; streamId: string } | { ok: false; error: string };
+      const swResult = await chrome.runtime.sendMessage({
+        topic: 'asr:get-stream-id',
+        payload: { targetTabId },
+      }) as { ok: true; streamId: string } | { ok: false; error: string };
       if (!swResult.ok) throw new Error(swResult.error);
       const streamId = swResult.streamId;
 
       // M2-46：streamId 是一次性 TTL token，不落 storage 避免過期後被重複消費。
       // 直接透過 tabs.sendMessage 交付給 content-script 記憶體（InMemoryTabStreamIdProvider）。
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      const tab = tabs[0];
-      if (tab?.id != null) {
-        try {
-          await chrome.tabs.sendMessage(tab.id, {
-            topic: 'asr:stream-id',
-            streamId,
-          });
-        } catch {
-          // content-script 可能尚未就緒（頁面剛加載），sendMessage 失敗不阻斷授權流程；
-          // streamId 會在 content-script 啟動並調用 start() 時透過 storage 的 authorized=true 觸發重試。
-        }
+      try {
+        await chrome.tabs.sendMessage(targetTabId, {
+          topic: 'asr:stream-id',
+          streamId,
+        });
+      } catch {
+        // content-script 可能尚未就緒（頁面剛加載），sendMessage 失敗不阻斷授權流程；
+        // streamId 會在 content-script 啟動並調用 start() 時透過 storage 的 authorized=true 觸發重試。
       }
 
       // 寫入 tabCaptureAuthorized=true，觸發 content-script 的 storage.onChanged 熱重啟。

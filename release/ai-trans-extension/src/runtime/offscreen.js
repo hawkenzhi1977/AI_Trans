@@ -48456,6 +48456,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       "504",
       // 權限類
       "tab-capture-not-authorized",
+      "tab-capture-reauth-needed",
+      "re-authorization",
+      "\u91CD\u65B0\u6388\u6B0A",
       "not authorized",
       "permission",
       "access denied",
@@ -48860,7 +48863,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       if (!mediaStream) {
         if (!streamId) {
           const err = new Error("tabCapture: no mediaStream and no streamId provided");
-          port.postMessage({ type: "error", message: err.message });
+          port.postMessage({ type: "error", message: err.message, code: "need-stream-id" });
           recordDiagnostic({
             type: "pipeline-error",
             error: { port: "audio", code: "tab-capture-no-stream-id", recoverable: true, cause: err }
@@ -48878,6 +48881,12 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         };
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
         mediaStream = stream;
+        for (const track of stream.getTracks()) {
+          track.onended = () => {
+            console.warn("[AI_Trans] offscreen: capture track ended \u2014 discarding dead MediaStream");
+            void handleStreamEnded();
+          };
+        }
         console.warn("[AI_Trans] offscreen: new MediaStream acquired via getUserMedia");
       } else {
         console.warn("[AI_Trans] offscreen: reusing existing MediaStream (skipping getUserMedia)");
@@ -48911,7 +48920,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       port.postMessage({ type: "captureStarted" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      port.postMessage({ type: "error", message: `tabCapture failed: ${message}` });
+      port.postMessage({ type: "error", message: `tabCapture failed: ${message}`, code: "capture-failed" });
       recordDiagnostic({
         type: "pipeline-error",
         error: {
@@ -48923,7 +48932,10 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       });
       await detachAudioProcessing();
       if (mediaStream) {
-        for (const track of mediaStream.getTracks()) track.stop();
+        for (const track of mediaStream.getTracks()) {
+          track.onended = null;
+          track.stop();
+        }
         mediaStream = null;
       }
     }
@@ -48962,12 +48974,43 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     await detachAudioProcessing();
     if (mediaStream) {
       for (const track of mediaStream.getTracks()) {
+        track.onended = null;
         track.stop();
       }
       mediaStream = null;
     }
     if (portRef) {
       portRef.postMessage({ type: "captureStopped" });
+    }
+  }
+  async function handleStreamEnded() {
+    const portRef = currentPort;
+    await detachAudioProcessing();
+    if (mediaStream) {
+      for (const track of mediaStream.getTracks()) {
+        track.onended = null;
+        try {
+          track.stop();
+        } catch {
+        }
+      }
+      mediaStream = null;
+    }
+    recordDiagnostic({
+      type: "pipeline-error",
+      error: {
+        port: "audio",
+        code: "tab-capture-stream-ended",
+        recoverable: true,
+        cause: new Error("tabCapture MediaStream track ended unexpectedly (tab reloaded/navigated)")
+      }
+    });
+    if (portRef) {
+      portRef.postMessage({
+        type: "error",
+        message: "tabCapture stream ended (tab reloaded/navigated)",
+        code: "stream-ended"
+      });
     }
   }
   chrome.runtime.onConnect.addListener((port) => {

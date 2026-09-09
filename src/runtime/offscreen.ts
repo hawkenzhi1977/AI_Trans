@@ -30,7 +30,11 @@ type OffscreenResponse =
   | { type: 'captureStarted' }
   | { type: 'captureStopped' }
   | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
-  | { type: 'error'; message: string }
+  // M2-55：error 帶結構化 code，讓 content-script 精確區分「需重取 streamId」與一般捕獲失敗。
+  // - need-stream-id：offscreen 無 MediaStream 且未收到 streamId（複用探測失敗，需重新授權/重取）。
+  // - capture-failed：getUserMedia / 音頻處理拋錯。
+  // - stream-ended：捕獲軌意外結束（tab 重載/串流失效），死串流已丟棄。
+  | { type: 'error'; message: string; code?: 'need-stream-id' | 'capture-failed' | 'stream-ended' }
   | { type: 'local-onnx:status'; downloaded: boolean; modelName: string; loaded?: boolean; loading?: boolean; downloading?: boolean }
   | { type: 'local-onnx:warmup-complete'; ok: boolean; error?: string }
   | { type: 'local-onnx:download-progress'; progress: number; loaded: number; total: number; fileCount?: number; completedFiles?: number }
@@ -238,8 +242,10 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
     if (!mediaStream) {
       // 尚無流——需要新 streamId 才能 getUserMedia。
       if (!streamId) {
+        // M2-55：結構化 code='need-stream-id'——content-script 樂觀探測複用失敗時，
+        // 據此觸發 StreamIdAcquirer 自動重取（而非直接當一般錯誤降級）。
         const err = new Error('tabCapture: no mediaStream and no streamId provided');
-        port.postMessage({ type: 'error', message: err.message } satisfies OffscreenResponse);
+        port.postMessage({ type: 'error', message: err.message, code: 'need-stream-id' } satisfies OffscreenResponse);
         recordDiagnostic({
           type: 'pipeline-error',
           error: { port: 'audio', code: 'tab-capture-no-stream-id', recoverable: true, cause: err },
@@ -257,6 +263,15 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints as MediaStreamConstraints);
       mediaStream = stream;
+      // M2-55（#5）：track 結束偵測——tab 重載/導航可能使捕獲軌 ended，
+      // 死串流若被靜默複用會導致「有 captureStarted 但無 audioChunk」的無聲失敗。
+      // 軌結束時立即丟棄 mediaStream，讓下次複用探測正確回報 need-stream-id 觸發重取。
+      for (const track of stream.getTracks()) {
+        track.onended = () => {
+          console.warn('[AI_Trans] offscreen: capture track ended — discarding dead MediaStream');
+          void handleStreamEnded();
+        };
+      }
       console.warn('[AI_Trans] offscreen: new MediaStream acquired via getUserMedia');
     } else {
       console.warn('[AI_Trans] offscreen: reusing existing MediaStream (skipping getUserMedia)');
@@ -308,7 +323,7 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
     port.postMessage({ type: 'captureStarted' } satisfies OffscreenResponse);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    port.postMessage({ type: 'error', message: `tabCapture failed: ${message}` } satisfies OffscreenResponse);
+    port.postMessage({ type: 'error', message: `tabCapture failed: ${message}`, code: 'capture-failed' } satisfies OffscreenResponse);
     // §5.6：tabCapture 失敗必須落診斷。
     recordDiagnostic({
       type: 'pipeline-error',
@@ -322,7 +337,10 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
     // 建流失敗時才完整清理（避免把複用流也殺掉）。
     await detachAudioProcessing();
     if (mediaStream) {
-      for (const track of mediaStream.getTracks()) track.stop();
+      for (const track of mediaStream.getTracks()) {
+        track.onended = null; // 解除 ended 偵測，避免主動停止誤觸發 handleStreamEnded。
+        track.stop();
+      }
       mediaStream = null;
     }
   }
@@ -368,12 +386,47 @@ async function stopCapture(): Promise<void> {
   await detachAudioProcessing();
   if (mediaStream) {
     for (const track of mediaStream.getTracks()) {
+      track.onended = null; // 解除 ended 偵測，避免主動停止誤觸發 handleStreamEnded。
       track.stop();
     }
     mediaStream = null;
   }
   if (portRef) {
     portRef.postMessage({ type: 'captureStopped' } satisfies OffscreenResponse);
+  }
+}
+
+/**
+ * M2-55（#5）：捕獲軌意外結束（tab 重載/導航/串流失效）時的死串流處理。
+ * 丟棄 mediaStream 並通知 content-script，讓下次複用探測正確回報 need-stream-id
+ * 觸發 StreamIdAcquirer 自動重取，避免靜默複用無聲死串流（§5.6 不靜默）。
+ */
+async function handleStreamEnded(): Promise<void> {
+  const portRef = currentPort;
+  await detachAudioProcessing();
+  if (mediaStream) {
+    for (const track of mediaStream.getTracks()) {
+      track.onended = null;
+      try { track.stop(); } catch { /* 已結束，忽略 */ }
+    }
+    mediaStream = null;
+  }
+  // §5.6：死串流丟棄留痕（診斷 + 通知 content-script）。
+  recordDiagnostic({
+    type: 'pipeline-error',
+    error: {
+      port: 'audio',
+      code: 'tab-capture-stream-ended',
+      recoverable: true,
+      cause: new Error('tabCapture MediaStream track ended unexpectedly (tab reloaded/navigated)'),
+    },
+  });
+  if (portRef) {
+    portRef.postMessage({
+      type: 'error',
+      message: 'tabCapture stream ended (tab reloaded/navigated)',
+      code: 'stream-ended',
+    } satisfies OffscreenResponse);
   }
 }
 

@@ -175,63 +175,76 @@ export class LocalWhisperASR implements ASRProvider {
 
   /**
    * 流式推理——M2-37：轉發推理請求給 Offscreen Document。
-   * 當前實現：將音頻塊分為 3 段，每段推理後 emit provisional，最後一段 emit final。
+   * M2-56 根因修復：此前將 chunk 切 3 段各 ~85ms 分別推理，Whisper 對如此短的碎片
+   * 產出垃圾/空文本。改為整塊 PCM 一次推理（Whisper 返回帶時間戳的 chunks），
+   * 結果作為 final emit。
    */
   async transcribeStream(req: ASRRequest, emit: (r: ASRResult) => void): Promise<void> {
     if (!this.warmedUp) {
       throw new Error('LocalWhisperASR not warmed up. Call warmup() first.');
     }
 
-    const { chunk } = req;
-    const segmentDuration = chunk.pcm.length / 3; // 分為 3 段。
+    const { chunk, hintLang } = req;
     const sampleRate = chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1000)) : 16000;
+    const startTime = performance.now();
 
-    for (let i = 0; i < 3; i++) {
-      const start = Math.floor(i * segmentDuration);
-      const end = Math.floor((i + 1) * segmentDuration);
-      const segmentPcm = chunk.pcm.slice(start, end);
-      const isLast = i === 2;
+    // 整塊 PCM 一次推理（Whisper 需要連續音頻才能準確識別）。
+    const response = await chrome.runtime.sendMessage({
+      topic: 'asr-whisper:transcribe',
+      payload: {
+        pcm: chunk.pcm,
+        sampleRate,
+        hintLang,
+      },
+    });
 
-      const startTime = performance.now();
+    // 響應可能直接是結果，或包裹在 { ok, result } 中。
+    const raw = response as { ok?: boolean; result?: AsrTranscribeResponse } | AsrTranscribeResponse;
+    const transcribeResult = 'result' in raw && raw.result ? raw.result : (raw as AsrTranscribeResponse);
 
-      // 轉發推理請求給 Offscreen Document。
-      const response = await chrome.runtime.sendMessage({
-        topic: 'asr-whisper:transcribe',
-        payload: {
-          pcm: segmentPcm,
-          sampleRate,
-        },
-      });
+    if (!transcribeResult?.ok) {
+      throw new Error(transcribeResult?.error ?? 'transcribe failed');
+    }
 
-      // 響應可能直接是結果，或包裹在 { ok, result } 中。
-      const raw = response as { ok?: boolean; result?: AsrTranscribeResponse } | AsrTranscribeResponse;
-      const transcribeResult = 'result' in raw && raw.result ? raw.result : (raw as AsrTranscribeResponse);
+    const durationMs = performance.now() - startTime;
+    const audioDurationMs = chunk.duration;
+    const rtf = transcribeResult.rtf ?? (durationMs / audioDurationMs);
 
-      if (!transcribeResult?.ok) {
-        throw new Error(transcribeResult?.error ?? 'transcribe failed');
-      }
-
-      const durationMs = performance.now() - startTime;
-      const audioDurationMs = (segmentPcm.length / sampleRate) * 1000;
-      const rtf = transcribeResult.rtf ?? (durationMs / audioDurationMs);
-
-      const segment: SubtitleSegment = {
+    // 解析結果：優先使用帶時間戳的 chunks，否則整塊作為單段。
+    const segments: SubtitleSegment[] = transcribeResult.chunks?.map(
+      (c, i) => ({
         id: `${chunk.seq}-${i}`,
-        sourceText: transcribeResult.text?.trim() ?? '',
+        sourceText: c.text.trim(),
         translatedText: undefined,
-        provisional: !isLast,
-        start: (start / sampleRate) * 1000,
-        end: (end / sampleRate) * 1000,
+        provisional: false,
+        start: (c.timestamp?.[0] ?? 0) * 1000,
+        end: (c.timestamp?.[1] ?? chunk.duration / 1000) * 1000,
         origin: 'realtime-asr' as const,
         revision: 0,
-      };
+      })
+    ) ?? [
+      {
+        id: `${chunk.seq}-0`,
+        sourceText: transcribeResult.text?.trim() ?? '',
+        translatedText: undefined,
+        provisional: false,
+        start: 0,
+        end: chunk.duration,
+        origin: 'realtime-asr' as const,
+        revision: 0,
+      },
+    ];
 
-      emit({
-        seq: chunk.seq,
-        segments: [segment],
-        isPartial: !isLast,
-        rtf,
-      });
-    }
+    emit({
+      seq: chunk.seq,
+      segments,
+      isPartial: false,
+      rtf,
+    });
+  }
+
+  /** M2-56：供策略查詢模型是否已載入（避免 chunk 到達時 model 未就緒）。 */
+  isReady(): boolean {
+    return this.warmedUp;
   }
 }

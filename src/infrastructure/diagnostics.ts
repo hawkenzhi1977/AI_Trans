@@ -67,6 +67,9 @@ export function isUserActionable(message: string): boolean {
     '504',
     // 權限類
     'tab-capture-not-authorized',
+    'tab-capture-reauth-needed',
+    're-authorization',
+    '重新授權',
     'not authorized',
     'permission',
     'access denied',
