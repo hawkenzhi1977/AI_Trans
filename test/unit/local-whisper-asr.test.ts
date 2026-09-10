@@ -229,4 +229,133 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     // warmup 後
     expect(asr.isReady()).toBe(true);
   });
+
+  // ─── M2-57：響應雙格式兼容 + 超時保護 ───────────────────────────────
+
+  it('M2-57：transcribe 兼容 SW 包裝格式 { ok, result }', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // SW 包裝格式：{ ok: true, result: { type, ok, text, chunks } }
+    mockSendMessage.mockResolvedValueOnce({
+      ok: true,
+      result: {
+        type: 'asr-whisper:transcribe-result',
+        ok: true,
+        text: 'sw wrapped',
+        chunks: [{ text: 'sw wrapped', timestamp: [0, 3] }],
+        rtf: 0.4,
+      },
+    });
+
+    const chunk = makeChunk(10);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
+    const result = await asr.transcribe(req);
+
+    expect(result.segments).toHaveLength(1);
+    expect(result.segments[0].sourceText).toBe('sw wrapped');
+  });
+
+  it('M2-57：transcribe 兼容 offscreen 裸廣播格式（頂層 ok/text/chunks）', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // Offscreen 裸廣播格式：直接是 AsrTranscribeResponse（無 result 包裝）
+    mockSendMessage.mockResolvedValueOnce({
+      type: 'asr-whisper:transcribe-result',
+      ok: true,
+      text: 'raw broadcast',
+      chunks: [{ text: 'raw broadcast', timestamp: [0, 2] }],
+      rtf: 0.3,
+    });
+
+    const chunk = makeChunk(11);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
+    const result = await asr.transcribe(req);
+
+    expect(result.segments).toHaveLength(1);
+    expect(result.segments[0].sourceText).toBe('raw broadcast');
+  });
+
+  it('M2-57：transcribeStream 兼容 offscreen 裸廣播格式', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // 裸廣播格式（無 result 包裝）
+    mockSendMessage.mockResolvedValueOnce({
+      type: 'asr-whisper:transcribe-result',
+      ok: true,
+      text: 'stream raw',
+      chunks: [{ text: 'stream raw', timestamp: [0.5, 4.0] }],
+      rtf: 0.2,
+    });
+
+    const chunk = makeChunk(12);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: true };
+    const emitted: Array<{ text: string }> = [];
+
+    await asr.transcribeStream(req, (r) => {
+      emitted.push({ text: r.segments[0].sourceText });
+    });
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].text).toBe('stream raw');
+  });
+
+  it('M2-57：transcribe 超時時拋出 timeout 錯誤', async () => {
+    vi.useFakeTimers();
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // 模擬 sendMessage 永遠不 resolve（掛起）
+    mockSendMessage.mockImplementationOnce(
+      () => new Promise(() => {})
+    );
+
+    const chunk = makeChunk(13);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
+    const promise = asr.transcribe(req);
+
+    // 推進超時（30s）——先 attach catch 避免 unhandled rejection
+    const result = promise.then(
+      () => { throw new Error('should have rejected'); },
+      (err: Error) => err
+    );
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    const err = await result;
+    expect(err.message).toContain('timeout');
+    vi.useRealTimers();
+  });
+
+  it('M2-57：transcribeStream 超時時拋出 timeout 錯誤', async () => {
+    vi.useFakeTimers();
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // 模擬掛起
+    mockSendMessage.mockImplementationOnce(
+      () => new Promise(() => {}) // 永不 resolve
+    );
+
+    const chunk = makeChunk(14);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: true };
+    const promise = asr.transcribeStream(req, () => {});
+
+    // 先 attach catch 避免 unhandled rejection
+    const result = promise.then(
+      () => { throw new Error('should have rejected'); },
+      (err: Error) => err
+    );
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    const err = await result;
+    expect(err.message).toContain('timeout');
+    vi.useRealTimers();
+  });
 });

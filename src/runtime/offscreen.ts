@@ -526,11 +526,22 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender) => {
       void clearAsrModelCache(msg.payload?.modelId).then(broadcast);
       return false;
     case 'asr-whisper:warmup': {
+      // M2-57：若 SW 轉發 port 通道已建立，本入口跳過——由 port 路徑處理，避免雙重推理
+      // （chrome.runtime.sendMessage 會同時廣播給 SW 與 offscreen）。
+      if (onnxPortConnected) {
+        busyCount = Math.max(0, busyCount - 1);
+        return false;
+      }
       const warmupMsg = message as { topic?: string; payload?: { modelId?: string } };
       void warmupAsrPipeline(warmupMsg.payload?.modelId ?? 'Xenova/whisper-base.en').then(broadcast);
       return false;
     }
     case 'asr-whisper:transcribe': {
+      // M2-57：同上——port 路徑已處理時跳過，避免雙重推理 + 響應競態。
+      if (onnxPortConnected) {
+        busyCount = Math.max(0, busyCount - 1);
+        return false;
+      }
       const transcribeMsg = message as { topic?: string; payload?: { pcm?: Float32Array; sampleRate?: number; hintLang?: string } };
       void runAsrInference(
         transcribeMsg.payload?.pcm ?? new Float32Array(0),

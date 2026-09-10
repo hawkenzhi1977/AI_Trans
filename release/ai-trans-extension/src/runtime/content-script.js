@@ -3483,6 +3483,24 @@ Example output:
     base: "Xenova/whisper-base.en",
     small: "Xenova/whisper-small.en"
   };
+  var TRANSCRIBE_TIMEOUT_MS = 3e4;
+  function sendMessageWithTimeout(message, timeoutMs = TRANSCRIBE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`ASR transcribe timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+      chrome.runtime.sendMessage(message).then(
+        (res) => {
+          clearTimeout(timer);
+          resolve(res);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      );
+    });
+  }
   var LocalWhisperASR = class {
     engineId = "local-whisper";
     location = "local";
@@ -3533,7 +3551,7 @@ Example output:
       const { chunk, hintLang } = req;
       const startTime = performance.now();
       try {
-        const response = await chrome.runtime.sendMessage({
+        const response = await sendMessageWithTimeout({
           topic: "asr-whisper:transcribe",
           payload: {
             pcm: chunk.pcm,
@@ -3606,7 +3624,7 @@ Example output:
       const { chunk, hintLang } = req;
       const sampleRate = chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1e3)) : 16e3;
       const startTime = performance.now();
-      const response = await chrome.runtime.sendMessage({
+      const response = await sendMessageWithTimeout({
         topic: "asr-whisper:transcribe",
         payload: {
           pcm: chunk.pcm,

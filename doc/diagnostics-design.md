@@ -948,6 +948,16 @@ DiagnosticRecord 結構:
 - **開發者響應**: 查看 catch 中 `recordDiagnostic` 的 cause 鏈；確認 offscreen document 是否存活
 - **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（run() warmup try/catch）
 
+### 11.4b ASR Transcribe 超時（M2-57）
+
+- **診斷碼**: asr-engine-failed（cause 含 `timeout`）
+- **用戶可見消息**: 最近失敗: 降級: asr engine local-whisper failed: ASR transcribe timeout after 30000ms (<timestamp>)
+- **觸發條件**: `LocalWhisperASR.transcribe()` / `transcribeStream()` 中 `sendMessageWithTimeout()` 30s 內未收到 offscreen 響應
+- **根因**: offscreen Whisper 推理掛起（模型載入中、CPU 資源競爭、port 斷開未偵測）
+- **用戶響應**: 刷新頁面重試；若持續出現，檢查模型是否完整下載（Options → ASR 模型）
+- **開發者響應**: 確認 offscreen document 存活；檢查 `onnxPortConnected` 守衛是否生效（排除雙重推理）；查看 SW port 通道狀態
+- **代碼落點**: src/adapters/asr/local-whisper.ts（`sendMessageWithTimeout()` 30s 超時）
+
 ### 11.5 ASR 性能降檔
 
 - **診斷碼**: asr-performance-degraded

@@ -37,6 +37,29 @@ interface AsrTranscribeResponse {
   rtf?: number;
 }
 
+/** M2-57：transcribe 超時（ms）——防止 offscreen 推理掛起導致字幕管線永久停滯。 */
+const TRANSCRIBE_TIMEOUT_MS = 30_000;
+
+/**
+ * M2-57：帶超時的 sendMessage 包裝。
+ * chrome.runtime.sendMessage 在 SW/offscreen 無響應時會掛起至 Chrome 120s 超時，
+ * 此處以較短的業務超時快速失敗，讓策略層有機會降級/重試。
+ */
+function sendMessageWithTimeout(
+  message: Record<string, unknown>,
+  timeoutMs: number = TRANSCRIBE_TIMEOUT_MS
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`ASR transcribe timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    chrome.runtime.sendMessage(message).then(
+      (res) => { clearTimeout(timer); resolve(res); },
+      (err) => { clearTimeout(timer); reject(err instanceof Error ? err : new Error(String(err))); }
+    );
+  });
+}
+
 /**
  * 本地 Whisper ASR Provider——M2-37 遷移至 Offscreen Document 推理。
  * Content-script 側僅作為消息代理，將請求轉發給 Offscreen Document 執行實際推理。
@@ -105,8 +128,8 @@ export class LocalWhisperASR implements ASRProvider {
     const startTime = performance.now();
 
     try {
-      // 轉發推理請求給 Offscreen Document。
-      const response = await chrome.runtime.sendMessage({
+      // M2-57：帶超時轉發推理請求給 Offscreen Document（防止掛起）。
+      const response = await sendMessageWithTimeout({
         topic: 'asr-whisper:transcribe',
         payload: {
           pcm: chunk.pcm,
@@ -188,8 +211,8 @@ export class LocalWhisperASR implements ASRProvider {
     const sampleRate = chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1000)) : 16000;
     const startTime = performance.now();
 
-    // 整塊 PCM 一次推理（Whisper 需要連續音頻才能準確識別）。
-    const response = await chrome.runtime.sendMessage({
+    // M2-57：整塊 PCM 一次推理（Whisper 需要連續音頻才能準確識別），帶超時保護。
+    const response = await sendMessageWithTimeout({
       topic: 'asr-whisper:transcribe',
       payload: {
         pcm: chunk.pcm,

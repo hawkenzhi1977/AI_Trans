@@ -49078,11 +49078,19 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         void clearAsrModelCache(msg.payload?.modelId).then(broadcast);
         return false;
       case "asr-whisper:warmup": {
+        if (onnxPortConnected) {
+          busyCount = Math.max(0, busyCount - 1);
+          return false;
+        }
         const warmupMsg = message;
         void warmupAsrPipeline(warmupMsg.payload?.modelId ?? "Xenova/whisper-base.en").then(broadcast);
         return false;
       }
       case "asr-whisper:transcribe": {
+        if (onnxPortConnected) {
+          busyCount = Math.max(0, busyCount - 1);
+          return false;
+        }
         const transcribeMsg = message;
         void runAsrInference(
           transcribeMsg.payload?.pcm ?? new Float32Array(0),
