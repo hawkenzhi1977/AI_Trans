@@ -51,6 +51,7 @@ const DEBUG_CATEGORY_IDS: Array<[DebugLogCategory, string]> = [
   ['bridge', 'dbg-bridge'],
   ['interceptor', 'dbg-interceptor'],
   ['local-onnx', 'dbg-local-onnx'],
+  ['audio', 'dbg-audio'],
   ['popup', 'dbg-popup'],
 ];
 

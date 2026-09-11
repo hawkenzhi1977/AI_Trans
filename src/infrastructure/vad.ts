@@ -81,6 +81,16 @@ export class EnergyVAD {
     this.silenceStartTime = null;
   }
 
+  /** M2-58：動態調整 RMS 閾值（策略在持續過濾時兜底放寬用）。 */
+  setThreshold(threshold: number): void {
+    this.config.threshold = threshold;
+  }
+
+  /** M2-58：讀取當前閾值（診斷/測試用）。 */
+  getThreshold(): number {
+    return this.config.threshold;
+  }
+
   /**
    * 標記 AudioChunk 的 isSpeech 字段（批量處理）。
    * @param chunk 待標記的音頻塊。

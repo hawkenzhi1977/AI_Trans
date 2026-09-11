@@ -24,6 +24,36 @@ export interface RealtimeASRDeps {
 }
 
 /**
+ * M2-58：VAD 兜底觸發條件——連續 N 塊（40 × 256ms ≈ 10.2s）全部被過濾時放寬閾值。
+ * 防止低音量視頻（安靜旁白/音樂）被固定閾值永久過濾 → 「有音頻但永遠無字幕」。
+ */
+export const VAD_FALLBACK_SILENT_CHUNKS = 40;
+
+/**
+ * M2-58：將 ASR segment 時間戳對齊到視頻時間軸。
+ * Whisper 輸出的 start/end 相對於輸入 chunk（0~chunk.duration）；
+ * 加上 chunk 開始時的視頻時間（onChunk 以播放狀態反推）即為視頻絕對時間。
+ * clamp ≥0（播放狀態未觀察到時 chunkStartMs 可能為 0，不產生負時間）。
+ */
+export function alignSegmentsToVideoTimeline(
+  segments: SubtitleSegment[],
+  chunkStartMs: number,
+): SubtitleSegment[] {
+  return segments.map((s) => ({
+    ...s,
+    start: Math.max(0, s.start + chunkStartMs),
+    end: Math.max(0, s.end + chunkStartMs),
+  }));
+}
+
+/** M2-58：過濾空文本 segment（靜音/識別失敗），避免空白 cue 進入 overlay。 */
+export function filterEmptySegments(segments: SubtitleSegment[]): SubtitleSegment[] {
+  return segments.filter(
+    (s) => s.sourceText.trim().length > 0 || (s.translatedText ?? '').trim().length > 0,
+  );
+}
+
+/**
  * 三級策略：實時擷取 ASR。
  * isApplicable：config.asr.type !== 'none' && tabCaptureAuthorized。
  * run：tabCapture → ASR → 翻譯 → 推送（支持 provisional 字幕）。
@@ -39,10 +69,27 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   private downgradeCheckInterval: ReturnType<typeof setInterval> | null = null;
   private audioHandle: AudioSourceHandle | null = null;
 
+  // M2-58：VAD 統計與兜底（§5.6——「chunk 全被過濾」必須留痕，不得靜默）。
+  private baseVadThreshold = 0.01;
+  private consecutiveSilentChunks = 0;
+  private vadFallbackArmed = false;
+  private vadWindowReceived = 0;
+  private vadWindowPassed = 0;
+  private vadWindowMaxRms = 0;
+  private vadSessionMaxRms = 0;
+  private vadWindowStart = 0;
+  // M2-58：ASR 調用計數（首調 breadcrumb——確認 VAD→ASR 交接真的發生）。
+  private asrCallCount = 0;
+
   /** 注入依賴（由 Orchestrator 調用）。 */
   inject(deps: RealtimeASRDeps): void {
     this.deps = deps;
-    this.vad = new EnergyVAD({ threshold: deps.vadThreshold ?? 0.01 });
+    // M2-58：記錄基礎閾值（兜底放寬的基準）；重注入時重置兜底狀態（restart 路徑）。
+    this.baseVadThreshold = deps.vadThreshold ?? 0.01;
+    this.consecutiveSilentChunks = 0;
+    this.vadFallbackArmed = false;
+    this.asrCallCount = 0;
+    this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
     this.perf = new PerfMetrics(100); // 滑動窗口 100 樣本。
   }
 
@@ -130,9 +177,58 @@ export class RealtimeASRStrategy implements CaptionStrategy {
       // M2-56：若 provider 有 isReady() 且未就緒，跳過（防 warmup 邊界競態）。
       if (asrProvider.isReady && !asrProvider.isReady()) return;
 
-      // VAD 過濾靜音。
-      this.vad!.markChunk(chunk);
-      if (!chunk.isSpeech) return; // 靜音跳過。
+      // M2-58：時間軸對齊——offscreen 無法獲取視頻時間軸（chunk.startTime=0），
+      // 此處以播放狀態反推：chunk 覆蓋視頻時間 [videoNow - duration, videoNow]。
+      // lastPlayback 由 timeupdate 驅動（~250ms 粒度），誤差可接受。
+      const videoNow = ctx.playback().currentTime; // ms
+      chunk.startTime = Math.max(0, videoNow - chunk.duration);
+
+      // VAD 過濾靜音（M2-58：用 process() 取 rms 做統計，markChunk 會丟棄它）。
+      const vadResult = this.vad!.process(chunk.pcm, chunk.sampleRate, performance.now());
+      chunk.isSpeech = vadResult.isSpeech;
+
+      // M2-58：VAD 5s 窗口統計（§5.6 breadcrumb）——區分「無 chunk」與「有 chunk 但全被過濾」。
+      this.vadWindowReceived++;
+      if (vadResult.rms > this.vadWindowMaxRms) this.vadWindowMaxRms = vadResult.rms;
+      if (vadResult.rms > this.vadSessionMaxRms) this.vadSessionMaxRms = vadResult.rms;
+      if (vadResult.isSpeech) this.vadWindowPassed++;
+      const vadNow = performance.now();
+      if (this.vadWindowStart === 0) this.vadWindowStart = vadNow;
+      if (vadNow - this.vadWindowStart >= 5000) {
+        diagLog(
+          'strategy',
+          `realtime-asr: VAD window — received=${this.vadWindowReceived}, passed=${this.vadWindowPassed}, maxRms=${this.vadWindowMaxRms.toFixed(5)} (last 5s)`,
+        );
+        this.vadWindowReceived = 0;
+        this.vadWindowPassed = 0;
+        this.vadWindowMaxRms = 0;
+        this.vadWindowStart = vadNow;
+      }
+
+      if (!vadResult.isSpeech) {
+        // M2-58：兜底——連續 ~10s 全被過濾時放寬閾值（降半）並落診斷，
+        // 防止低音量視頻被固定閾值永久過濾（§5.6：軟失敗必須留痕）。
+        this.consecutiveSilentChunks++;
+        if (!this.vadFallbackArmed && this.consecutiveSilentChunks >= VAD_FALLBACK_SILENT_CHUNKS) {
+          const relaxed = this.baseVadThreshold / 2;
+          this.vad!.setThreshold(relaxed);
+          this.vadFallbackArmed = true;
+          recordDiagnostic({
+            type: 'engine-degraded',
+            port: 'asr',
+            reason: `vad-filtering-all: ${this.consecutiveSilentChunks} consecutive chunks below threshold (${this.baseVadThreshold} -> ${relaxed}), sessionMaxRms=${this.vadSessionMaxRms.toFixed(5)}; threshold relaxed`,
+          });
+          diagLog('strategy', `realtime-asr: VAD fallback armed — threshold relaxed ${this.baseVadThreshold} -> ${relaxed}`);
+        }
+        return; // 靜音跳過。
+      }
+      this.consecutiveSilentChunks = 0;
+
+      // M2-58：首次 ASR dispatch breadcrumb（§5.6）——確認 VAD→ASR 交接真的發生。
+      this.asrCallCount++;
+      if (this.asrCallCount === 1) {
+        diagLog('strategy', `realtime-asr: first ASR dispatch (seq=${chunk.seq}, chunkMs=${Math.round(chunk.duration)})`);
+      }
 
       try {
         // ASR 推理（流式）。
@@ -161,6 +257,12 @@ export class RealtimeASRStrategy implements CaptionStrategy {
               data: { stage: 'asr', ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf },
             });
 
+            // M2-58：ASR 結果摘要（每結果一行的頻率 ~1/s，非洪水）。
+            diagLog(
+              'strategy',
+              `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${asrResult.segments.reduce((n, s) => n + s.sourceText.length, 0)}`,
+            );
+
             // 翻譯。
             const translateStart = performance.now();
             const translatedSegments = await this.translateSegments(
@@ -175,12 +277,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
               data: { stage: 'translate', ms: translateMs, seq: chunk.seq },
             });
 
-            // 推送事件。
+            // 推送事件（M2-58：對齊視頻時間軸 + 過濾空文本）。
             if (!this.running) return;
-            emit({
-              type: asrResult.isPartial ? 'segments-updated' : 'segments-ready',
-              segments: translatedSegments,
-            });
+            this.emitAligned(asrResult, translatedSegments, chunk, emit);
           });
         } else {
           // 非流式推理。
@@ -211,11 +310,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             data: { stage: 'translate', ms: translateMs, seq: chunk.seq },
           });
 
+          // M2-58：對齊視頻時間軸 + 過濾空文本。
           if (!this.running) return;
-          emit({
-            type: 'segments-ready',
-            segments: translatedSegments,
-          });
+          this.emitAligned(asrResult, translatedSegments, chunk, emit);
         }
       } catch (err) {
         // §5.6：ASR 失敗必須落診斷。
@@ -249,6 +346,15 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     this.unsubscribeChunk?.();
     this.unsubscribeChunk = null;
     this.vad?.reset();
+    // M2-58：重置統計與兜底狀態，避免跨會話累積誤讀（§5.4 註冊必配解除的計數器版本）。
+    this.consecutiveSilentChunks = 0;
+    this.vadFallbackArmed = false;
+    this.vadWindowReceived = 0;
+    this.vadWindowPassed = 0;
+    this.vadWindowMaxRms = 0;
+    this.vadSessionMaxRms = 0;
+    this.vadWindowStart = 0;
+    this.asrCallCount = 0;
     // M2-13：清理降檔檢查定時器。
     if (this.downgradeCheckInterval !== null) {
       clearInterval(this.downgradeCheckInterval);
@@ -282,6 +388,26 @@ export class RealtimeASRStrategy implements CaptionStrategy {
       targetLang: 'zh-Hant',
     });
     return result.segments;
+  }
+
+  /**
+   * M2-58：對齊 + 過濾後推送。全空時跳過 emit（留 breadcrumb，§5.6 不靜默）。
+   * chunk.startTime 已在 onChunk 以播放狀態反推（視頻時間軸）。
+   */
+  private emitAligned(
+    asrResult: { isPartial: boolean },
+    translatedSegments: SubtitleSegment[],
+    chunk: AudioChunk,
+    emit: (e: PipelineEvent) => void,
+  ): void {
+    const segments = filterEmptySegments(
+      alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime),
+    );
+    if (segments.length === 0) {
+      diagLog('strategy', `realtime-asr: ASR returned no usable text (seq=${chunk.seq}), skipping emit`);
+      return;
+    }
+    emit({ type: asrResult.isPartial ? 'segments-updated' : 'segments-ready', segments });
   }
 
   /** 獲取性能統計摘要（用於觀測與調試）。 */

@@ -59,15 +59,16 @@ describe('debug-log — 分類門控（M1-51）', () => {
     expect(getDebugFlags()).toEqual(DEBUG_LOG_OFF);
   });
 
-  it('十個分類全部覆蓋（overlay/llm/capture/pipeline/strategy/content/bridge/interceptor/local-onnx/popup）', () => {
+  it('十一個分類全部覆蓋（overlay/llm/capture/pipeline/strategy/content/bridge/interceptor/local-onnx/popup/audio）', () => {
     const all: DebugLogConfig = { ...DEBUG_LOG_OFF };
     for (const k of Object.keys(DEBUG_LOG_OFF) as Array<keyof DebugLogConfig>) all[k] = true;
     setDebugFlags(all);
     const categories = Object.keys(DEBUG_LOG_OFF) as Array<keyof DebugLogConfig>;
     for (const cat of categories) diagLog(cat, 'x');
     expect(logSpy).toHaveBeenCalledTimes(categories.length);
+    // M2-58：新增 audio 分類（tabCapture 音頻捕獲鏈路 breadcrumb）。
     expect(Object.keys(DEBUG_LOG_OFF).sort()).toEqual(
-      ['bridge', 'capture', 'content', 'interceptor', 'llm', 'local-onnx', 'overlay', 'pipeline', 'popup', 'strategy']
+      ['audio', 'bridge', 'capture', 'content', 'interceptor', 'llm', 'local-onnx', 'overlay', 'pipeline', 'popup', 'strategy']
     );
   });
 });

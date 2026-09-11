@@ -49,6 +49,7 @@ export type DebugLogCategory =
   | 'bridge' // timedtext 消息橋（waitForCapture/輪詢）
   | 'interceptor' // MAIN world 攔截器（XHR/fetch hook/字幕模組驅動）
   | 'local-onnx' // 本地 ONNX 翻譯適配器（chunk 進度/echo 統計）
+  | 'audio' // tabCapture 音頻捕獲鏈路（offscreen ↔ adapter chunk 流動統計）
   | 'popup'; // Popup 生命週期診斷（init 時序/storage 阻塞/openOptionsPage 失敗）
 
 /** 調試日誌開關配置（每類一個布爾開關）。 */
@@ -65,6 +66,7 @@ export const DEBUG_LOG_OFF: DebugLogConfig = {
   bridge: false,
   interceptor: false,
   'local-onnx': false,
+  audio: false,
   popup: false,
 };
 

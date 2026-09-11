@@ -978,6 +978,17 @@ DiagnosticRecord 結構:
 - **開發者響應**: 開啟「pipeline」調試日誌分類可觀察 VAD 切分頻率；調整 `asr.vadThreshold` 可改變靈敏度
 - **代碼落點**: src/infrastructure/vad.ts（`EnergyVAD.process`）
 
+### 11.6a VAD 全靜音兜底（M2-58）
+
+- **診斷碼**: vad-filtering-all
+- **用戶可見消息**: 最近失敗: 降級: vad-filtering-all: 40 consecutive chunks below threshold (0.01 -> 0.005), sessionMaxRms=0.00000; threshold relaxed (<timestamp>)
+- **觸發條件**: `RealtimeASRStrategy` 捕獲中連續 `VAD_FALLBACK_SILENT_CHUNKS = 40` 塊（≈10s）音頻 RMS 全部低於 VAD 閾值（`asr.vadThreshold`，預設 0.01）——即 VAD 把全部音頻當靜音過濾，ASR 永遠收不到語音段
+- **根因**: 低音量視頻（旁白/音樂背景）的 RMS 持續低於閾值；`vadThreshold` 無 UI 配置項，用戶無法手動調整
+- **處理（§5.6 不靜默）**: 落 `engine-degraded` 診斷（reason 含 `vad-filtering-all` + 實際閾值與 sessionMaxRms 證據）+ `diagLog('strategy', ...)`，並將 VAD 閾值放寬為原值一半（`EnergyVAD.setThreshold(base/2)`）——低音量視頻不再永久靜音；放寬僅一次（`vadFallbackArmed` 防重複觸發），`stop()` 重置狀態（restart 不繼承舊會話放寬）
+- **用戶響應**: 若持續出現且 sessionMaxRms 極低（<0.001），視頻本身音量過小——調大系統/瀏覽器音量後重新授權 ASR
+- **開發者響應**: 配合 §11.9 音頻捕獲 breadcrumb 判定——`maxRms` 正常但 VAD 全過濾 → 閾值問題（本條目）；`maxRms≈0` → 音頻流本身靜音（context suspend / 無聲音軌）
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`VAD_FALLBACK_SILENT_CHUNKS` + `consecutiveSilentChunks` 計數 + `vadFallbackArmed`）；src/infrastructure/vad.ts（`setThreshold()`）
+
 ### 11.7 本地 Whisper 模型下載
 
 - **診斷碼**: (非錯誤，狀態通知)
@@ -998,6 +1009,29 @@ DiagnosticRecord 結構:
 - **開發者響應**: 開啟「pipeline」調試日誌分類可觀察路由決策；確認端點格式
 - **代碼落點**: src/adapters/asr/cloud-asr.ts（端點識別邏輯）
 
+### 11.9 音頻捕獲 breadcrumb（M2-58，§5.6）
+
+「captureStarted 但無 audioChunk」的無聲失敗必須可判定。音頻數據路徑（offscreen 產出 → port 傳輸 → adapter 接收）在兩端各留 breadcrumb：
+
+- **offscreen 產出端**（`console.warn`，不受調試門控——失敗痕跡永遠可見）:
+  - `startCapture` 建立 context 後：防禦性 `resume()`（autoplay policy suspend 時 onaudioprocess 永不觸發）+ state breadcrumb——`[AI_Trans] offscreen: audioContext state=<state>, passthroughContext state=<state>`（排障直接判定 context 是否被 suspend）
+  - `onaudioprocess` 首塊：`[AI_Trans] offscreen: first audioChunk sent (rms=<rms>, samples=<n>)`
+  - `onaudioprocess` 5s 窗口統計：`[AI_Trans] offscreen: audioChunk stats — sent=<n>, maxRms=<rms> (last 5s)`（區分「context 未產出 chunk」與「有 chunk 但內容靜音」）
+- **adapter 接收端**（`diagLog('audio', ...)`，受 M2-58 新增 `audio` 分類門控——正常流轉觀測日誌）:
+  - 首塊：`first audioChunk received from offscreen (samples: <n>, sampleRate: <rate>)`
+  - 5s 窗口：`audioChunk stats — received=<n> (last 5s)`；`chunkCallback` 未註冊時仍計數留痕（§5.6 不靜默丟棄）
+  - `stop()` 重置計數（新會話重新出現首塊 breadcrumb，不跨會話累積）
+- **判定矩陣**: offscreen 無 `first audioChunk sent` → context suspend / ScriptProcessor 未觸發（查 state breadcrumb）；offscreen 有 sent 但 adapter 無 received → port 傳輸中斷（查 §11.3）；兩端都有但 `maxRms≈0` → 音頻流靜音（查 §11.6a / 視頻音量）；兩端都有且 `maxRms>0` 但 ASR 仍空 → PCM 序列化損毀（查 §11.9a M2-59 base64）
+- **代碼落點**: src/runtime/offscreen.ts（`startCapture` 防禦性 resume + state breadcrumb；`onaudioprocess` 首塊/5s 統計）；src/adapters/audio/tab-capture-source.ts（`audioChunk` case 接收計數 + `diagLog('audio')`）；src/infrastructure/debug-log.ts（`audio` 分類）
+
+### 11.9a PCM base64 序列化（M2-59，§5.7）
+
+Chrome MV3 extension messaging（`port.postMessage` / `runtime.sendMessage`）對 `Float32Array` 的序列化行為不穩定——接收端可能收到沒有 `length` 的 plain object（jsdom 單元測試中直接賦值不經過序列化，無法捕獲）。所有 PCM 跨 context 傳輸統一改用 base64 string：
+
+- **編碼**（`src/infrastructure/pcm-encoding.ts`）: `encodePcmFloat32(Float32Array) → string`——Float32Array bytes → base64
+- **解碼**（§5.7 容錯）: `decodePcmFloat32(string) → Float32Array`——空/非法輸入返回空 Float32Array（不拋錯）；字節數非 4 倍數時截斷到完整 float32（不拋 RangeError）
+- **四條路徑**: (a) offscreen `onaudioprocess` → port.postMessage `{ type: 'audioChunk', pcm: base64 }`；(b) `tab-capture-source.ts` port.onMessage → decodePcmFloat32 → AudioChunk；(c) `local-whisper.ts` transcribe/transcribeStream → sendMessage `{ payload: { pcm: base64 } }`；(d) offscreen `asr-whisper:transcribe` 接收端（broadcast + port）→ decodePcmFloat32 → runAsrInference
+- **代碼落點**: src/infrastructure/pcm-encoding.ts（新檔）；src/runtime/offscreen.ts（audioChunk 發送 + transcribe 接收）；src/adapters/audio/tab-capture-source.ts（audioChunk 接收）；src/adapters/asr/local-whisper.ts（transcribe/transcribeStream 發送）
 
 ---
 
@@ -1018,7 +1052,7 @@ DiagnosticRecord 結構:
 
 ### 13.1 分類與開關
 
-- **八分類**: `overlay` / `llm` / `capture` / `pipeline` / `strategy` / `content` / `bridge` / `interceptor`,各一個布爾開關。
+- **十一分類**: `overlay` / `llm` / `capture` / `pipeline` / `strategy` / `content` / `bridge` / `interceptor` / `local-onnx` / `audio`（M2-58：tabCapture 音頻捕獲鏈路 chunk 流動統計）/ `popup`,各一個布爾開關。
 - **預設全關**: `DEBUG_LOG_OFF`——普通用戶零噪音。
 - **輸出格式**: `diagLog(category, ...)` 僅在對應分類開啟時 `console.log`,前綴 `[AI_Trans:diag][<category>]`,便於過濾。
 - **持久化與同步**: 開關存 `EngineConfig.debugLog`（`chrome.storage.local`）;Options 頁「調試日誌」分區勾選;content-script 讀取後 `setDebugFlags()` 寫入模組內存,並 `dispatchEvent(new CustomEvent('ai-trans:set-debug-flags'))` 同步給無法訪問 `chrome.storage` 的 MAIN world 攔截器。

@@ -12,6 +12,7 @@
     bridge: false,
     interceptor: false,
     "local-onnx": false,
+    audio: false,
     popup: false
   };
   var PROFILE_DEFAULTS = {
@@ -128,6 +129,7 @@
     ["bridge", "dbg-bridge"],
     ["interceptor", "dbg-interceptor"],
     ["local-onnx", "dbg-local-onnx"],
+    ["audio", "dbg-audio"],
     ["popup", "dbg-popup"]
   ];
   function readDebugLog() {

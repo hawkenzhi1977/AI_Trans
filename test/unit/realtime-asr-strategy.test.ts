@@ -1,11 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { RealtimeASRStrategy } from '../../src/application/strategies/realtime-asr-strategy';
+import { RealtimeASRStrategy, alignSegmentsToVideoTimeline, filterEmptySegments, VAD_FALLBACK_SILENT_CHUNKS } from '../../src/application/strategies/realtime-asr-strategy';
 import type { AudioSourceProvider, AudioSourceHandle, AudioChunk } from '../../src/domain/models/audio';
 import type { ASRProvider } from '../../src/domain/ports/asr-provider';
 import type { TranslationProvider } from '../../src/domain/ports/translation-provider';
 import type { PlatformAdapter } from '../../src/domain/ports/platform-adapter';
 import type { StrategyContext } from '../../src/domain/ports/caption-strategy';
 import type { EngineConfig } from '../../src/domain/models/config';
+import type { SubtitleSegment } from '../../src/domain/models/subtitle';
+
+// M2-58：mock 診斷模塊（passthrough + spy），供 VAD 兜底斷言 recordDiagnostic 調用。
+vi.mock('../../src/infrastructure/diagnostics', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/infrastructure/diagnostics')>();
+  return {
+    ...actual,
+    recordDiagnostic: vi.fn(async (e: Parameters<typeof actual.recordDiagnostic>[0]) =>
+      actual.recordDiagnostic(e)
+    ),
+  };
+});
+import { recordDiagnostic } from '../../src/infrastructure/diagnostics';
 
 function createMockChunk(seq = 0): AudioChunk {
   return {
@@ -166,5 +179,234 @@ describe('RealtimeASRStrategy — M2-53 deps 未注入回歸', () => {
     };
     const result = await strategy.isApplicable(ctx);
     expect(result).toBe(true);
+  });
+});
+
+// M2-58：時間軸對齊 + 空 segment 過濾（純函數）。
+describe('M2-58 alignSegmentsToVideoTimeline / filterEmptySegments', () => {
+  it('align：segment 時間戳加上 chunk 視頻起點（chunk-relative → video-absolute）', () => {
+    const segments: SubtitleSegment[] = [
+      { id: '1', sourceText: 'hello', start: 1000, end: 2000 },
+      { id: '2', sourceText: 'world', start: 3000, end: 4000 },
+    ];
+    const aligned = alignSegmentsToVideoTimeline(segments, 5000);
+    expect(aligned[0].start).toBe(6000);
+    expect(aligned[0].end).toBe(7000);
+    expect(aligned[1].start).toBe(8000);
+    expect(aligned[1].end).toBe(9000);
+    // 其餘字段保留。
+    expect(aligned[0].sourceText).toBe('hello');
+  });
+
+  it('align：負偏移 clamp ≥0（播放狀態未觀察到時不產生負時間）', () => {
+    const segments: SubtitleSegment[] = [
+      { id: '1', sourceText: 'x', start: 50, end: 200 },
+    ];
+    const aligned = alignSegmentsToVideoTimeline(segments, -100);
+    expect(aligned[0].start).toBe(0);
+    expect(aligned[0].end).toBe(100);
+  });
+
+  it('align：空數組回傳空數組', () => {
+    expect(alignSegmentsToVideoTimeline([], 1234)).toEqual([]);
+  });
+
+  it('filter：sourceText 與 translatedText 皆空 → 移除', () => {
+    const segments: SubtitleSegment[] = [
+      { id: '1', sourceText: '', start: 0, end: 100 },
+      { id: '2', sourceText: '  ', translatedText: '', start: 100, end: 200 },
+    ];
+    expect(filterEmptySegments(segments)).toEqual([]);
+  });
+
+  it('filter：sourceText 非空 → 保留（即使無翻譯）', () => {
+    const segments: SubtitleSegment[] = [
+      { id: '1', sourceText: 'hello', start: 0, end: 100 },
+    ];
+    expect(filterEmptySegments(segments)).toHaveLength(1);
+  });
+
+  it('filter：sourceText 空但 translatedText 非空 → 保留', () => {
+    const segments: SubtitleSegment[] = [
+      { id: '1', sourceText: '', translatedText: '你好', start: 0, end: 100 },
+    ];
+    expect(filterEmptySegments(segments)).toHaveLength(1);
+  });
+});
+
+// M2-58：策略級——VAD 兜底 + 時間軸對齊 + 空 segment 跳過。
+describe('RealtimeASRStrategy — M2-58 VAD 兜底與時間軸對齊', () => {
+  let strategy: RealtimeASRStrategy;
+  let mockAudioSource: AudioSourceProvider;
+  let mockHandle: AudioSourceHandle;
+  let mockASR: ASRProvider;
+  let mockTranslation: TranslationProvider;
+  let chunkCallback: ((chunk: AudioChunk) => void) | null = null;
+
+  /** 常幅 PCM chunk（rms = amplitude）。 */
+  function makeChunk(seq: number, amplitude: number): AudioChunk {
+    const pcm = new Float32Array(80_000);
+    pcm.fill(amplitude);
+    return { seq, startTime: 0, duration: 5000, sampleRate: 16_000, channels: 1, pcm, isSpeech: true };
+  }
+
+  function makeContext(currentTimeMs: number): StrategyContext {
+    return {
+      platform: {} as PlatformAdapter,
+      playback: () => ({ currentTime: currentTimeMs, playing: true, rate: 1, duration: 100_000, buffered: [] }),
+      config: {
+        asr: { type: 'local-whisper', modelTier: 'base', vadThreshold: 0.01 },
+        targetLang: 'zh-Hant',
+      } as EngineConfig,
+      asr: {} as ASRProvider,
+      translation: {} as TranslationProvider,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    strategy = new RealtimeASRStrategy();
+    mockHandle = {
+      kind: 'tab-capture',
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    mockAudioSource = {
+      kind: 'tab-capture',
+      open: vi.fn().mockResolvedValue(mockHandle),
+      onChunk: vi.fn((cb) => { chunkCallback = cb; }),
+    };
+    mockASR = {
+      engineId: 'test-asr',
+      location: 'local',
+      warmup: vi.fn().mockResolvedValue(undefined),
+      transcribe: vi.fn().mockResolvedValue({
+        segments: [{ id: '1', sourceText: 'hello', start: 1000, end: 2000 }],
+        isPartial: false,
+        rtf: 0.5,
+      }),
+    };
+    mockTranslation = {
+      engineId: 'test-llm',
+      location: 'cloud',
+      translate: vi.fn().mockResolvedValue({
+        engineId: 'test-llm',
+        degraded: false,
+        segments: [{ id: '1', sourceText: 'hello', translatedText: '你好', targetLang: 'zh-Hant', start: 1000, end: 2000 }],
+      }),
+    };
+    strategy.inject({
+      audioSource: mockAudioSource,
+      asrProvider: mockASR,
+      translationProvider: mockTranslation,
+      vadThreshold: 0.01,
+    });
+    chunkCallback = null;
+  });
+
+  it('VAD 兜底：連續 N 塊全被過濾 → 落 vad-filtering-all 診斷並放寬閾值（低音量視頻不再永久靜音）', async () => {
+    const ctx = makeContext(0);
+    await strategy.run(ctx, () => {});
+
+    // 餵入 VAD_FALLBACK_SILENT_CHUNKS 塊全零 PCM（rms=0 < 0.01）。
+    for (let i = 0; i < VAD_FALLBACK_SILENT_CHUNKS; i++) {
+      chunkCallback!(makeChunk(i, 0));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+
+    // §5.6：兜底必須落診斷（reason 含 vad-filtering-all）。
+    const degradedCalls = (recordDiagnostic as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0]?.type === 'engine-degraded'
+    );
+    expect(degradedCalls.length).toBe(1);
+    expect((degradedCalls[0][0] as { reason: string }).reason).toContain('vad-filtering-all');
+
+    // 放寬後（0.01 → 0.005）：rms=0.006 的塊應通過 VAD → ASR 被調用。
+    chunkCallback!(makeChunk(VAD_FALLBACK_SILENT_CHUNKS, 0.006));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mockASR.transcribe).toHaveBeenCalledTimes(1);
+
+    // 兜底單次（armed）：再餵 N 塊靜音不重複落診斷。
+    for (let i = 0; i < VAD_FALLBACK_SILENT_CHUNKS; i++) {
+      chunkCallback!(makeChunk(100 + i, 0));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    const degradedCalls2 = (recordDiagnostic as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0]?.type === 'engine-degraded'
+    );
+    expect(degradedCalls2.length).toBe(1);
+    strategy.stop();
+  });
+
+  it('時間軸對齊：ASR segment（chunk-relative）+ chunk 視頻起點 → segments-ready 為視頻絕對時間', async () => {
+    // 視頻已播到 10s；chunk duration 5s → chunk 覆蓋 [5s, 10s]。
+    const ctx = makeContext(10_000);
+    const events: Array<{ type: string; segments?: SubtitleSegment[] }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    // rms=0.1 > 0.01 → 通過 VAD。
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ready = events.find((e) => e.type === 'segments-ready');
+    expect(ready).toBeDefined();
+    // ASR 回傳 start=1000/end=2000（chunk-relative）+ chunkStart=5000 → 6000/7000。
+    expect(ready!.segments![0].start).toBe(6000);
+    expect(ready!.segments![0].end).toBe(7000);
+    strategy.stop();
+  });
+
+  it('空 segment：ASR 回傳全空文本 → 不 emit segments-ready（避免空白 cue）', async () => {
+    (mockASR.transcribe as ReturnType<typeof vi.fn>).mockResolvedValue({
+      segments: [{ id: '1', sourceText: '', start: 0, end: 1000 }],
+      isPartial: false,
+      rtf: 0.5,
+    });
+    (mockTranslation.translate as ReturnType<typeof vi.fn>).mockResolvedValue({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: '1', sourceText: '', translatedText: '', targetLang: 'zh-Hant', start: 0, end: 1000 }],
+    });
+    const ctx = makeContext(10_000);
+    const events: Array<{ type: string }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(events.some((e) => e.type === 'segments-ready' || e.type === 'segments-updated')).toBe(false);
+    strategy.stop();
+  });
+
+  it('stop() 重置 VAD 兜底狀態（restart 路徑不繼承舊會話的放寬/計數）', async () => {
+    const ctx = makeContext(0);
+    await strategy.run(ctx, () => {});
+    // 觸發一次兜底。
+    for (let i = 0; i < VAD_FALLBACK_SILENT_CHUNKS; i++) {
+      chunkCallback!(makeChunk(i, 0));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    expect(
+      (recordDiagnostic as ReturnType<typeof vi.fn>).mock.calls.some(
+        (c: unknown[]) => c[0]?.type === 'engine-degraded'
+      )
+    ).toBe(true);
+
+    // stop + 重新 run（模擬 restart；orchestrator 會重新 inject，此處直接驗證 stop 重置）。
+    strategy.stop();
+    vi.clearAllMocks();
+    await strategy.run(ctx, () => {});
+
+    // 新會話：餵入 N-1 塊靜音（未達兜底門檻）→ 不該有 engine-degraded。
+    for (let i = 0; i < VAD_FALLBACK_SILENT_CHUNKS - 1; i++) {
+      chunkCallback!(makeChunk(i, 0));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    expect(
+      (recordDiagnostic as ReturnType<typeof vi.fn>).mock.calls.some(
+        (c: unknown[]) => c[0]?.type === 'engine-degraded'
+      )
+    ).toBe(false);
+    strategy.stop();
   });
 });

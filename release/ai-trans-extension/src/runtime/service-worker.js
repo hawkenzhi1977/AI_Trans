@@ -9,6 +9,7 @@ var DEBUG_LOG_OFF = {
   bridge: false,
   interceptor: false,
   "local-onnx": false,
+  audio: false,
   popup: false
 };
 var DEFAULT_CONFIG = {

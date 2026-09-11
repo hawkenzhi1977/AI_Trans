@@ -6,6 +6,7 @@ import type { ASRConfig } from '../../domain/models/config';
 import type { ASRRequest, ASRResult } from '../../domain/models/asr';
 import type { SubtitleSegment } from '../../domain/models/subtitle';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
+import { encodePcmFloat32 } from '../../infrastructure/pcm-encoding';
 
 /** Whisper 模型檔位映射（HuggingFace Hub 模型 ID）。 */
 const WHISPER_MODELS: Record<string, string> = {
@@ -132,7 +133,7 @@ export class LocalWhisperASR implements ASRProvider {
       const response = await sendMessageWithTimeout({
         topic: 'asr-whisper:transcribe',
         payload: {
-          pcm: chunk.pcm,
+          pcm: encodePcmFloat32(chunk.pcm),
           sampleRate: chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1000)) : 16000,
           hintLang,
         },
@@ -215,7 +216,7 @@ export class LocalWhisperASR implements ASRProvider {
     const response = await sendMessageWithTimeout({
       topic: 'asr-whisper:transcribe',
       payload: {
-        pcm: chunk.pcm,
+        pcm: encodePcmFloat32(chunk.pcm),
         sampleRate,
         hintLang,
       },

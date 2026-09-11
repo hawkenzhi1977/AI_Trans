@@ -19,6 +19,8 @@ import type { AudioSourceHandle } from '../../domain/models/audio';
 import type { AudioChunk } from '../../domain/models/audio';
 import type { PlatformAdapter } from '../../domain/ports/platform-adapter';
 import { recordDiagnostic } from '../../infrastructure/diagnostics';
+import { diagLog } from '../../infrastructure/debug-log';
+import { decodePcmFloat32 } from '../../infrastructure/pcm-encoding';
 
 /** Offscreen Document 接收的消息類型。 */
 type OffscreenRequest =
@@ -29,7 +31,7 @@ type OffscreenRequest =
 type OffscreenResponse =
   | { type: 'captureStarted' }
   | { type: 'captureStopped' }
-  | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
+  | { type: 'audioChunk'; pcm: string; sampleRate: number; timestamp: number }
   // M2-55：error 帶結構化 code，讓 adapter 精確區分「需重取 streamId」與一般捕獲失敗。
   // - need-stream-id：offscreen 無 MediaStream 且未收到 streamId（複用探測失敗，觸發自動重取）。
   // - capture-failed：getUserMedia / 音頻處理拋錯。
@@ -129,6 +131,10 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
   private streamIdAcquirer: StreamIdAcquirer | null = null;
   // M2-55：待決的捕獲握手 resolver（start() 等待 captureStarted/error；handleMessage 解決它）。
   private pendingStart: ((r: HandshakeResult) => void) | null = null;
+  // M2-58：audioChunk 接收統計（§5.6 breadcrumb）——首塊 + 5s 窗口計數，
+  // 區分「offscreen 未送出」與「已送達但下游丟棄」（chunkCallback 缺失時統計仍可見）。
+  private receivedChunkCount = 0;
+  private chunkWindowStart = 0;
 
   /** 注入 in-memory streamId 提供者（由 composition.ts 在組裝時傳入）。 */
   setStreamIdProvider(provider: TabStreamIdProvider): void {
@@ -363,6 +369,8 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
     // 不再發 offscreen:idle-close——空閒計時由 offscreen 自管（10 分鐘空閒後自行完整釋放）。
     // 這樣下次 start() 可複用已有 MediaStream，繞開 streamId TTL。
     seqCounter = 0; // 重置序號計數器。
+    this.receivedChunkCount = 0; // M2-58：重置接收統計，避免跨會話累積誤讀。
+    this.chunkWindowStart = 0;
   }
 
   /** 處理來自 Offscreen Document 的消息。 */
@@ -378,15 +386,34 @@ export class TabCaptureAudioSource implements AudioSourceProvider {
         break;
       }
       case 'audioChunk': {
+        // M2-59：base64 → Float32Array（修復 extension messaging 對 typed array 序列化損毀）。
+        const pcm = decodePcmFloat32(msg.pcm);
+        // M2-58：接收 breadcrumb（§5.6）——先計數再判 callback，
+        // chunkCallback 缺失（靜默丟棄）時統計仍可見，不再無聲。
+        this.receivedChunkCount++;
+        if (this.receivedChunkCount === 1) {
+          diagLog(
+            'audio',
+            'first audioChunk received from offscreen (samples:', pcm.length, ', sampleRate:', msg.sampleRate, ')',
+          );
+        } else {
+          const now = performance.now();
+          if (this.chunkWindowStart === 0) this.chunkWindowStart = now;
+          if (now - this.chunkWindowStart >= 5000) {
+            diagLog('audio', `audioChunk stats — received=${this.receivedChunkCount} (last 5s)`);
+            this.receivedChunkCount = 0;
+            this.chunkWindowStart = now;
+          }
+        }
         if (!this.chunkCallback) return;
         // 構造 AudioChunk（VAD 標記由下游 EnergyVAD 處理）。
         const chunk: AudioChunk = {
           seq: seqCounter++,
           startTime: 0, // Offscreen 無法獲取視頻時間軸，由下游對齊。
-          duration: (msg.pcm.length / msg.sampleRate) * 1000, // ms
+          duration: (pcm.length / msg.sampleRate) * 1000, // ms
           sampleRate: msg.sampleRate,
           channels: 1,
-          pcm: msg.pcm,
+          pcm,
           isSpeech: true, // 默認 true，VAD 會重新標記。
         };
         this.chunkCallback(chunk);

@@ -4,6 +4,7 @@
 // 同時負責本地 ONNX 翻譯模型的推理（Transformers.js + ONNX Runtime Web）。
 import { recordDiagnostic } from '../infrastructure/diagnostics';
 import { IdleTimeout } from '../infrastructure/idle-timeout';
+import { encodePcmFloat32, decodePcmFloat32 } from '../infrastructure/pcm-encoding';
 import { LOCAL_ONNX_MODEL } from '../domain/models/config';
 import OpenCC from 'opencc-js';
 
@@ -23,13 +24,13 @@ type OffscreenRequest =
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
   | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } }
   | { type: 'asr-whisper:warmup'; payload: { modelId: string } }
-  | { type: 'asr-whisper:transcribe'; payload: { pcm: Float32Array; sampleRate: number; hintLang?: string } };
+  | { type: 'asr-whisper:transcribe'; payload: { pcm: string; sampleRate: number; hintLang?: string } };
 
 /** Offscreen Document 發送的響應類型。 */
 type OffscreenResponse =
   | { type: 'captureStarted' }
   | { type: 'captureStopped' }
-  | { type: 'audioChunk'; pcm: Float32Array; sampleRate: number; timestamp: number }
+  | { type: 'audioChunk'; pcm: string; sampleRate: number; timestamp: number }
   // M2-55：error 帶結構化 code，讓 content-script 精確區分「需重取 streamId」與一般捕獲失敗。
   // - need-stream-id：offscreen 無 MediaStream 且未收到 streamId（複用探測失敗，需重新授權/重取）。
   // - capture-failed：getUserMedia / 音頻處理拋錯。
@@ -295,9 +296,28 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
     const source = audioContext.createMediaStreamSource(mediaStream);
     mediaStreamSource = source;
 
+    // M2-58：防禦性 resume + state breadcrumb（§5.6）。
+    // 若 autoplay policy 將 context suspend，onaudioprocess 永不觸發 →
+    // 「captureStarted 但無 audioChunk」的無聲失敗。resume() 在已運行時為 no-op；
+    // 記錄 state 讓排障時能直接判定 context 是否被 suspend。
+    void audioContext.resume().catch((err) => {
+      console.warn('[AI_Trans] offscreen: audioContext resume failed:', err);
+    });
+    void passthroughContext.resume().catch((err) => {
+      console.warn('[AI_Trans] offscreen: passthroughContext resume failed:', err);
+    });
+    console.warn(
+      `[AI_Trans] offscreen: audioContext state=${audioContext.state}, passthroughContext state=${passthroughContext.state}`,
+    );
+
     // ScriptProcessorNode 提取 PCM 數據（16kHz mono）。
     // bufferSize 4096 ≈ 256ms @ 16kHz，平衡延遲與 CPU。
     scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    // M2-58：音頻數據路徑 breadcrumb——首塊 + 5s 窗口統計（§5.6）。
+    // 區分「context 未產出 chunk」與「有 chunk 但內容靜音」兩類失敗。
+    let sentChunkCount = 0;
+    let windowMaxRms = 0;
+    let windowStart = performance.now();
     scriptProcessor.onaudioprocess = (event) => {
       const portRef = currentPort;
       if (!portRef) return;
@@ -307,11 +327,29 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
       // 複製 Float32Array（事件回收後數據失效）。
       const pcm = new Float32Array(inputData.length);
       pcm.set(inputData);
+      // RMS 統計（複用已複製數據，不二次掃描 inputData）。
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+      const rms = Math.sqrt(sum / pcm.length);
+      sentChunkCount++;
+      if (rms > windowMaxRms) windowMaxRms = rms;
+      if (sentChunkCount === 1) {
+        console.warn(`[AI_Trans] offscreen: first audioChunk sent (rms=${rms.toFixed(5)}, samples=${pcm.length})`);
+      }
+      const now = performance.now();
+      if (now - windowStart >= 5000) {
+        console.warn(
+          `[AI_Trans] offscreen: audioChunk stats — sent=${sentChunkCount}, maxRms=${windowMaxRms.toFixed(5)} (last 5s)`,
+        );
+        sentChunkCount = 0;
+        windowMaxRms = 0;
+        windowStart = now;
+      }
       const response: OffscreenResponse = {
         type: 'audioChunk',
-        pcm,
+        pcm: encodePcmFloat32(pcm),
         sampleRate: audioContext?.sampleRate ?? 16000,
-        timestamp: performance.now(),
+        timestamp: now,
       };
       portRef.postMessage(response);
     };
@@ -542,9 +580,9 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender) => {
         busyCount = Math.max(0, busyCount - 1);
         return false;
       }
-      const transcribeMsg = message as { topic?: string; payload?: { pcm?: Float32Array; sampleRate?: number; hintLang?: string } };
+      const transcribeMsg = message as { topic?: string; payload?: { pcm?: string; sampleRate?: number; hintLang?: string } };
       void runAsrInference(
-        transcribeMsg.payload?.pcm ?? new Float32Array(0),
+        decodePcmFloat32(transcribeMsg.payload?.pcm ?? ''),
         transcribeMsg.payload?.sampleRate ?? 16000,
         transcribeMsg.payload?.hintLang
       ).then(broadcast);
@@ -568,7 +606,7 @@ function connectToServiceWorker(): void {
       topic?: string;
       type?: string;
       messageId?: string;
-      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: Float32Array; sampleRate?: number; hintLang?: string };
+      payload?: { text?: string; targetLang?: string; sourceLang?: string; modelId?: string; pcm?: string; sampleRate?: number; hintLang?: string };
       text?: string;
       targetLang?: string;
       sourceLang?: string;
@@ -631,9 +669,9 @@ function connectToServiceWorker(): void {
           broadcastToAll(result as OffscreenResponse);
           break;
         case 'asr-whisper:transcribe': {
-          const pcmData = msg.payload?.pcm as Float32Array | undefined;
+          const pcmData = decodePcmFloat32(msg.payload?.pcm ?? '');
           result = await runAsrInference(
-            pcmData ?? new Float32Array(0),
+            pcmData,
             (msg.payload?.sampleRate as number) ?? 16000,
             msg.payload?.hintLang as string | undefined
           );
@@ -2200,4 +2238,18 @@ export const _testExports = {
   calcUniqueNgramRatio,
   // 清理舊模型快取（供測試驗證）。
   clearCacheForModel,
+  // M2-58：音頻捕獲（供測試驗證防禦性 resume / state breadcrumb / onaudioprocess 統計）。
+  startCapture,
+  resetCaptureModuleForTest,
 };
+
+/** M2-58：重置音頻捕獲模組狀態（供測試間隔離，避免 MediaStream/context 跨測試污染）。 */
+function resetCaptureModuleForTest(): void {
+  mediaStream = null;
+  mediaStreamSource = null;
+  audioContext = null;
+  scriptProcessor = null;
+  currentPort = null;
+  passthroughContext = null;
+  passthroughSource = null;
+}

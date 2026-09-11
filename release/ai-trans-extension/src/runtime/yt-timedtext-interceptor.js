@@ -11,6 +11,7 @@
     bridge: false,
     interceptor: false,
     "local-onnx": false,
+    audio: false,
     popup: false
   };
 

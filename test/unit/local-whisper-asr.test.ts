@@ -5,6 +5,7 @@ import { LocalWhisperASR } from '../../src/adapters/asr/local-whisper';
 import type { ASRConfig } from '../../src/domain/models/config';
 import type { ASRRequest } from '../../src/domain/models/asr';
 import type { AudioChunk } from '../../src/domain/models/audio';
+import { encodePcmFloat32 } from '../../src/infrastructure/pcm-encoding';
 
 // Mock chrome.runtime.sendMessage
 const mockSendMessage = vi.fn();
@@ -110,7 +111,7 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     expect(mockSendMessage).toHaveBeenLastCalledWith({
       topic: 'asr-whisper:transcribe',
       payload: {
-        pcm: chunk.pcm,
+        pcm: encodePcmFloat32(chunk.pcm),
         sampleRate: 16000,
         hintLang: 'en',
       },

@@ -105,6 +105,7 @@
     bridge: false,
     interceptor: false,
     "local-onnx": false,
+    audio: false,
     popup: false
   };
   var DEFAULT_CONFIG = {
@@ -297,6 +298,14 @@
     reset() {
       this.silenceStartTime = null;
     }
+    /** M2-58：動態調整 RMS 閾值（策略在持續過濾時兜底放寬用）。 */
+    setThreshold(threshold) {
+      this.config.threshold = threshold;
+    }
+    /** M2-58：讀取當前閾值（診斷/測試用）。 */
+    getThreshold() {
+      return this.config.threshold;
+    }
     /**
      * 標記 AudioChunk 的 isSpeech 字段（批量處理）。
      * @param chunk 待標記的音頻塊。
@@ -454,6 +463,19 @@
   }
 
   // src/application/strategies/realtime-asr-strategy.ts
+  var VAD_FALLBACK_SILENT_CHUNKS = 40;
+  function alignSegmentsToVideoTimeline(segments, chunkStartMs) {
+    return segments.map((s) => ({
+      ...s,
+      start: Math.max(0, s.start + chunkStartMs),
+      end: Math.max(0, s.end + chunkStartMs)
+    }));
+  }
+  function filterEmptySegments(segments) {
+    return segments.filter(
+      (s) => s.sourceText.trim().length > 0 || (s.translatedText ?? "").trim().length > 0
+    );
+  }
   var RealtimeASRStrategy = class {
     origin = "realtime-asr";
     deps = null;
@@ -463,10 +485,25 @@
     unsubscribeChunk = null;
     downgradeCheckInterval = null;
     audioHandle = null;
+    // M2-58：VAD 統計與兜底（§5.6——「chunk 全被過濾」必須留痕，不得靜默）。
+    baseVadThreshold = 0.01;
+    consecutiveSilentChunks = 0;
+    vadFallbackArmed = false;
+    vadWindowReceived = 0;
+    vadWindowPassed = 0;
+    vadWindowMaxRms = 0;
+    vadSessionMaxRms = 0;
+    vadWindowStart = 0;
+    // M2-58：ASR 調用計數（首調 breadcrumb——確認 VAD→ASR 交接真的發生）。
+    asrCallCount = 0;
     /** 注入依賴（由 Orchestrator 調用）。 */
     inject(deps) {
       this.deps = deps;
-      this.vad = new EnergyVAD({ threshold: deps.vadThreshold ?? 0.01 });
+      this.baseVadThreshold = deps.vadThreshold ?? 0.01;
+      this.consecutiveSilentChunks = 0;
+      this.vadFallbackArmed = false;
+      this.asrCallCount = 0;
+      this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
       this.perf = new PerfMetrics(100);
     }
     async isApplicable(ctx) {
@@ -529,8 +566,46 @@
       audioSource.onChunk(async (chunk) => {
         if (!this.running) return;
         if (asrProvider.isReady && !asrProvider.isReady()) return;
-        this.vad.markChunk(chunk);
-        if (!chunk.isSpeech) return;
+        const videoNow = ctx.playback().currentTime;
+        chunk.startTime = Math.max(0, videoNow - chunk.duration);
+        const vadResult = this.vad.process(chunk.pcm, chunk.sampleRate, performance.now());
+        chunk.isSpeech = vadResult.isSpeech;
+        this.vadWindowReceived++;
+        if (vadResult.rms > this.vadWindowMaxRms) this.vadWindowMaxRms = vadResult.rms;
+        if (vadResult.rms > this.vadSessionMaxRms) this.vadSessionMaxRms = vadResult.rms;
+        if (vadResult.isSpeech) this.vadWindowPassed++;
+        const vadNow = performance.now();
+        if (this.vadWindowStart === 0) this.vadWindowStart = vadNow;
+        if (vadNow - this.vadWindowStart >= 5e3) {
+          diagLog(
+            "strategy",
+            `realtime-asr: VAD window \u2014 received=${this.vadWindowReceived}, passed=${this.vadWindowPassed}, maxRms=${this.vadWindowMaxRms.toFixed(5)} (last 5s)`
+          );
+          this.vadWindowReceived = 0;
+          this.vadWindowPassed = 0;
+          this.vadWindowMaxRms = 0;
+          this.vadWindowStart = vadNow;
+        }
+        if (!vadResult.isSpeech) {
+          this.consecutiveSilentChunks++;
+          if (!this.vadFallbackArmed && this.consecutiveSilentChunks >= VAD_FALLBACK_SILENT_CHUNKS) {
+            const relaxed = this.baseVadThreshold / 2;
+            this.vad.setThreshold(relaxed);
+            this.vadFallbackArmed = true;
+            recordDiagnostic({
+              type: "engine-degraded",
+              port: "asr",
+              reason: `vad-filtering-all: ${this.consecutiveSilentChunks} consecutive chunks below threshold (${this.baseVadThreshold} -> ${relaxed}), sessionMaxRms=${this.vadSessionMaxRms.toFixed(5)}; threshold relaxed`
+            });
+            diagLog("strategy", `realtime-asr: VAD fallback armed \u2014 threshold relaxed ${this.baseVadThreshold} -> ${relaxed}`);
+          }
+          return;
+        }
+        this.consecutiveSilentChunks = 0;
+        this.asrCallCount++;
+        if (this.asrCallCount === 1) {
+          diagLog("strategy", `realtime-asr: first ASR dispatch (seq=${chunk.seq}, chunkMs=${Math.round(chunk.duration)})`);
+        }
         try {
           const req = {
             chunk,
@@ -553,6 +628,10 @@
                 type: "metrics",
                 data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
               });
+              diagLog(
+                "strategy",
+                `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${asrResult.segments.reduce((n, s) => n + s.sourceText.length, 0)}`
+              );
               const translateStart = performance.now();
               const translatedSegments = await this.translateSegments(
                 asrResult.segments,
@@ -566,10 +645,7 @@
                 data: { stage: "translate", ms: translateMs, seq: chunk.seq }
               });
               if (!this.running) return;
-              emit({
-                type: asrResult.isPartial ? "segments-updated" : "segments-ready",
-                segments: translatedSegments
-              });
+              this.emitAligned(asrResult, translatedSegments, chunk, emit);
             });
           } else {
             const asrResult = await asrProvider.transcribe(req);
@@ -598,10 +674,7 @@
               data: { stage: "translate", ms: translateMs, seq: chunk.seq }
             });
             if (!this.running) return;
-            emit({
-              type: "segments-ready",
-              segments: translatedSegments
-            });
+            this.emitAligned(asrResult, translatedSegments, chunk, emit);
           }
         } catch (err) {
           recordDiagnostic({
@@ -629,6 +702,14 @@
       this.unsubscribeChunk?.();
       this.unsubscribeChunk = null;
       this.vad?.reset();
+      this.consecutiveSilentChunks = 0;
+      this.vadFallbackArmed = false;
+      this.vadWindowReceived = 0;
+      this.vadWindowPassed = 0;
+      this.vadWindowMaxRms = 0;
+      this.vadSessionMaxRms = 0;
+      this.vadWindowStart = 0;
+      this.asrCallCount = 0;
       if (this.downgradeCheckInterval !== null) {
         clearInterval(this.downgradeCheckInterval);
         this.downgradeCheckInterval = null;
@@ -655,6 +736,20 @@
         targetLang: "zh-Hant"
       });
       return result.segments;
+    }
+    /**
+     * M2-58：對齊 + 過濾後推送。全空時跳過 emit（留 breadcrumb，§5.6 不靜默）。
+     * chunk.startTime 已在 onChunk 以播放狀態反推（視頻時間軸）。
+     */
+    emitAligned(asrResult, translatedSegments, chunk, emit) {
+      const segments = filterEmptySegments(
+        alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime)
+      );
+      if (segments.length === 0) {
+        diagLog("strategy", `realtime-asr: ASR returned no usable text (seq=${chunk.seq}), skipping emit`);
+        return;
+      }
+      emit({ type: asrResult.isPartial ? "segments-updated" : "segments-ready", segments });
     }
     /** 獲取性能統計摘要（用於觀測與調試）。 */
     getPerfSummary() {
@@ -2905,6 +3000,35 @@ Example output:
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
+  // src/infrastructure/pcm-encoding.ts
+  function encodePcmFloat32(pcm) {
+    const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    let binary = "";
+    const chunkSize = 32768;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+  function decodePcmFloat32(encoded) {
+    if (typeof encoded !== "string" || encoded.length === 0) return new Float32Array(0);
+    try {
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const usable = bytes.length - bytes.length % 4;
+      if (usable === 0) return new Float32Array(0);
+      const view = new DataView(bytes.buffer, 0, usable);
+      const out = new Float32Array(usable / 4);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = view.getFloat32(i * 4, true);
+      }
+      return out;
+    } catch {
+      return new Float32Array(0);
+    }
+  }
+
   // src/adapters/audio/tab-capture-source.ts
   var CHROME_API_TIMEOUT_MS = 5e3;
   var CAPTURE_HANDSHAKE_TIMEOUT_MS = 1e4;
@@ -2943,6 +3067,10 @@ Example output:
     streamIdAcquirer = null;
     // M2-55：待決的捕獲握手 resolver（start() 等待 captureStarted/error；handleMessage 解決它）。
     pendingStart = null;
+    // M2-58：audioChunk 接收統計（§5.6 breadcrumb）——首塊 + 5s 窗口計數，
+    // 區分「offscreen 未送出」與「已送達但下游丟棄」（chunkCallback 缺失時統計仍可見）。
+    receivedChunkCount = 0;
+    chunkWindowStart = 0;
     /** 注入 in-memory streamId 提供者（由 composition.ts 在組裝時傳入）。 */
     setStreamIdProvider(provider) {
       this.streamIdProvider = provider;
@@ -3136,6 +3264,8 @@ Example output:
         this.pendingStart({ kind: "error", message: "capture stopped before handshake completed" });
       }
       seqCounter = 0;
+      this.receivedChunkCount = 0;
+      this.chunkWindowStart = 0;
     }
     /** 處理來自 Offscreen Document 的消息。 */
     handleMessage(msg) {
@@ -3148,16 +3278,36 @@ Example output:
           break;
         }
         case "audioChunk": {
+          const pcm = decodePcmFloat32(msg.pcm);
+          this.receivedChunkCount++;
+          if (this.receivedChunkCount === 1) {
+            diagLog(
+              "audio",
+              "first audioChunk received from offscreen (samples:",
+              pcm.length,
+              ", sampleRate:",
+              msg.sampleRate,
+              ")"
+            );
+          } else {
+            const now = performance.now();
+            if (this.chunkWindowStart === 0) this.chunkWindowStart = now;
+            if (now - this.chunkWindowStart >= 5e3) {
+              diagLog("audio", `audioChunk stats \u2014 received=${this.receivedChunkCount} (last 5s)`);
+              this.receivedChunkCount = 0;
+              this.chunkWindowStart = now;
+            }
+          }
           if (!this.chunkCallback) return;
           const chunk = {
             seq: seqCounter++,
             startTime: 0,
             // Offscreen 無法獲取視頻時間軸，由下游對齊。
-            duration: msg.pcm.length / msg.sampleRate * 1e3,
+            duration: pcm.length / msg.sampleRate * 1e3,
             // ms
             sampleRate: msg.sampleRate,
             channels: 1,
-            pcm: msg.pcm,
+            pcm,
             isSpeech: true
             // 默認 true，VAD 會重新標記。
           };
@@ -3554,7 +3704,7 @@ Example output:
         const response = await sendMessageWithTimeout({
           topic: "asr-whisper:transcribe",
           payload: {
-            pcm: chunk.pcm,
+            pcm: encodePcmFloat32(chunk.pcm),
             sampleRate: chunk.duration > 0 ? Math.round(chunk.pcm.length / (chunk.duration / 1e3)) : 16e3,
             hintLang
           }
@@ -3627,7 +3777,7 @@ Example output:
       const response = await sendMessageWithTimeout({
         topic: "asr-whisper:transcribe",
         payload: {
-          pcm: chunk.pcm,
+          pcm: encodePcmFloat32(chunk.pcm),
           sampleRate,
           hintLang
         }

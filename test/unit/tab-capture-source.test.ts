@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { resetChromeMock } from '../support/setup-dom';
 import { TabCaptureAudioSource } from '../../src/adapters/audio/tab-capture-source';
 import type { TabStreamIdProvider, StreamIdAcquirer } from '../../src/adapters/audio/tab-capture-source';
+import { setDebugFlags } from '../../src/infrastructure/debug-log';
+import { encodePcmFloat32 } from '../../src/infrastructure/pcm-encoding';
 
 // M2-46：TabCaptureAudioSource 使用 in-memory streamId provider（不落 storage）。
 // streamId 由 popup 透過 tabs.sendMessage 直接交付 content-script 記憶體，
@@ -415,5 +417,80 @@ describe('TabCaptureAudioSource — in-memory streamId provider（M2-46）', () 
     // 且 handler 對重複調用安全——避免 offscreen 消息在 stop→start 間隙被舊監聽器誤處理）。
     expect(ports[0].onMessage.addListener).toHaveBeenCalledTimes(1);
     expect(ports[1].onMessage.addListener).toHaveBeenCalledTimes(1);
+  });
+});
+
+// M2-58：audioChunk 接收 breadcrumb（§5.6——「chunk 到沒到 content-script」必須可觀測）。
+describe('TabCaptureAudioSource — M2-58 audioChunk 接收 breadcrumb', () => {
+  let source: TabCaptureAudioSource;
+  let handle: Awaited<ReturnType<TabCaptureAudioSource['open']>>;
+  let mockPort: ReturnType<typeof makeMockPort>;
+
+  beforeEach(async () => {
+    resetChromeMock();
+    setDebugFlags({ audio: false });
+    source = new TabCaptureAudioSource();
+    source.setStreamIdProvider(makeProvider({ streamId: 'sid' }));
+    handle = await source.open({} as never);
+
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    mockPort = makeMockPort();
+    (chrome.runtime.connect as ReturnType<typeof vi.fn>).mockReturnValue(mockPort);
+
+    const startPromise = handle.start();
+    await new Promise((r) => setTimeout(r, 0));
+    triggerPortMessage(mockPort, { type: 'captureStarted' });
+    await startPromise;
+  });
+
+  afterEach(() => {
+    setDebugFlags({ audio: false });
+  });
+
+  it('audioChunk 消息 → chunkCallback 收到 AudioChunk（seq 遞增、duration 由樣本數計算）', async () => {
+    const chunks: Array<{ seq: number; duration: number; sampleRate: number; pcm: Float32Array }> = [];
+    source.onChunk((c) => chunks.push(c));
+
+    triggerPortMessage(mockPort, { type: 'audioChunk', pcm: encodePcmFloat32(new Float32Array(4096)), sampleRate: 16_000, timestamp: 123 });
+    triggerPortMessage(mockPort, { type: 'audioChunk', pcm: encodePcmFloat32(new Float32Array(4096)), sampleRate: 16_000, timestamp: 234 });
+
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0].seq).toBe(0);
+    expect(chunks[1].seq).toBe(1);
+    // 4096 samples @ 16kHz = 256ms。
+    expect(chunks[0].duration).toBeCloseTo(256);
+    expect(chunks[0].sampleRate).toBe(16_000);
+    expect(chunks[0].pcm).toHaveLength(4096);
+  });
+
+  it('§5.6：chunkCallback 未註冊時仍計數並留 breadcrumb（首塊 diagLog 可見，不再無聲丟棄）', async () => {
+    setDebugFlags({ audio: true });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    // 不調用 source.onChunk（chunkCallback = null）。
+    triggerPortMessage(mockPort, { type: 'audioChunk', pcm: encodePcmFloat32(new Float32Array(4096)), sampleRate: 16_000, timestamp: 1 });
+
+    const firstChunkLogs = logSpy.mock.calls.filter(
+      (c) => typeof c[1] === 'string' && c[1].includes('first audioChunk received')
+    );
+    expect(firstChunkLogs).toHaveLength(1);
+    logSpy.mockRestore();
+  });
+
+  it('stop() 重置接收統計（新會話重新出現首塊 breadcrumb，計數不跨會話累積）', async () => {
+    setDebugFlags({ audio: true });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    triggerPortMessage(mockPort, { type: 'audioChunk', pcm: encodePcmFloat32(new Float32Array(4096)), sampleRate: 16_000, timestamp: 1 });
+    await handle.stop();
+
+    // stop 後再收 chunk（mock port 未觸發 onDisconnect，listener 仍在）→ 計數已重置 → 再見「首塊」。
+    triggerPortMessage(mockPort, { type: 'audioChunk', pcm: encodePcmFloat32(new Float32Array(4096)), sampleRate: 16_000, timestamp: 2 });
+
+    const firstChunkLogs = logSpy.mock.calls.filter(
+      (c) => typeof c[1] === 'string' && c[1].includes('first audioChunk received')
+    );
+    expect(firstChunkLogs).toHaveLength(2);
+    logSpy.mockRestore();
   });
 });

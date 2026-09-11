@@ -48535,6 +48535,35 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   };
 
+  // src/infrastructure/pcm-encoding.ts
+  function encodePcmFloat32(pcm) {
+    const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    let binary = "";
+    const chunkSize = 32768;
+    for (let i2 = 0; i2 < bytes.length; i2 += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i2, i2 + chunkSize));
+    }
+    return btoa(binary);
+  }
+  function decodePcmFloat32(encoded) {
+    if (typeof encoded !== "string" || encoded.length === 0) return new Float32Array(0);
+    try {
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i2 = 0; i2 < binary.length; i2++) bytes[i2] = binary.charCodeAt(i2);
+      const usable = bytes.length - bytes.length % 4;
+      if (usable === 0) return new Float32Array(0);
+      const view = new DataView(bytes.buffer, 0, usable);
+      const out = new Float32Array(usable / 4);
+      for (let i2 = 0; i2 < out.length; i2++) {
+        out[i2] = view.getFloat32(i2 * 4, true);
+      }
+      return out;
+    } catch {
+      return new Float32Array(0);
+    }
+  }
+
   // src/domain/models/config.ts
   var LOCAL_ONNX_MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
 
@@ -48898,7 +48927,19 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       audioContext = new AudioContext({ sampleRate: 16e3 });
       const source = audioContext.createMediaStreamSource(mediaStream);
       mediaStreamSource = source;
+      void audioContext.resume().catch((err) => {
+        console.warn("[AI_Trans] offscreen: audioContext resume failed:", err);
+      });
+      void passthroughContext.resume().catch((err) => {
+        console.warn("[AI_Trans] offscreen: passthroughContext resume failed:", err);
+      });
+      console.warn(
+        `[AI_Trans] offscreen: audioContext state=${audioContext.state}, passthroughContext state=${passthroughContext.state}`
+      );
       scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+      let sentChunkCount = 0;
+      let windowMaxRms = 0;
+      let windowStart = performance.now();
       scriptProcessor.onaudioprocess = (event) => {
         const portRef = currentPort;
         if (!portRef) return;
@@ -48906,11 +48947,28 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         const inputData = event.inputBuffer.getChannelData(0);
         const pcm = new Float32Array(inputData.length);
         pcm.set(inputData);
+        let sum = 0;
+        for (let i2 = 0; i2 < pcm.length; i2++) sum += pcm[i2] * pcm[i2];
+        const rms = Math.sqrt(sum / pcm.length);
+        sentChunkCount++;
+        if (rms > windowMaxRms) windowMaxRms = rms;
+        if (sentChunkCount === 1) {
+          console.warn(`[AI_Trans] offscreen: first audioChunk sent (rms=${rms.toFixed(5)}, samples=${pcm.length})`);
+        }
+        const now = performance.now();
+        if (now - windowStart >= 5e3) {
+          console.warn(
+            `[AI_Trans] offscreen: audioChunk stats \u2014 sent=${sentChunkCount}, maxRms=${windowMaxRms.toFixed(5)} (last 5s)`
+          );
+          sentChunkCount = 0;
+          windowMaxRms = 0;
+          windowStart = now;
+        }
         const response = {
           type: "audioChunk",
-          pcm,
+          pcm: encodePcmFloat32(pcm),
           sampleRate: audioContext?.sampleRate ?? 16e3,
-          timestamp: performance.now()
+          timestamp: now
         };
         portRef.postMessage(response);
       };
@@ -49093,7 +49151,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         }
         const transcribeMsg = message;
         void runAsrInference(
-          transcribeMsg.payload?.pcm ?? new Float32Array(0),
+          decodePcmFloat32(transcribeMsg.payload?.pcm ?? ""),
           transcribeMsg.payload?.sampleRate ?? 16e3,
           transcribeMsg.payload?.hintLang
         ).then(broadcast);
@@ -49159,9 +49217,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             broadcastToAll(result);
             break;
           case "asr-whisper:transcribe": {
-            const pcmData = msg.payload?.pcm;
+            const pcmData = decodePcmFloat32(msg.payload?.pcm ?? "");
             result = await runAsrInference(
-              pcmData ?? new Float32Array(0),
+              pcmData,
               msg.payload?.sampleRate ?? 16e3,
               msg.payload?.hintLang
             );
@@ -50287,8 +50345,20 @@ ${numbered}
     // 退化輸出檢測（供測試驗證 n-gram 唯一率計算）。
     calcUniqueNgramRatio,
     // 清理舊模型快取（供測試驗證）。
-    clearCacheForModel
+    clearCacheForModel,
+    // M2-58：音頻捕獲（供測試驗證防禦性 resume / state breadcrumb / onaudioprocess 統計）。
+    startCapture,
+    resetCaptureModuleForTest
   };
+  function resetCaptureModuleForTest() {
+    mediaStream = null;
+    mediaStreamSource = null;
+    audioContext = null;
+    scriptProcessor = null;
+    currentPort = null;
+    passthroughContext = null;
+    passthroughSource = null;
+  }
 })();
 /*! Bundled license information:
 

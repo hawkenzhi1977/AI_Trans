@@ -244,7 +244,7 @@ export interface AudioChunk {
   duration: Millis;
   sampleRate: number;         // 如 16000
   channels: number;           // 通常單聲道 1
-  pcm: Float32Array;          // 解碼後 PCM（留在 Offscreen，避免跨域拷貝）
+  pcm: Float32Array;          // 解碼後 PCM（domain 內部結構；跨 context 傳輸時以 base64 string 編碼，見 §6.2a）
   isSpeech: boolean;          // VAD 結果：是否含語音
 }
 
@@ -482,6 +482,8 @@ export interface AudioSourceProvider {
 **插拔說明**：二級 `BufferedAudioSource` 若因 YouTube 改版失效 → 上層策略鏈捕獲異常 → 降級到三級 `TabCaptureAudioSource`。二者輸出同為 `AudioChunk`，下游 ASR 管線完全不變。
 
 > **TabCaptureAudioSource 實裝設計（M2-04）**：`src/adapters/audio/tab-capture-source.ts` 實現 `AudioSourceProvider`（`kind: 'tab-capture'`）。`open()` 通過 content-script → port 向 Offscreen Document 發 `{ type: 'start', tabId }` → Offscreen 調 `chrome.tabCapture.getMediaStream({ tabId, audio: true, video: false })` → 建 `AudioContext` → `MediaStreamAudioSourceNode` → `ScriptProcessorNode`（或 `AudioWorklet`）按 200ms 窗口分塊 → 推送 `AudioChunk`（`seq` 單調遞增、`pcm: Float32Array`、`isSpeech` 由 VAD 標記）。`stop()` 軟停止（detach ScriptProcessor + close AudioContext + 清 currentPort，保留 `mediaStream` 供複用）；空閒完整釋放才 stop tracks + null mediaStream + 通知 SW 關 offscreen document。§5.4：所有訂閱/定時器在 `stop()` 解除；§5.1：`chrome.runtime.connect` 等宿主方法 `.bind(globalThis)`。
+>
+> **PCM base64 序列化（M2-59）**：Chrome MV3 extension messaging（`port.postMessage` / `runtime.sendMessage`）對 `Float32Array` 的序列化行為不穩定——接收端可能收到沒有 `length` 的 plain object，導致 VAD RMS=0、ASR 空結果。所有 PCM 跨 context 傳輸統一改用 base64 string：`src/infrastructure/pcm-encoding.ts` 提供 `encodePcmFloat32(Float32Array) → string` 與 `decodePcmFloat32(string) → Float32Array`。涉及四條路徑：(a) offscreen `onaudioprocess` → port.postMessage `{ type: 'audioChunk', pcm: base64 }`；(b) `tab-capture-source.ts` port.onMessage → decodePcmFloat32 → AudioChunk；(c) `local-whisper.ts` transcribe/transcribeStream → sendMessage `{ payload: { pcm: base64 } }`；(d) offscreen `asr-whisper:transcribe` 接收端（broadcast + port）→ decodePcmFloat32 → runAsrInference。§5.7 容錯：decodePcmFloat32 對空/非法輸入返回空 Float32Array（不拋錯），字節數非 4 倍數時截斷到完整 float32。
 
 > **tabCapture.getMediaStreamId 必須在 Service Worker 中調用（M2-52）**：Chrome 116+ 將 `chrome.tabCapture.getMediaStreamId()` 返回的 streamId 限定在同一 render process——popup 取得的 streamId 只能在 popup 自身的 render process 中使用，無法跨進程傳遞給 offscreen document（屬不同 render process），導致 offscreen 調用 `getUserMedia(streamId)` 時拋 `AbortError: Error starting tab capture`。Service Worker 與 offscreen document 共享同一 extension context，SW 取得的 streamId 可在 offscreen 中正常使用。**正確架構**：Popup 不直接調用 `getMediaStreamId`，改為 `chrome.runtime.sendMessage({ topic: 'asr:get-stream-id' })` → SW 處理器以 callback 風格調用 `chrome.tabCapture.getMediaStreamId({}, cb)` → 回傳 `{ ok: true, streamId }` → Popup 再透過 `chrome.tabs.sendMessage` 交付至 content-script。SW 處理器同時須對 `chrome.runtime.lastError` 與例外做防禦（§5.6 不靜默）。
 
@@ -887,7 +889,7 @@ T_display ≈ T_segment(VAD等待) + T_asr(識別) + T_translate(翻譯) + T_tra
 4. **管線並行**
    - 跨段並發 ASR/翻譯；`seq` 有序重排；背壓與**丟段策略**（落後過多時跳幀保實時，寧可漏一段不積壓）。
 5. **傳輸優化**
-   - 音頻 PCM 全程留在 Offscreen，不跨組件拷貝；必要傳輸用 Transferable/SharedArrayBuffer；消息合批。
+    - 音頻 PCM 全程留在 Offscreen，不跨組件拷貝；必要傳輸用 base64 string（M2-59：Float32Array 跨 extension messaging 序列化不穩定，統一 base64 編碼）；消息合批。
 6. **渲染優化**
    - 單一覆蓋層節點增量更新；`requestAnimationFrame` 與播放時間對齊；provisional 原地替換避免重排。
 7. **動態引擎選擇**

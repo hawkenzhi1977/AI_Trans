@@ -52,7 +52,7 @@ function makeCtx(p: PlatformAdapter, diagnostics: string[]): StrategyContext {
       debugLog: {
         overlay: false, llm: false, capture: false, pipeline: false,
         strategy: false, content: false, bridge: false, interceptor: false,
-        'local-onnx': false, popup: false,
+        'local-onnx': false, audio: false, popup: false,
       },
     },
     asr: {
@@ -567,7 +567,7 @@ describe('NativeCaptionStrategy M2-30 智能字幕軌選擇', () => {
         debugLog: {
           overlay: false, llm: false, capture: false, pipeline: false,
           strategy: false, content: false, bridge: false, interceptor: false,
-          'local-onnx': false, popup: false,
+          'local-onnx': false, audio: false, popup: false,
         },
       },
       audioLanguage,
