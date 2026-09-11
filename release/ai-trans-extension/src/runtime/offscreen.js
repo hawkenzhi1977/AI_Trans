@@ -49265,6 +49265,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   var asrPipeline = null;
+  var asrPipelineModelId = null;
   var asrDownloadInProgress = false;
   var localOnnxDownloadInProgress = false;
   var DownloadProgressAggregator = class {
@@ -49839,6 +49840,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         device: "wasm",
         dtype: "q8"
       });
+      asrPipelineModelId = modelId;
       console.warn("[AI_Trans] ASR Whisper pipeline loaded for inference");
       return { type: "asr-whisper:warmup-complete", ok: true };
     } catch (err) {
@@ -49895,11 +49897,20 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
     try {
       const pipelineFn = asrPipeline;
-      const result = await pipelineFn(pcm, {
-        language: hintLang,
-        task: "transcribe",
+      const isEnglishOnly = asrPipelineModelId?.includes(".en") ?? false;
+      if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
+        console.warn(
+          `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
+        );
+      }
+      const options = {
         return_timestamps: true
-      });
+      };
+      if (!isEnglishOnly) {
+        options.language = hintLang;
+        options.task = "transcribe";
+      }
+      const result = await pipelineFn(pcm, options);
       const durationMs = performance.now() - startTime;
       const audioDurationMs = pcm.length / sampleRate * 1e3;
       const rtf = durationMs / audioDurationMs;
@@ -50314,6 +50325,7 @@ ${numbered}
     webgpuFailed = false;
     asrDownloadInProgress = false;
     asrPipeline = null;
+    asrPipelineModelId = null;
     currentModelName = LOCAL_ONNX_MODEL;
   }
   var _testExports = {

@@ -359,4 +359,50 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     expect(err.message).toContain('timeout');
     vi.useRealTimers();
   });
+
+  // M2-60：多語言模型檔位映射。
+  it('M2-60: base-multi 檔位映射到 Xenova/whisper-base（多語言）', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base-multi' });
+    await asr.warmup(mockConfig);
+
+    // 斷言 warmup 消息的 modelId 為多語言變體（非 .en）。
+    const warmupCall = mockSendMessage.mock.calls.find(
+      (c) => c[0]?.topic === 'asr-whisper:warmup'
+    );
+    expect(warmupCall?.[0].payload.modelId).toBe('Xenova/whisper-base');
+  });
+
+  it('M2-60: tiny-multi 檔位映射到 Xenova/whisper-tiny（多語言）', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'tiny-multi' });
+    await asr.warmup(mockConfig);
+
+    const warmupCall = mockSendMessage.mock.calls.find(
+      (c) => c[0]?.topic === 'asr-whisper:warmup'
+    );
+    expect(warmupCall?.[0].payload.modelId).toBe('Xenova/whisper-tiny');
+  });
+
+  it('M2-60: small-multi 檔位映射到 Xenova/whisper-small（多語言）', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'small-multi' });
+    await asr.warmup(mockConfig);
+
+    const warmupCall = mockSendMessage.mock.calls.find(
+      (c) => c[0]?.topic === 'asr-whisper:warmup'
+    );
+    expect(warmupCall?.[0].payload.modelId).toBe('Xenova/whisper-small');
+  });
+
+  it('M2-60: 未知檔位回退到 base（.en）', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'unknown-tier' });
+    await asr.warmup(mockConfig);
+
+    const warmupCall = mockSendMessage.mock.calls.find(
+      (c) => c[0]?.topic === 'asr-whisper:warmup'
+    );
+    expect(warmupCall?.[0].payload.modelId).toBe('Xenova/whisper-base.en');
+  });
 });

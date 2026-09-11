@@ -969,3 +969,131 @@ describe('clearCacheForModel — 按模型名稱清理快取', () => {
     expect(deleteFn).not.toHaveBeenCalled();
   });
 });
+
+// ============================================================
+// M2-60：Whisper English-only 模型推理參數修復
+// ============================================================
+
+describe('M2-60: ASR English-only 模型推理參數', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** 安裝假 Cache API：指定模型已緩存。 */
+  function installAsrCache(modelId: string): void {
+    const onnxUrl = `https://huggingface.co/${modelId}/resolve/main/model.onnx`;
+    const cache = { keys: vi.fn(async () => [makeRequest(onnxUrl)]) };
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache']),
+      open: vi.fn(async () => cache),
+    });
+  }
+
+  it('English-only 模型（.en）不傳 language/task 參數', async () => {
+    installAsrCache('Xenova/whisper-base.en');
+
+    // pipeline() 返回可調用的 pipeline 實例（mock 為 vi.fn）。
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [{ text: 'hello', timestamp: [0, 1] }] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    // warmup 載入 .en 模型。
+    const warmupResult = await _testExports.warmupAsrPipeline('Xenova/whisper-base.en');
+    expect(warmupResult.ok).toBe(true);
+
+    // 推理：hintLang='zh'（非英文）。
+    const pcm = new Float32Array(1600); // 0.1s @ 16kHz
+    const result = await _testExports.runAsrInference(pcm, 16000, 'zh');
+    expect(result.ok).toBe(true);
+
+    // 斷言 pipeline 實例被調用時 options 不含 language/task。
+    expect(mockPipelineInstance).toHaveBeenCalledTimes(1);
+    const callArgs = mockPipelineInstance.mock.calls[0];
+    expect(callArgs[1]).toEqual({ return_timestamps: true });
+    expect(callArgs[1].language).toBeUndefined();
+    expect(callArgs[1].task).toBeUndefined();
+  });
+
+  it('多語言模型（非 .en）傳入 language/task 參數', async () => {
+    installAsrCache('Xenova/whisper-base');
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: '你好', chunks: [{ text: '你好', timestamp: [0, 1] }] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    const warmupResult = await _testExports.warmupAsrPipeline('Xenova/whisper-base');
+    expect(warmupResult.ok).toBe(true);
+
+    const pcm = new Float32Array(1600);
+    const result = await _testExports.runAsrInference(pcm, 16000, 'zh');
+    expect(result.ok).toBe(true);
+
+    expect(mockPipelineInstance).toHaveBeenCalledTimes(1);
+    const callArgs = mockPipelineInstance.mock.calls[0];
+    expect(callArgs[1].language).toBe('zh');
+    expect(callArgs[1].task).toBe('transcribe');
+    expect(callArgs[1].return_timestamps).toBe(true);
+  });
+
+  it('English-only 模型 + 非英文 hintLang → console.warn 診斷警告', async () => {
+    installAsrCache('Xenova/whisper-base.en');
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    await _testExports.warmupAsrPipeline('Xenova/whisper-base.en');
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const pcm = new Float32Array(1600);
+    await _testExports.runAsrInference(pcm, 16000, 'zh');
+
+    // 斷言 console.warn 被調用且包含 hintLang 忽略提示。
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((msg) => msg.includes('hintLang=zh') && msg.includes('English-only'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('English-only 模型 + 英文 hintLang → 無警告', async () => {
+    installAsrCache('Xenova/whisper-base.en');
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    await _testExports.warmupAsrPipeline('Xenova/whisper-base.en');
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const pcm = new Float32Array(1600);
+    await _testExports.runAsrInference(pcm, 16000, 'en');
+
+    // 英文 hintLang 不觸發警告。
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((msg) => msg.includes('hintLang=en') && msg.includes('English-only'))).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  it('resetLocalOnnxModuleForTest 重置 asrPipelineModelId', async () => {
+    installAsrCache('Xenova/whisper-base.en');
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    await _testExports.warmupAsrPipeline('Xenova/whisper-base.en');
+
+    // 推理後 modelId 已設置。
+    const pcm = new Float32Array(1600);
+    await _testExports.runAsrInference(pcm, 16000, 'zh');
+
+    // reset 後再推理：pipeline 為 null → lazy 載入失敗（無快取）→ 返回錯誤。
+    resetLocalOnnxModuleForTest();
+
+    // 清除快取 mock（讓 lazy 載入找不到模型）。
+    vi.stubGlobal('caches', { keys: vi.fn(async () => []), open: vi.fn() });
+
+    const result = await _testExports.runAsrInference(pcm, 16000, 'zh');
+    expect(result.ok).toBe(false);
+  });
+});

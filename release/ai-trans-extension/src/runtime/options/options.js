@@ -524,12 +524,20 @@
   var WHISPER_MODEL_IDS = {
     tiny: "Xenova/whisper-tiny.en",
     base: "Xenova/whisper-base.en",
-    small: "Xenova/whisper-small.en"
+    small: "Xenova/whisper-small.en",
+    // M2-60：多語言（非 English-only）變體。
+    "tiny-multi": "Xenova/whisper-tiny",
+    "base-multi": "Xenova/whisper-base",
+    "small-multi": "Xenova/whisper-small"
   };
   var WHISPER_MODEL_SIZES = {
     "Xenova/whisper-tiny.en": "\u7D04 40 MB",
     "Xenova/whisper-base.en": "\u7D04 80 MB",
-    "Xenova/whisper-small.en": "\u7D04 180 MB"
+    "Xenova/whisper-small.en": "\u7D04 180 MB",
+    // M2-60：多語言變體（權重較大，含多語言 token 嵌入）。
+    "Xenova/whisper-tiny": "\u7D04 75 MB",
+    "Xenova/whisper-base": "\u7D04 140 MB",
+    "Xenova/whisper-small": "\u7D04 250 MB"
   };
   function initAsrModelUI() {
     const modelNameInput = $("asr-model-name");

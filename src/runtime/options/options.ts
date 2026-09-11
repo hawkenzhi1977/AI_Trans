@@ -75,7 +75,7 @@ function fillDebugLog(config: EngineConfig['debugLog']): void {
 function readForm(): EngineConfig {
   const translationType = $<HTMLSelectElement>('translation-type').value as EngineConfig['translation']['type'];
   const asrType = $<HTMLSelectElement>('asr-type').value as EngineConfig['asr']['type'];
-  const modelTier = $<HTMLSelectElement>('asr-tier').value as 'tiny' | 'base' | 'small';
+  const modelTier = $<HTMLSelectElement>('asr-tier').value as NonNullable<EngineConfig['asr']['modelTier']>;
   const profile = $<HTMLSelectElement>('performance-profile').value as EngineConfig['performanceProfile'];
 
   // 背景色：根據預設選擇決定
@@ -572,6 +572,10 @@ const WHISPER_MODEL_IDS: Record<string, string> = {
   tiny: 'Xenova/whisper-tiny.en',
   base: 'Xenova/whisper-base.en',
   small: 'Xenova/whisper-small.en',
+  // M2-60：多語言（非 English-only）變體。
+  'tiny-multi': 'Xenova/whisper-tiny',
+  'base-multi': 'Xenova/whisper-base',
+  'small-multi': 'Xenova/whisper-small',
 };
 
 /** Whisper 模型大小提示（dtype: q8 實際下載大小）。 */
@@ -579,6 +583,10 @@ const WHISPER_MODEL_SIZES: Record<string, string> = {
   'Xenova/whisper-tiny.en': '約 40 MB',
   'Xenova/whisper-base.en': '約 80 MB',
   'Xenova/whisper-small.en': '約 180 MB',
+  // M2-60：多語言變體（權重較大，含多語言 token 嵌入）。
+  'Xenova/whisper-tiny': '約 75 MB',
+  'Xenova/whisper-base': '約 140 MB',
+  'Xenova/whisper-small': '約 250 MB',
 };
 
 /** ASR 模型狀態。 */

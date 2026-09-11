@@ -958,6 +958,16 @@ DiagnosticRecord 結構:
 - **開發者響應**: 確認 offscreen document 存活；檢查 `onnxPortConnected` 守衛是否生效（排除雙重推理）；查看 SW port 通道狀態
 - **代碼落點**: src/adapters/asr/local-whisper.ts（`sendMessageWithTimeout()` 30s 超時）
 
+### 11.4c English-only 模型語言提示忽略警告（M2-60）
+
+- **診斷碼**: （console.warn，非結構化診斷碼——屬提示性警告，不觸發降級）
+- **用戶可見消息**: （開發者 console）`[AI_Trans] ASR: hintLang=<lang> ignored for English-only model <modelId>`
+- **觸發條件**: `runAsrInference()` 中 `asrPipelineModelId?.includes('.en')` 為 true 且 `!/^en/i.test(hintLang)`（hintLang 非英文）
+- **根因**: Whisper `.en` 變體是 English-only 模型，不接受 `language`/`task` 參數；若用戶以非英文 hintLang 搭配 `.en` 模型，語言提示被忽略（推理仍正常，但無語言引導）
+- **用戶響應**: 若視頻非英文，在 Options → ASR 模型切換為多語言變體（`base-multi` / `small-multi`）
+- **開發者響應**: 確認用戶模型選擇與視頻語言匹配；`.en` 模型僅適用於英文音頻
+- **代碼落點**: src/runtime/offscreen.ts（`runAsrInference()` English-only 檢測 + console.warn）
+
 ### 11.5 ASR 性能降檔
 
 - **診斷碼**: asr-performance-degraded

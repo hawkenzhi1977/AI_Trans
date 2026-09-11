@@ -13,6 +13,10 @@ const WHISPER_MODELS: Record<string, string> = {
   tiny: 'Xenova/whisper-tiny.en',
   base: 'Xenova/whisper-base.en',
   small: 'Xenova/whisper-small.en',
+  // M2-60：多語言（非 English-only）變體——支持任意語言 hintLang。
+  'tiny-multi': 'Xenova/whisper-tiny',
+  'base-multi': 'Xenova/whisper-base',
+  'small-multi': 'Xenova/whisper-small',
 };
 
 /** LocalWhisperASR 配置。 */

@@ -3631,7 +3631,11 @@ Example output:
   var WHISPER_MODELS = {
     tiny: "Xenova/whisper-tiny.en",
     base: "Xenova/whisper-base.en",
-    small: "Xenova/whisper-small.en"
+    small: "Xenova/whisper-small.en",
+    // M2-60：多語言（非 English-only）變體——支持任意語言 hintLang。
+    "tiny-multi": "Xenova/whisper-tiny",
+    "base-multi": "Xenova/whisper-base",
+    "small-multi": "Xenova/whisper-small"
   };
   var TRANSCRIBE_TIMEOUT_MS = 3e4;
   function sendMessageWithTimeout(message, timeoutMs = TRANSCRIBE_TIMEOUT_MS) {

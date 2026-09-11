@@ -762,6 +762,9 @@ function preferWebGpu(): boolean {
 /** ASR Whisper pipeline 實例（僅用於下載，推理由 content-script 執行）。 */
 let asrPipeline: unknown = null;
 
+/** M2-60：當前 ASR pipeline 對應的模型 ID（用於 English-only 檢測）。 */
+let asrPipelineModelId: string | null = null;
+
 /** ASR Whisper 模型下載進行中旗標（M1-59）——供 check-status 讓 Options 頁顯示「下載中」。 */
 let asrDownloadInProgress = false;
 
@@ -1569,6 +1572,7 @@ async function warmupAsrPipeline(modelId: string): Promise<OffscreenResponse> {
       device: 'wasm',
       dtype: 'q8',
     });
+    asrPipelineModelId = modelId;
 
     console.warn('[AI_Trans] ASR Whisper pipeline loaded for inference');
     return { type: 'asr-whisper:warmup-complete', ok: true } satisfies OffscreenResponse;
@@ -1646,11 +1650,24 @@ async function runAsrInference(
       options?: { language?: string; task?: string; return_timestamps?: boolean }
     ) => Promise<{ text?: string; chunks?: Array<{ text: string; timestamp?: [number, number] }> }>;
 
-    const result = await pipelineFn(pcm, {
-      language: hintLang,
-      task: 'transcribe',
+    // M2-60：English-only 模型（.en 變體）不接受 language/task 參數。
+    const isEnglishOnly = asrPipelineModelId?.includes('.en') ?? false;
+
+    if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
+      console.warn(
+        `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
+      );
+    }
+
+    const options: { language?: string; task?: string; return_timestamps?: boolean } = {
       return_timestamps: true,
-    });
+    };
+    if (!isEnglishOnly) {
+      options.language = hintLang;
+      options.task = 'transcribe';
+    }
+
+    const result = await pipelineFn(pcm, options);
 
     const durationMs = performance.now() - startTime;
     const audioDurationMs = (pcm.length / sampleRate) * 1000;
@@ -2203,6 +2220,8 @@ export function resetLocalOnnxModuleForTest(): void {
   asrDownloadInProgress = false;
   // M2-37：重置 ASR pipeline（避免測試間互相污染）。
   asrPipeline = null;
+  // M2-60：重置 ASR pipeline 模型 ID（避免測試間互相污染）。
+  asrPipelineModelId = null;
   // 重置模型名稱為預設值
   currentModelName = LOCAL_ONNX_MODEL;
 }
