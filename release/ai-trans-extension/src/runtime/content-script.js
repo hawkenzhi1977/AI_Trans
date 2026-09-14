@@ -2454,7 +2454,7 @@ Example output:
 
   // src/adapters/translation/local-onnx-translation.ts
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
-  var PER_CHUNK_TIMEOUT_MS = 3e4;
+  var PER_CHUNK_TIMEOUT_MS = 6e4;
   var modelStats = {
     totalChunks: 0,
     mergedChunks: 0,
@@ -3637,7 +3637,7 @@ Example output:
     "base-multi": "Xenova/whisper-base",
     "small-multi": "Xenova/whisper-small"
   };
-  var TRANSCRIBE_TIMEOUT_MS = 3e4;
+  var TRANSCRIBE_TIMEOUT_MS = 6e4;
   function sendMessageWithTimeout(message, timeoutMs = TRANSCRIBE_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

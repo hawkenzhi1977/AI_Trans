@@ -49266,6 +49266,15 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   }
   var asrPipeline = null;
   var asrPipelineModelId = null;
+  var inferenceLock = Promise.resolve();
+  function withInferenceLock(fn) {
+    const prev = inferenceLock;
+    let resolve;
+    inferenceLock = new Promise((r2) => {
+      resolve = r2;
+    });
+    return prev.then(() => fn().finally(() => resolve()));
+  }
   var asrDownloadInProgress = false;
   var localOnnxDownloadInProgress = false;
   var DownloadProgressAggregator = class {
@@ -49830,12 +49839,11 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       return { type: "asr-whisper:warmup-complete", ok: true };
     }
     try {
-      if (!await hasAsrModelInCache(modelId)) {
-        return {
-          type: "asr-whisper:warmup-complete",
-          ok: false,
-          error: "ASR model not downloaded. Please download it from the Options page first. / \u8ACB\u5148\u5728\u9078\u9805\u9801\u9762\u4E0B\u8F09 ASR \u6A21\u578B"
-        };
+      const cached = await hasAsrModelInCache(modelId);
+      if (!cached) {
+        console.warn(
+          `[AI_Trans] ASR model not in cache, will download during warmup: ${modelId}`
+        );
       }
       const transformers = await Promise.resolve().then(() => (init_transformers_web(), transformers_web_exports));
       const { pipeline, env: env3 } = transformers;
@@ -49905,21 +49913,23 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       };
     }
     try {
-      const pipelineFn = asrPipeline;
-      const isEnglishOnly = asrPipelineModelId?.includes(".en") ?? false;
-      if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
-        console.warn(
-          `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
-        );
-      }
-      const options = {
-        return_timestamps: true
-      };
-      if (!isEnglishOnly) {
-        options.language = hintLang;
-        options.task = "transcribe";
-      }
-      const result = await pipelineFn(pcm, options);
+      const result = await withInferenceLock(async () => {
+        const pipelineFn = asrPipeline;
+        const isEnglishOnly = asrPipelineModelId?.includes(".en") ?? false;
+        if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
+          console.warn(
+            `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
+          );
+        }
+        const options = {
+          return_timestamps: true
+        };
+        if (!isEnglishOnly) {
+          options.language = hintLang;
+          options.task = "transcribe";
+        }
+        return pipelineFn(pcm, options);
+      });
       const durationMs = performance.now() - startTime;
       const audioDurationMs = pcm.length / sampleRate * 1e3;
       const rtf = durationMs / audioDurationMs;
@@ -49998,13 +50008,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       const prompt = buildPrompt(text, targetLang);
       console.log(`[AI_Trans:local-onnx] prompt \u69CB\u5EFA\u5B8C\u6210, prompt length:`, prompt.length);
       const pipelineFn = translationPipeline;
-      console.log(`[AI_Trans:local-onnx] \u958B\u59CB\u63A8\u7406...`);
-      const result = await pipelineFn(prompt, {
+      console.log(`[AI_Trans:local-onnx] \u958B\u59CB\u63A8\u7406\uFF08\u4E32\u884C\u5316\u9396\uFF09...`);
+      const result = await withInferenceLock(() => pipelineFn(prompt, {
         max_new_tokens: 256,
         do_sample: false,
         repetition_penalty: 1.1,
         return_full_text: false
-      });
+      }));
       console.log(`[AI_Trans:local-onnx] \u63A8\u7406\u5B8C\u6210`);
       const generatedText = result[0]?.generated_text ?? "";
       console.log("[AI_Trans:local-onnx] generated_text:", JSON.stringify(generatedText.slice(0, 500)));
@@ -50369,7 +50379,9 @@ ${numbered}
     clearCacheForModel,
     // M2-58：音頻捕獲（供測試驗證防禦性 resume / state breadcrumb / onaudioprocess 統計）。
     startCapture,
-    resetCaptureModuleForTest
+    resetCaptureModuleForTest,
+    // M2-63：推理串行化鎖（供測試驗證 ASR/translate 不並行）。
+    withInferenceLock
   };
   function resetCaptureModuleForTest() {
     mediaStream = null;
