@@ -1216,3 +1216,96 @@ describe('M2-61: ASR warmup modelId 修復', () => {
     expect(result.ok).toBe(true);
   });
 });
+
+describe('M2-63: warmup 首次下載 + 推理串行化', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    await chrome.storage.local.clear();
+    resetLocalOnnxModuleForTest();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('warmup：cache miss 時仍嘗試 pipeline()（觸發下載），不直接返回失敗', async () => {
+    // cache 中沒有 ASR 模型（只有 local-onnx 翻譯模型）。
+    const onnxUrl = 'https://hf-mirror.com/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/onnx/model_q4.onnx';
+    const cache = { keys: vi.fn(async () => [makeRequest(onnxUrl)]) };
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache']),
+      open: vi.fn(async () => cache),
+    });
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    // warmup 應成功（pipeline() 被調用，觸發下載+載入）。
+    const result = await _testExports.warmupAsrPipeline('Xenova/whisper-base');
+    expect(result.ok).toBe(true);
+    expect(transformersMock.pipeline).toHaveBeenCalledWith(
+      'automatic-speech-recognition',
+      'Xenova/whisper-base',
+      expect.anything()
+    );
+  });
+
+  it('warmup：cache miss 時輸出 breadcrumb（console.warn）', async () => {
+    // cache 中沒有 ASR 模型。
+    const onnxUrl = 'https://hf-mirror.com/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/onnx/model_q4.onnx';
+    const cache = { keys: vi.fn(async () => [makeRequest(onnxUrl)]) };
+    vi.stubGlobal('caches', {
+      keys: vi.fn(async () => ['transformers-cache']),
+      open: vi.fn(async () => cache),
+    });
+
+    const mockPipelineInstance = vi.fn(async () => ({ text: 'hello', chunks: [] }));
+    transformersMock.pipeline.mockResolvedValue(mockPipelineInstance);
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await _testExports.warmupAsrPipeline('Xenova/whisper-base');
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((msg) => msg.includes('not in cache') && msg.includes('will download'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('withInferenceLock：兩個推理任務串行執行（不並行）', async () => {
+    const executionOrder: string[] = [];
+    let firstDone = false;
+
+    // 第一個任務：模擬 ASR 推理（耗時）。
+    const task1 = _testExports.withInferenceLock(async () => {
+      executionOrder.push('asr-start');
+      await new Promise((r) => setTimeout(r, 50));
+      firstDone = true;
+      executionOrder.push('asr-end');
+    });
+
+    // 第二個任務：模擬 local-onnx 翻譯（在第一個完成前不應開始）。
+    const task2 = _testExports.withInferenceLock(async () => {
+      executionOrder.push('translate-start');
+      expect(firstDone).toBe(true); // 串行化：第一個必須已完成。
+      executionOrder.push('translate-end');
+    });
+
+    await Promise.all([task1, task2]);
+    expect(executionOrder).toEqual(['asr-start', 'asr-end', 'translate-start', 'translate-end']);
+  });
+
+  it('withInferenceLock：前一個失敗不阻塞下一個', async () => {
+    const executionOrder: string[] = [];
+
+    const task1 = _testExports.withInferenceLock(async () => {
+      executionOrder.push('task1');
+      throw new Error('inference failed');
+    });
+
+    const task2 = _testExports.withInferenceLock(async () => {
+      executionOrder.push('task2');
+    });
+
+    await expect(task1).rejects.toThrow('inference failed');
+    await task2;
+    expect(executionOrder).toEqual(['task1', 'task2']);
+  });
+});

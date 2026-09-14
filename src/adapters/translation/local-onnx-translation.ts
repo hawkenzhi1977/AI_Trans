@@ -50,8 +50,8 @@ export interface LocalOnnxTranslationConfig {
 /** 單次翻譯會話的最大時限（毫秒）：超過此時間主動中斷，避免 Offscreen 長時間運行不穩定。 */
 const MAX_SESSION_DURATION_MS = 10 * 60 * 1000; // 10 分鐘
 
-/** 單個 chunk 推理的最大時限（毫秒）：低配機器 CPU 推理過慢時快速失敗，避免阻塞整個管線。 */
-const PER_CHUNK_TIMEOUT_MS = 30_000; // 30 秒
+/** M2-63：單個 chunk 推理的最大時限（毫秒）——首次推理含模型載入，需更長超時。 */
+const PER_CHUNK_TIMEOUT_MS = 60_000; // 60 秒
 
 /** 翻譯質量統計（用於後續優化分析）。 */
 const modelStats = {

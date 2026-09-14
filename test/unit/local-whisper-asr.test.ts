@@ -321,19 +321,19 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
     const promise = asr.transcribe(req);
 
-    // 推進超時（30s）——先 attach catch 避免 unhandled rejection
+    // 推進超時（M2-63：60s）——先 attach catch 避免 unhandled rejection
     const result = promise.then(
       () => { throw new Error('should have rejected'); },
       (err: Error) => err
     );
 
-    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(61_000);
     const err = await result;
     expect(err.message).toContain('timeout');
     vi.useRealTimers();
   });
 
-  it('M2-57：transcribeStream 超時時拋出 timeout 錯誤', async () => {
+  it('M2-57/M2-63：transcribeStream 超時時拋出 timeout 錯誤', async () => {
     vi.useFakeTimers();
     mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
     const asr = new LocalWhisperASR({ modelTier: 'base' });
@@ -354,7 +354,7 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
       (err: Error) => err
     );
 
-    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(61_000);
     const err = await result;
     expect(err.message).toContain('timeout');
     vi.useRealTimers();

@@ -765,6 +765,20 @@ let asrPipeline: unknown = null;
 /** M2-60：當前 ASR pipeline 對應的模型 ID（用於 English-only 檢測）。 */
 let asrPipelineModelId: string | null = null;
 
+/**
+ * M2-63：推理串行化鎖——ASR transcribe 和 local-onnx translate 共用，
+ * 避免兩個大模型同時推理導致 CPU 競爭、兩者都超時。
+ */
+let inferenceLock: Promise<void> = Promise.resolve();
+
+/** 串行化執行推理任務：前一個完成後才開始下一個。 */
+function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = inferenceLock;
+  let resolve!: () => void;
+  inferenceLock = new Promise<void>((r) => { resolve = r; });
+  return prev.then(() => fn().finally(() => resolve()));
+}
+
 /** ASR Whisper 模型下載進行中旗標（M1-59）——供 check-status 讓 Options 頁顯示「下載中」。 */
 let asrDownloadInProgress = false;
 
@@ -1559,14 +1573,13 @@ async function warmupAsrPipeline(modelId: string): Promise<OffscreenResponse> {
     return { type: 'asr-whisper:warmup-complete', ok: true } satisfies OffscreenResponse;
   }
   try {
-    // 先檢查是否已緩存，未緩存時返回錯誤（不觸發下載）。
-    if (!(await hasAsrModelInCache(modelId))) {
-      return {
-        type: 'asr-whisper:warmup-complete',
-        ok: false,
-        error:
-          'ASR model not downloaded. Please download it from the Options page first. / 請先在選項頁面下載 ASR 模型',
-      } satisfies OffscreenResponse;
+    // M2-63：不再要求模型已在 cache——pipeline() 會自動觸發下載（首次使用）。
+    // 舊邏輯在 cache miss 時直接返回失敗，導致用戶未手動下載模型時 warmup 永遠失敗。
+    const cached = await hasAsrModelInCache(modelId);
+    if (!cached) {
+      console.warn(
+        `[AI_Trans] ASR model not in cache, will download during warmup: ${modelId}`
+      );
     }
 
     const transformers = await import('@huggingface/transformers');
@@ -1659,29 +1672,32 @@ async function runAsrInference(
   }
 
   try {
-    const pipelineFn = asrPipeline as (
-      audio: Float32Array,
-      options?: { language?: string; task?: string; return_timestamps?: boolean }
-    ) => Promise<{ text?: string; chunks?: Array<{ text: string; timestamp?: [number, number] }> }>;
+    // M2-63：推理串行化——與 local-onnx translate 共用鎖，避免 CPU 競爭。
+    const result = await withInferenceLock(async () => {
+      const pipelineFn = asrPipeline as (
+        audio: Float32Array,
+        options?: { language?: string; task?: string; return_timestamps?: boolean }
+      ) => Promise<{ text?: string; chunks?: Array<{ text: string; timestamp?: [number, number] }> }>;
 
-    // M2-60：English-only 模型（.en 變體）不接受 language/task 參數。
-    const isEnglishOnly = asrPipelineModelId?.includes('.en') ?? false;
+      // M2-60：English-only 模型（.en 變體）不接受 language/task 參數。
+      const isEnglishOnly = asrPipelineModelId?.includes('.en') ?? false;
 
-    if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
-      console.warn(
-        `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
-      );
-    }
+      if (isEnglishOnly && hintLang && !/^en/i.test(hintLang)) {
+        console.warn(
+          `[AI_Trans] ASR: hintLang=${hintLang} ignored for English-only model ${asrPipelineModelId}`
+        );
+      }
 
-    const options: { language?: string; task?: string; return_timestamps?: boolean } = {
-      return_timestamps: true,
-    };
-    if (!isEnglishOnly) {
-      options.language = hintLang;
-      options.task = 'transcribe';
-    }
+      const options: { language?: string; task?: string; return_timestamps?: boolean } = {
+        return_timestamps: true,
+      };
+      if (!isEnglishOnly) {
+        options.language = hintLang;
+        options.task = 'transcribe';
+      }
 
-    const result = await pipelineFn(pcm, options);
+      return pipelineFn(pcm, options);
+    });
 
     const durationMs = performance.now() - startTime;
     const audioDurationMs = (pcm.length / sampleRate) * 1000;
@@ -1792,13 +1808,14 @@ async function runInference(
       options?: Record<string, unknown>
     ) => Promise<Array<{ generated_text: string }>>;
 
-    console.log(`[AI_Trans:local-onnx] 開始推理...`);
-    const result = await pipelineFn(prompt, {
+    // M2-63：推理串行化——與 ASR transcribe 共用鎖，避免 CPU 競爭。
+    console.log(`[AI_Trans:local-onnx] 開始推理（串行化鎖）...`);
+    const result = await withInferenceLock(() => pipelineFn(prompt, {
       max_new_tokens: 256,
       do_sample: false,
       repetition_penalty: 1.1,
       return_full_text: false,
-    });
+    }));
     console.log(`[AI_Trans:local-onnx] 推理完成`);
 
     // 解析生成結果——按行號還原譯文。
@@ -2274,6 +2291,8 @@ export const _testExports = {
   // M2-58：音頻捕獲（供測試驗證防禦性 resume / state breadcrumb / onaudioprocess 統計）。
   startCapture,
   resetCaptureModuleForTest,
+  // M2-63：推理串行化鎖（供測試驗證 ASR/translate 不並行）。
+  withInferenceLock,
 };
 
 /** M2-58：重置音頻捕獲模組狀態（供測試間隔離，避免 MediaStream/context 跨測試污染）。 */

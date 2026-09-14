@@ -42,8 +42,8 @@ interface AsrTranscribeResponse {
   rtf?: number;
 }
 
-/** M2-57：transcribe 超時（ms）——防止 offscreen 推理掛起導致字幕管線永久停滯。 */
-const TRANSCRIBE_TIMEOUT_MS = 30_000;
+/** M2-57/M2-63：transcribe 超時（ms）——首次推理含模型下載+載入，需更長超時。 */
+const TRANSCRIBE_TIMEOUT_MS = 60_000;
 
 /**
  * M2-57：帶超時的 sendMessage 包裝。

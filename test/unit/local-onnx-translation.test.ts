@@ -314,8 +314,8 @@ describe('LocalONNXTranslationProvider', () => {
     expect(result.segments[2].translatedText).toBe('line-2');
   });
 
-  // M2-45：慢推理保護——單個 chunk 超過 30 秒時快速失敗。
-  it('單個 chunk 推理超過 30 秒 → 超時拋錯（不阻塞整個管線）', async () => {
+  // M2-45/M2-63：慢推理保護——單個 chunk 超過 60 秒時快速失敗。
+  it('單個 chunk 推理超過 60 秒 → 超時拋錯（不阻塞整個管線）', async () => {
     const provider = new LocalONNXTranslationProvider({
       modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
       chunkSize: 4,
@@ -337,8 +337,8 @@ describe('LocalONNXTranslationProvider', () => {
 
     const translatePromise = provider.translate(req());
     
-    // 找到超時 timer 並手動觸發
-    const timeoutTimer = timers.find((t) => t.delay === 30000);
+    // 找到超時 timer（M2-63：60s）並手動觸發
+    const timeoutTimer = timers.find((t) => t.delay === 60000);
     expect(timeoutTimer).toBeDefined();
     
     // 觸發超時
