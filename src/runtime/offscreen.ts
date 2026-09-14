@@ -1324,7 +1324,19 @@ async function hasAsrModelInCache(modelId: string): Promise<boolean> {
 
     const cache = await cachesApi.open(target);
     const requests = await cache.keys();
-    return requests.some((r) => r.url.includes('.onnx') && r.url.includes(modelId));
+    // M2-61：精確匹配 path segment（帶尾斜杠），避免 'Xenova/whisper-base' 交叉匹配
+    // 'Xenova/whisper-base.en'（HuggingFace URL: huggingface.co/{modelId}/resolve/main/...）。
+    const matched = requests.some((r) => r.url.includes('.onnx') && r.url.includes(`${modelId}/`));
+    if (!matched) {
+      // §5.6 breadcrumb：模型不在 cache 時記錄實際 cache keys，方便排障。
+      const onnxKeys = requests.filter((r) => r.url.includes('.onnx')).map((r) => r.url);
+      if (onnxKeys.length > 0) {
+        console.warn(
+          `[AI_Trans] ASR model not in cache: ${modelId} (cache has: ${onnxKeys.join(', ')})`
+        );
+      }
+    }
+    return matched;
   } catch {
     return false;
   }
@@ -1612,10 +1624,12 @@ async function runAsrInference(
   // lazy 恢復：pipeline 未載入但快取存在 → 自動載入。
   if (asrPipeline === null) {
     try {
-      // 嘗試使用默認模型 ID 載入。
-      const defaultModelId = 'Xenova/whisper-base.en';
-      if (await hasAsrModelInCache(defaultModelId)) {
-        await warmupAsrPipeline(defaultModelId);
+      // M2-61：使用上次 warmup 的 modelId（asrPipelineModelId），而非硬編碼 .en 變體。
+      // idle shutdown 只釋放 pipeline（asrPipeline=null），不重置 asrPipelineModelId，
+      // 因此 lazy 恢復時仍知道用戶實際使用的模型。
+      const modelId = asrPipelineModelId ?? 'Xenova/whisper-base.en';
+      if (await hasAsrModelInCache(modelId)) {
+        await warmupAsrPipeline(modelId);
       }
     } catch (err) {
       const error = toReadableError(err);
