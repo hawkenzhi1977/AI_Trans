@@ -49638,7 +49638,16 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
       if (!target) return false;
       const cache = await cachesApi.open(target);
       const requests = await cache.keys();
-      return requests.some((r2) => r2.url.includes(".onnx") && r2.url.includes(modelId));
+      const matched = requests.some((r2) => r2.url.includes(".onnx") && r2.url.includes(`${modelId}/`));
+      if (!matched) {
+        const onnxKeys = requests.filter((r2) => r2.url.includes(".onnx")).map((r2) => r2.url);
+        if (onnxKeys.length > 0) {
+          console.warn(
+            `[AI_Trans] ASR model not in cache: ${modelId} (cache has: ${onnxKeys.join(", ")})`
+          );
+        }
+      }
+      return matched;
     } catch {
       return false;
     }
@@ -49866,9 +49875,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     const startTime = performance.now();
     if (asrPipeline === null) {
       try {
-        const defaultModelId = "Xenova/whisper-base.en";
-        if (await hasAsrModelInCache(defaultModelId)) {
-          await warmupAsrPipeline(defaultModelId);
+        const modelId = asrPipelineModelId ?? "Xenova/whisper-base.en";
+        if (await hasAsrModelInCache(modelId)) {
+          await warmupAsrPipeline(modelId);
         }
       } catch (err) {
         const error = toReadableError(err);

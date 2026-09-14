@@ -120,13 +120,11 @@ function readForm(): EngineConfig {
     debugLog: readDebugLog(),
   };
 
-  // 檔位默認值合併：未手動指定 tier 時依檔位。
+  // M2-62：性能檔位覆蓋 asr.type，但保留用戶手動選擇的 modelTier。
+  // 舊邏輯用 spread 無條件覆蓋 modelTier，導致用戶選擇 base-multi 後保存仍被改回 base。
   const prof = PROFILE_DEFAULTS[profile];
   if (prof) {
-    config.asr = { ...config.asr, ...(prof.asr as Partial<EngineConfig['asr']>) };
-    if (modelTier === 'base' && profile !== 'balanced') {
-      config.asr.modelTier = prof.asr.modelTier;
-    }
+    config.asr.type = prof.asr.type;
   }
   return config;
 }
@@ -618,7 +616,9 @@ function initAsrModelUI(): void {
     const modelId = getCurrentModelId();
     modelNameInput.value = modelId;
     const size = WHISPER_MODEL_SIZES[modelId] ?? '大小未知';
-    sizeInfo.textContent = size;
+    // M2-62：English-only 模型對非英文音頻無法識別，加提示避免用戶困惑。
+    const isEnglishOnly = modelId.endsWith('.en');
+    sizeInfo.textContent = isEnglishOnly ? `${size}（僅支持英文音頻，中文請選多語言變體）` : size;
   }
 
   /** 更新狀態標籤樣式與文字。 */

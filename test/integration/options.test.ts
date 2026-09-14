@@ -23,7 +23,7 @@ const HTML = `
   <button id="btn-warmup-model">預加載模型</button>
   <button id="btn-clear-model">清除快取</button>
   <select id="asr-type"><option value="cloud">雲端</option><option value="local-whisper">本地 Whisper</option></select>
-  <select id="asr-tier"><option value="tiny">tiny</option><option value="base">base</option><option value="small">small</option></select>
+  <select id="asr-tier"><option value="tiny">tiny</option><option value="base" selected>base</option><option value="small">small</option><option value="tiny-multi">tiny-multi</option><option value="base-multi">base-multi</option><option value="small-multi">small-multi</option></select>
   <input id="asr-endpoint" />
   <input id="asr-custom-model" />
   <input id="asr-model-name" disabled />
@@ -274,6 +274,65 @@ describe('Options — M2-24 補充修復十三 預加載模型按鈕', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(document.getElementById('local-model-status-badge')!.textContent).toContain('預加載失敗');
     expect(document.getElementById('status')!.textContent).toContain('Local ONNX model not downloaded');
+  });
+});
+
+describe('Options — M2-62 modelTier 持久化', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('選擇 base-multi 後保存，modelTier 不被性能檔位覆蓋', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    // 用戶選擇 base-multi（多語言）
+    (document.getElementById('asr-tier') as HTMLSelectElement).value = 'base-multi';
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('engineConfig');
+    const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
+    // M2-62：modelTier 保留用戶選擇，不被 PROFILE_DEFAULTS.balanced.asr.modelTier('base') 覆蓋
+    expect(saved.asr.modelTier).toBe('base-multi');
+  });
+
+  it('選擇 tiny-multi + streaming 檔位保存，modelTier 仍為 tiny-multi', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    (document.getElementById('asr-tier') as HTMLSelectElement).value = 'tiny-multi';
+    (document.getElementById('performance-profile') as HTMLSelectElement).value = 'streaming';
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+    const stored = await chrome.storage.local.get('engineConfig');
+    const saved = (stored as Record<string, unknown>).engineConfig as EngineConfig;
+    expect(saved.asr.modelTier).toBe('tiny-multi');
+  });
+
+  it('.en 模型顯示「僅支持英文音頻」提示', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    // 默認 base（.en）→ sizeInfo 應含英文提示
+    expect(document.getElementById('asr-model-size-info')!.textContent).toContain('僅支持英文音頻');
+  });
+
+  it('多語言模型不顯示英文限制提示', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    await loadOptions();
+    (document.getElementById('asr-tier') as HTMLSelectElement).value = 'base-multi';
+    // 觸發 change 事件 → checkModelStatus → updateModelName
+    (document.getElementById('asr-tier') as HTMLSelectElement).dispatchEvent(new Event('change'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(document.getElementById('asr-model-size-info')!.textContent).not.toContain('僅支持英文音頻');
+  });
+
+  it('重新打開頁面後 asr-tier select 恢復已保存的 modelTier', async () => {
+    const configWithMulti: EngineConfig = {
+      ...SAVED_CONFIG,
+      asr: { type: 'local-whisper', modelTier: 'base-multi' },
+    };
+    await chrome.storage.local.set({ engineConfig: configWithMulti });
+    await loadOptions();
+    expect((document.getElementById('asr-tier') as HTMLSelectElement).value).toBe('base-multi');
   });
 });
 

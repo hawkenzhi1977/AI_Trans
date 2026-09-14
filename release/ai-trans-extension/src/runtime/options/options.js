@@ -190,10 +190,7 @@
     };
     const prof = PROFILE_DEFAULTS[profile];
     if (prof) {
-      config.asr = { ...config.asr, ...prof.asr };
-      if (modelTier === "base" && profile !== "balanced") {
-        config.asr.modelTier = prof.asr.modelTier;
-      }
+      config.asr.type = prof.asr.type;
     }
     return config;
   }
@@ -560,7 +557,8 @@
       const modelId = getCurrentModelId();
       modelNameInput.value = modelId;
       const size = WHISPER_MODEL_SIZES[modelId] ?? "\u5927\u5C0F\u672A\u77E5";
-      sizeInfo.textContent = size;
+      const isEnglishOnly = modelId.endsWith(".en");
+      sizeInfo.textContent = isEnglishOnly ? `${size}\uFF08\u50C5\u652F\u6301\u82F1\u6587\u97F3\u983B\uFF0C\u4E2D\u6587\u8ACB\u9078\u591A\u8A9E\u8A00\u8B8A\u9AD4\uFF09` : size;
     }
     function updateStatusBadge(status, message) {
       const styles = {
