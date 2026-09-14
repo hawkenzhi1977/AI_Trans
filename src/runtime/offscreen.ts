@@ -1894,6 +1894,10 @@ async function runInference(
     }
 
     let finalText = translatedLines.join('\n');
+    // M2-64：wrongLanguage（如 [BLANK AUDIO]）→ 回退原文，避免用戶看到無意義文本。
+    if (wrongLanguage) {
+      finalText = sourceLines.join('\n');
+    }
     // 簡繁轉換安全網：即使 prompt 已要求輸出繁體，部分模型仍可能輸出簡體，
     // 對 zh-Hant 目標統一轉換（對已是繁體的內容為冪等操作）。
     if (targetLang === 'zh-Hant') {

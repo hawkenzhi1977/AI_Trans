@@ -464,6 +464,7 @@
 
   // src/application/strategies/realtime-asr-strategy.ts
   var VAD_FALLBACK_SILENT_CHUNKS = 40;
+  var MIN_TRANSLATE_TEXT_LEN = 3;
   function alignSegmentsToVideoTimeline(segments, chunkStartMs) {
     return segments.map((s) => ({
       ...s,
@@ -628,10 +629,15 @@
                 type: "metrics",
                 data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
               });
+              const totalTextLen = asrResult.segments.reduce((n, s) => n + s.sourceText.trim().length, 0);
               diagLog(
                 "strategy",
-                `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${asrResult.segments.reduce((n, s) => n + s.sourceText.length, 0)}`
+                `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${totalTextLen}`
               );
+              if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
+                diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
+                return;
+              }
               const translateStart = performance.now();
               const translatedSegments = await this.translateSegments(
                 asrResult.segments,
@@ -661,6 +667,11 @@
               type: "metrics",
               data: { stage: "asr", ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf }
             });
+            const totalTextLen = asrResult.segments.reduce((n, s) => n + s.sourceText.trim().length, 0);
+            if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
+              diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
+              return;
+            }
             const translateStart = performance.now();
             const translatedSegments = await this.translateSegments(
               asrResult.segments,
@@ -2455,6 +2466,7 @@ Example output:
   // src/adapters/translation/local-onnx-translation.ts
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
   var PER_CHUNK_TIMEOUT_MS = 6e4;
+  var SLOW_CHUNK_THRESHOLD_MS = Math.floor(PER_CHUNK_TIMEOUT_MS * 0.75);
   var modelStats = {
     totalChunks: 0,
     mergedChunks: 0,
@@ -2464,7 +2476,7 @@ Example output:
     totalFallbacks: 0,
     // 回退原文的行數
     slowChunks: 0
-    // 推理超過 15 秒的 chunks（低配機器警告）
+    // 推理超過 SLOW_CHUNK_THRESHOLD_MS (45s) 的 chunks（接近超時警告）
   };
   var LocalONNXTranslationProvider = class {
     engineId = "local-onnx";
@@ -2574,7 +2586,7 @@ Example output:
       const chunkStartedAt = Date.now();
       const res = await this.requestTranslateWithTimeout(request, PER_CHUNK_TIMEOUT_MS);
       const elapsedMs = Date.now() - chunkStartedAt;
-      if (elapsedMs > 15e3) {
+      if (elapsedMs > SLOW_CHUNK_THRESHOLD_MS) {
         modelStats.slowChunks++;
         diagLog("local-onnx", `slow-chunk-warning: took ${elapsedMs}ms, slowChunks=${modelStats.slowChunks}`);
         if (modelStats.slowChunks >= 3) {
@@ -2585,7 +2597,7 @@ Example output:
               code: "local-onnx-slow-inference",
               recoverable: true,
               cause: new Error(
-                `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded 15s each. Consider switching to cloud translation (LLM/MT) for better performance on this device.`
+                `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded ${SLOW_CHUNK_THRESHOLD_MS / 1e3}s each. Consider switching to cloud translation (LLM/MT) for better performance on this device.`
               )
             }
           });
@@ -3637,7 +3649,7 @@ Example output:
     "base-multi": "Xenova/whisper-base",
     "small-multi": "Xenova/whisper-small"
   };
-  var TRANSCRIBE_TIMEOUT_MS = 6e4;
+  var TRANSCRIBE_TIMEOUT_MS = 12e4;
   function sendMessageWithTimeout(message, timeoutMs = TRANSCRIBE_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

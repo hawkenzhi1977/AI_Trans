@@ -53,13 +53,16 @@ const MAX_SESSION_DURATION_MS = 10 * 60 * 1000; // 10 分鐘
 /** M2-63：單個 chunk 推理的最大時限（毫秒）——首次推理含模型載入，需更長超時。 */
 const PER_CHUNK_TIMEOUT_MS = 60_000; // 60 秒
 
+/** M2-64：慢 chunk 降級閾值——接近超時（75%）才警告，避免正常慢機器（15-27s）被誤判。 */
+const SLOW_CHUNK_THRESHOLD_MS = Math.floor(PER_CHUNK_TIMEOUT_MS * 0.75); // 45 秒
+
 /** 翻譯質量統計（用於後續優化分析）。 */
 const modelStats = {
   totalChunks: 0,
   mergedChunks: 0,      // 輸出行數 < 輸入行數的 chunks
   perfectChunks: 0,     // 輸出行數 = 輸入行數的 chunks
   totalFallbacks: 0,    // 回退原文的行數
-  slowChunks: 0,        // 推理超過 15 秒的 chunks（低配機器警告）
+  slowChunks: 0,        // 推理超過 SLOW_CHUNK_THRESHOLD_MS (45s) 的 chunks（接近超時警告）
 };
 
 /**
@@ -199,26 +202,26 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
      // 單個 chunk 超時保護：低配機器 CPU 推理過慢時快速失敗（30 秒）。
      const res = await this.requestTranslateWithTimeout(request, PER_CHUNK_TIMEOUT_MS);
      
-     const elapsedMs = Date.now() - chunkStartedAt;
-     if (elapsedMs > 15_000) {
-       modelStats.slowChunks++;
-       diagLog('local-onnx', `slow-chunk-warning: took ${elapsedMs}ms, slowChunks=${modelStats.slowChunks}`);
-       if (modelStats.slowChunks >= 3) {
-         // 連續 3 個 chunk 超過 15 秒 → 落診斷，建議用戶切換雲端引擎。
-         recordDiagnostic({
-           type: 'pipeline-error',
-           error: {
-             port: 'translation',
-             code: 'local-onnx-slow-inference',
-             recoverable: true,
-             cause: new Error(
-               `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded 15s each. ` +
-               `Consider switching to cloud translation (LLM/MT) for better performance on this device.`
-             ),
-           },
-         });
-       }
-     }
+      const elapsedMs = Date.now() - chunkStartedAt;
+      if (elapsedMs > SLOW_CHUNK_THRESHOLD_MS) {
+        modelStats.slowChunks++;
+        diagLog('local-onnx', `slow-chunk-warning: took ${elapsedMs}ms, slowChunks=${modelStats.slowChunks}`);
+        if (modelStats.slowChunks >= 3) {
+          // M2-64：連續 3 個 chunk 超過 45s（接近 60s 超時）→ 落診斷，建議用戶切換雲端引擎。
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'translation',
+              code: 'local-onnx-slow-inference',
+              recoverable: true,
+              cause: new Error(
+                `local ONNX inference too slow: ${modelStats.slowChunks} chunks exceeded ${SLOW_CHUNK_THRESHOLD_MS / 1000}s each. ` +
+                `Consider switching to cloud translation (LLM/MT) for better performance on this device.`
+              ),
+            },
+          });
+        }
+      }
     
     const rawOutput = res.translatedText ?? '';
     const isEchoed = res.echoed === true;

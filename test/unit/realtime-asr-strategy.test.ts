@@ -409,4 +409,46 @@ describe('RealtimeASRStrategy — M2-58 VAD 兜底與時間軸對齊', () => {
     ).toBe(false);
     strategy.stop();
   });
+
+  // M2-64：極短文本（< 3 字符）跳過翻譯——避免 local-onnx 對 "um" 輸出 [BLANK AUDIO]。
+  it('M2-64：ASR 返回極短文本（len < 3）→ 跳過翻譯不 emit', async () => {
+    (mockASR.transcribe as ReturnType<typeof vi.fn>).mockResolvedValue({
+      segments: [{ id: '1', sourceText: 'um', start: 0, end: 500 }],
+      isPartial: false,
+      rtf: 0.3,
+    });
+    const ctx = makeContext(10_000);
+    const events: Array<{ type: string }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    // ASR 被調用但翻譯不被調用（極短文本跳過）。
+    expect(mockASR.transcribe).toHaveBeenCalledTimes(1);
+    expect(mockTranslation.translate).not.toHaveBeenCalled();
+    // 無 segments-ready/updated 事件。
+    expect(events.some((e) => e.type === 'segments-ready' || e.type === 'segments-updated')).toBe(false);
+    strategy.stop();
+  });
+
+  // M2-64：正常長度文本（>= 3）→ 正常翻譯 + emit。
+  it('M2-64：ASR 返回正常文本（len >= 3）→ 正常翻譯並 emit', async () => {
+    (mockASR.transcribe as ReturnType<typeof vi.fn>).mockResolvedValue({
+      segments: [{ id: '1', sourceText: 'hello world', start: 0, end: 2000 }],
+      isPartial: false,
+      rtf: 0.5,
+    });
+    const ctx = makeContext(10_000);
+    const events: Array<{ type: string }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockASR.transcribe).toHaveBeenCalledTimes(1);
+    expect(mockTranslation.translate).toHaveBeenCalledTimes(1);
+    expect(events.some((e) => e.type === 'segments-ready' || e.type === 'segments-updated')).toBe(true);
+    strategy.stop();
+  });
 });

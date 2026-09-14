@@ -321,13 +321,13 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
     const promise = asr.transcribe(req);
 
-    // 推進超時（M2-63：60s）——先 attach catch 避免 unhandled rejection
+    // 推進超時（M2-64：120s）——先 attach catch 避免 unhandled rejection
     const result = promise.then(
       () => { throw new Error('should have rejected'); },
       (err: Error) => err
     );
 
-    await vi.advanceTimersByTimeAsync(61_000);
+    await vi.advanceTimersByTimeAsync(121_000);
     const err = await result;
     expect(err.message).toContain('timeout');
     vi.useRealTimers();
@@ -354,9 +354,34 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
       (err: Error) => err
     );
 
-    await vi.advanceTimersByTimeAsync(61_000);
+    await vi.advanceTimersByTimeAsync(121_000);
     const err = await result;
     expect(err.message).toContain('timeout');
+    vi.useRealTimers();
+  });
+
+  // M2-64：串行化後排隊+推理=90s 不超時（120s 閾值內）。
+  it('M2-64：transcribe 在 120s 內完成 → 不超時', async () => {
+    vi.useFakeTimers();
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await asr.warmup(mockConfig);
+
+    // 模擬 90s 後才響應（排隊 ~20s + 推理 ~70s）——用 fake timer 可推進的 setTimeout。
+    mockSendMessage.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        vi.advanceTimersByTime(90_000);
+        resolve({ ok: true, result: { ok: true, text: 'hello' } });
+      })
+    );
+
+    const chunk = makeChunk(15);
+    const req: ASRRequest = { chunk, hintLang: 'en', allowPartial: false };
+    const promise = asr.transcribe(req);
+    // 推進超時窗口（120s）——90s < 120s → 不超時。
+    await vi.advanceTimersByTimeAsync(120_000);
+    const result = await promise;
+    expect(result.segments[0].sourceText).toBe('hello');
     vi.useRealTimers();
   });
 

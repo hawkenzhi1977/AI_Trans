@@ -50080,6 +50080,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
         });
       }
       let finalText = translatedLines.join("\n");
+      if (wrongLanguage) {
+        finalText = sourceLines.join("\n");
+      }
       if (targetLang === "zh-Hant") {
         finalText = s2tConverter(finalText);
       }

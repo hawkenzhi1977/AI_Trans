@@ -29,6 +29,9 @@ export interface RealtimeASRDeps {
  */
 export const VAD_FALLBACK_SILENT_CHUNKS = 40;
 
+/** M2-64：ASR 返回文本總長小於此值時跳過翻譯——local-onnx 對極短無意義文本輸出 [BLANK AUDIO]。 */
+const MIN_TRANSLATE_TEXT_LEN = 3;
+
 /**
  * M2-58：將 ASR segment 時間戳對齊到視頻時間軸。
  * Whisper 輸出的 start/end 相對於輸入 chunk（0~chunk.duration）；
@@ -258,10 +261,17 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             });
 
             // M2-58：ASR 結果摘要（每結果一行的頻率 ~1/s，非洪水）。
+            const totalTextLen = asrResult.segments.reduce((n, s) => n + s.sourceText.trim().length, 0);
             diagLog(
               'strategy',
-              `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${asrResult.segments.reduce((n, s) => n + s.sourceText.length, 0)}`,
+              `realtime-asr: ASR result seq=${chunk.seq}, segments=${asrResult.segments.length}, partial=${asrResult.isPartial}, textLen=${totalTextLen}`,
             );
+
+            // M2-64：極短文本跳過翻譯——local-onnx 對 "um"/"yeah" 等輸出 [BLANK AUDIO]，浪費 15-27s CPU。
+            if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
+              diagLog('strategy', `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
+              return;
+            }
 
             // 翻譯。
             const translateStart = performance.now();
@@ -296,6 +306,13 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             type: 'metrics',
             data: { stage: 'asr', ms: asrMs, seq: chunk.seq, rtf: asrResult.rtf },
           });
+
+          // M2-64：極短文本跳過翻譯（非流式路徑）。
+          const totalTextLen = asrResult.segments.reduce((n, s) => n + s.sourceText.trim().length, 0);
+          if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
+            diagLog('strategy', `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
+            return;
+          }
 
           const translateStart = performance.now();
           const translatedSegments = await this.translateSegments(

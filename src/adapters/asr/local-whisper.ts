@@ -42,8 +42,8 @@ interface AsrTranscribeResponse {
   rtf?: number;
 }
 
-/** M2-57/M2-63：transcribe 超時（ms）——首次推理含模型下載+載入，需更長超時。 */
-const TRANSCRIBE_TIMEOUT_MS = 60_000;
+/** M2-57/M2-63/M2-64：transcribe 超時（ms）——串行化後含 lock 排隊（local-onnx ~20s）+ 自身推理，需更長超時。 */
+const TRANSCRIBE_TIMEOUT_MS = 120_000;
 
 /**
  * M2-57：帶超時的 sendMessage 包裝。

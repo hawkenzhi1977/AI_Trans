@@ -357,7 +357,7 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
     expect(stored.lastDiagnostic.message).toContain('1. Hello\\n2. World');
   });
 
-  it('runInference：目標語言為中文但輸出英文 → 落 wrongLanguage 診斷', async () => {
+  it('runInference：目標語言為中文但輸出英文 → 落 wrongLanguage 診斷 + 回退原文', async () => {
     installCaches([makeRequest(MODEL_ONNX_URL)]);
     transformersMock.pipeline.mockResolvedValue(async () => [
       { generated_text: '1. keyboard\n2. monitor' },
@@ -367,11 +367,26 @@ describe('offscreen local-onnx Prompt 與輸出解析（補充修復十一）', 
 
     expect(res.ok).toBe(true);
     expect((res as { wrongLanguage?: boolean }).wrongLanguage).toBe(true);
+    // M2-64：wrongLanguage 時 translatedText 回退原文（非模型英文輸出）。
+    expect((res as { translatedText?: string }).translatedText).toBe('Hello\nWorld');
     expect(chrome.storage.local.set).toHaveBeenCalled();
     const stored = await chrome.storage.local.get('lastDiagnostic');
     expect(stored.lastDiagnostic.message).toContain('wrong language');
     expect(stored.lastDiagnostic.message).toContain('target: zh-Hant');
     expect(stored.lastDiagnostic.message).toContain('raw output:');
+  });
+
+  it('M2-64：wrongLanguage=[BLANK AUDIO] → translatedText 回退原文', async () => {
+    installCaches([makeRequest(MODEL_ONNX_URL)]);
+    transformersMock.pipeline.mockResolvedValue(async () => [
+      { generated_text: '1. [BLANK AUDIO]' },
+    ]);
+
+    const res = await _testExports.runInference('um', 'zh-Hant', undefined);
+
+    expect(res.ok).toBe(true);
+    // [BLANK AUDIO] 無中文 → wrongLanguage=true → 回退原文 "um"。
+    expect((res as { translatedText?: string }).translatedText).toBe('um');
   });
 
   it('runInference：無回顯（正常翻譯）不寫 echo 診斷', async () => {
