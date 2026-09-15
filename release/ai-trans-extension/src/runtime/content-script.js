@@ -465,12 +465,16 @@
   // src/application/strategies/realtime-asr-strategy.ts
   var VAD_FALLBACK_SILENT_CHUNKS = 40;
   var MIN_TRANSLATE_TEXT_LEN = 3;
+  var DEDUP_CONSECUTIVE_THRESHOLD = 3;
+  var MIN_DISPLAY_WINDOW_MS = 5e3;
+  var MAX_INFLIGHT_ASR = 2;
   function alignSegmentsToVideoTimeline(segments, chunkStartMs) {
-    return segments.map((s) => ({
-      ...s,
-      start: Math.max(0, s.start + chunkStartMs),
-      end: Math.max(0, s.end + chunkStartMs)
-    }));
+    return segments.map((s) => {
+      const start2 = Math.max(0, s.start + chunkStartMs);
+      const rawEnd = Math.max(0, s.end + chunkStartMs);
+      const end = Math.max(rawEnd, start2 + MIN_DISPLAY_WINDOW_MS);
+      return { ...s, start: start2, end };
+    });
   }
   function filterEmptySegments(segments) {
     return segments.filter(
@@ -499,6 +503,11 @@
     asrCallCount = 0;
     // M2-65：累計字幕緩衝——每次 emit 發送全量（非僅當前 chunk），避免 content-script 全量替換丟失舊字幕。
     accumulatedSegments = /* @__PURE__ */ new Map();
+    // M2-66：ASR 結果去重——追蹤連續相同文本的 chunk 數。
+    lastAsrText = "";
+    consecutiveDuplicateCount = 0;
+    // M2-66：Backpressure——in-flight ASR 請求計數。
+    inflightAsrCount = 0;
     /** 注入依賴（由 Orchestrator 調用）。 */
     inject(deps) {
       this.deps = deps;
@@ -507,6 +516,9 @@
       this.vadFallbackArmed = false;
       this.asrCallCount = 0;
       this.accumulatedSegments.clear();
+      this.lastAsrText = "";
+      this.consecutiveDuplicateCount = 0;
+      this.inflightAsrCount = 0;
       this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
       this.perf = new PerfMetrics(100);
     }
@@ -606,10 +618,15 @@
           return;
         }
         this.consecutiveSilentChunks = 0;
+        if (this.inflightAsrCount >= MAX_INFLIGHT_ASR) {
+          diagLog("strategy", `realtime-asr: backpressure \u2014 skipping seq=${chunk.seq} (inflight=${this.inflightAsrCount})`);
+          return;
+        }
         this.asrCallCount++;
         if (this.asrCallCount === 1) {
           diagLog("strategy", `realtime-asr: first ASR dispatch (seq=${chunk.seq}, chunkMs=${Math.round(chunk.duration)})`);
         }
+        this.inflightAsrCount++;
         try {
           const req = {
             chunk,
@@ -640,6 +657,17 @@
               if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
                 diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
                 return;
+              }
+              const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(" ").toLowerCase();
+              if (currentText === this.lastAsrText) {
+                this.consecutiveDuplicateCount++;
+                if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
+                  diagLog("strategy", `realtime-asr: dedup \u2014 skipping duplicate text "${currentText.slice(0, 30)}" (consecutive=${this.consecutiveDuplicateCount}, seq=${chunk.seq})`);
+                  return;
+                }
+              } else {
+                this.lastAsrText = currentText;
+                this.consecutiveDuplicateCount = 1;
               }
               const translateStart = performance.now();
               const translatedSegments = await this.translateSegments(
@@ -675,6 +703,17 @@
               diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
               return;
             }
+            const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(" ").toLowerCase();
+            if (currentText === this.lastAsrText) {
+              this.consecutiveDuplicateCount++;
+              if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
+                diagLog("strategy", `realtime-asr: dedup \u2014 skipping duplicate text "${currentText.slice(0, 30)}" (consecutive=${this.consecutiveDuplicateCount}, seq=${chunk.seq})`);
+                return;
+              }
+            } else {
+              this.lastAsrText = currentText;
+              this.consecutiveDuplicateCount = 1;
+            }
             const translateStart = performance.now();
             const translatedSegments = await this.translateSegments(
               asrResult.segments,
@@ -706,6 +745,8 @@
             port: "asr",
             reason: `ASR failed: ${err instanceof Error ? err.message : String(err)}`
           });
+        } finally {
+          this.inflightAsrCount = Math.max(0, this.inflightAsrCount - 1);
         }
       });
       this.unsubscribeChunk = () => {

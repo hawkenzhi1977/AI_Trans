@@ -48833,6 +48833,8 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var audioContext = null;
   var scriptProcessor = null;
   var currentPort = null;
+  var AUDIO_ACCUMULATE_TARGET_MS = 5e3;
+  var audioAccumBuffer = null;
   var passthroughContext = null;
   var passthroughSource = null;
   var IDLE_TIMEOUT_MS = 10 * 60 * 1e3;
@@ -48964,13 +48966,27 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           windowMaxRms = 0;
           windowStart = now;
         }
-        const response = {
-          type: "audioChunk",
-          pcm: encodePcmFloat32(pcm),
-          sampleRate: audioContext?.sampleRate ?? 16e3,
-          timestamp: now
-        };
-        portRef.postMessage(response);
+        const sampleRate = audioContext?.sampleRate ?? 16e3;
+        if (!audioAccumBuffer) {
+          audioAccumBuffer = new Float32Array(pcm.length);
+          audioAccumBuffer.set(pcm);
+        } else {
+          const merged = new Float32Array(audioAccumBuffer.length + pcm.length);
+          merged.set(audioAccumBuffer);
+          merged.set(pcm, audioAccumBuffer.length);
+          audioAccumBuffer = merged;
+        }
+        const accumulatedMs = audioAccumBuffer.length / sampleRate * 1e3;
+        if (accumulatedMs >= AUDIO_ACCUMULATE_TARGET_MS) {
+          const response = {
+            type: "audioChunk",
+            pcm: encodePcmFloat32(audioAccumBuffer),
+            sampleRate,
+            timestamp: now
+          };
+          portRef.postMessage(response);
+          audioAccumBuffer = null;
+        }
       };
       source.connect(scriptProcessor);
       scriptProcessor.connect(audioContext.destination);
@@ -48999,6 +49015,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
     }
   }
   async function detachAudioProcessing() {
+    audioAccumBuffer = null;
     if (scriptProcessor) {
       scriptProcessor.disconnect();
       scriptProcessor = null;

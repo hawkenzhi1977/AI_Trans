@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-09-15（**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
+> 最後更新：2026-09-15（**M2-66：實時 ASR 字幕不顯示修復**——新增 §4.28 `realtime-asr-backpressure`（inflight ≥ MAX_INFLIGHT_ASR=2 時跳過新 chunk，diagLog 留痕）+ §4.29 `realtime-asr-dedup`（連續 DEDUP_CONSECUTIVE_THRESHOLD=3 次相同 ASR 文本跳過翻譯，diagLog 留痕）；`alignSegmentsToVideoTimeline()` 新增 MIN_DISPLAY_WINDOW_MS=5000 最小顯示窗口（非診斷碼，行為變更）。先前：**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
 
 ---
 
@@ -637,6 +637,30 @@
 - **用戶響應**: 字幕顯示原文（未翻譯）；若持續出現，建議在 Options 中切換到雲端翻譯引擎
 - **開發者響應**: 查看 popup「最近失敗」的 `local-onnx-circuit-breaker-opened` 診斷；確認 N 值（連續失敗 chunk 數）；對照 Offscreen console 的 `wrongLanguage`/`echoed`/`degenerate` 麵包屑確認失敗原因
 - **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`CIRCUIT_BREAKER_THRESHOLD` 常量 + `translate()`/`translateStream()` 電路斷開器邏輯 + `recordDiagnostic`）
+
+### 4.28 realtime-asr Backpressure 跳過（M2-66）
+
+- **診斷碼**: `realtime-asr-backpressure`（diagLog，非 recordDiagnostic）
+- **port / kind**: `strategy` / info（diagLog 留痕，不發降級事件）
+- **用戶可見消息**: 無直接 UI 顯示（diagLog `strategy` 分類可選開啟）；間接效果：字幕延遲略增（跳過的 chunk 不產生字幕）
+- **觸發條件**: `RealtimeASRStrategy.onChunk()` 中 `inflightAsrCount >= MAX_INFLIGHT_ASR (2)`——已有 2 個 ASR 推理在飛，新 chunk 跳過
+- **根因**: `withInferenceLock` 串行化 ASR+translation，chunk 每 256ms 到一個但推理 ~25s/個 → 隊列爆炸 → 超時。Backpressure 在策略層跳過擁塞 chunk，避免無界隊列
+- **修復措施**: `MAX_INFLIGHT_ASR = 2`、`inflightAsrCount` 計數器，onChunk 入口檢查；try/finally 確保遞減（推理成功/失敗/超時都遞減）。跳過時 `diagLog('strategy', 'realtime-asr: backpressure — skipping seq=N (inflight=M)')`
+- **用戶響應**: 字幕間隔略增（跳過的 chunk 無字幕）；若持續大量跳過，建議降低 ASR 模型檔位（tiny/base）
+- **開發者響應**: Options 頁開啟 `strategy` 調試日誌，觀察 backpressure 頻率；若 >50% chunk 被跳過則推理速度跟不上音頻速率
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`MAX_INFLIGHT_ASR` + `inflightAsrCount` + onChunk 檢查 + try/finally 遞減）
+
+### 4.29 realtime-asr ASR 去重跳過（M2-66）
+
+- **診斷碼**: `realtime-asr-dedup`（diagLog，非 recordDiagnostic）
+- **port / kind**: `strategy` / info（diagLog 留痕，不發降級事件）
+- **用戶可見消息**: 無直接 UI 顯示（diagLog `strategy` 分類可選開啟）；間接效果：音樂/靜音段不產生重複字幕
+- **觸發條件**: `RealtimeASRStrategy` 流式/非流式路徑中 ASR 返回文本與 `lastAsrText` 相同且 `consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD (3)`——連續 3 次相同文本跳過翻譯
+- **根因**: Whisper 對 256ms 碎片（音樂/靜音）產出重複 `[MUSIC]`（7 chars），通過 `MIN_TRANSLATE_TEXT_LEN=3` 過濾但觸發大量無意義翻譯推理（每次 15-27s）
+- **修復措施**: `DEDUP_CONSECUTIVE_THRESHOLD = 3`、`lastAsrText: string`、`consecutiveDuplicateCount: number`；流式（transcribeStream）和非流式（transcribe）路徑均在翻譯前檢查；不同文本重置計數為 1；`stop()`/`inject()` 重置。跳過時 `diagLog('strategy', 'realtime-asr: dedup — skipping duplicate text "..." (consecutive=N, seq=M)')`
+- **用戶響應**: 音樂/靜音段無重複字幕（正常行為）；若所有字幕都被跳過則 ASR 模型可能持續產出相同文本
+- **開發者響應**: Options 頁開啟 `strategy` 調試日誌，觀察 dedup 頻率與跳過文本內容；若跳過文本非 `[MUSIC]`/`[BLANK]` 則可能是 ASR 模型問題
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`DEDUP_CONSECUTIVE_THRESHOLD` + `lastAsrText` + `consecutiveDuplicateCount` + 流式/非流式去重檢查 + stop/inject 重置）
 
 ---
 

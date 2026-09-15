@@ -143,9 +143,12 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
 
     expect(scriptProcessors).toHaveLength(1);
     const input = new Float32Array(4096).fill(0.1);
-    scriptProcessors[0].onaudioprocess!({
-      inputBuffer: { getChannelData: () => input },
-    });
+    // M2-66：音頻累積至 ~5s 才發送（4096 samples × 20 = 81920 samples ≈ 5.12s @ 16kHz）。
+    for (let i = 0; i < 20; i++) {
+      scriptProcessors[0].onaudioprocess!({
+        inputBuffer: { getChannelData: () => input },
+      });
+    }
 
     const chunkMsg = port.postMessage.mock.calls
       .map((c) => c[0] as { type: string; pcm?: string; sampleRate?: number })
@@ -154,7 +157,8 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
     // M2-59：pcm 為 base64 string（修復 extension messaging 對 Float32Array 序列化損毀）。
     expect(typeof chunkMsg!.pcm).toBe('string');
     const decoded = decodePcmFloat32(chunkMsg!.pcm!);
-    expect(decoded).toHaveLength(4096);
+    // 累積 20 × 4096 = 81920 samples
+    expect(decoded).toHaveLength(81_920);
     // 值精確還原（非引用同一陣列——事件緩衝回收後仍有效）。
     for (let i = 0; i < decoded.length; i++) {
       expect(decoded[i]).toBeCloseTo(0.1, 6);

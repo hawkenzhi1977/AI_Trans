@@ -136,6 +136,11 @@ let mediaStreamSource: MediaStreamAudioSourceNode | null = null;
 let audioContext: AudioContext | null = null;
 let scriptProcessor: ScriptProcessorNode | null = null;
 let currentPort: chrome.runtime.Port | null = null;
+
+// M2-66：音頻累積緩衝——將 256ms 碎片累積至 ~5s 再發送，
+// 讓 Whisper 有足夠上下文產出準確結果（256ms 碎片只能識別 [MUSIC]）。
+const AUDIO_ACCUMULATE_TARGET_MS = 5000;
+let audioAccumBuffer: Float32Array | null = null;
 // M2-53：tabCapture 聲音回播——Chrome 以非原生採樣率打開 AudioContext 時
 // 不會自動將捕獲流回播到揚聲器，需要獨立的原生採樣率 passthrough context 負責回播，
 // 16kHz 的 audioContext 只負責 ASR PCM 提取。
@@ -345,13 +350,28 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
         windowMaxRms = 0;
         windowStart = now;
       }
-      const response: OffscreenResponse = {
-        type: 'audioChunk',
-        pcm: encodePcmFloat32(pcm),
-        sampleRate: audioContext?.sampleRate ?? 16000,
-        timestamp: now,
-      };
-      portRef.postMessage(response);
+      // M2-66：累積至 ~5s 再發送（Whisper 需要連續音頻才能準確識別）。
+      const sampleRate = audioContext?.sampleRate ?? 16000;
+      if (!audioAccumBuffer) {
+        audioAccumBuffer = new Float32Array(pcm.length);
+        audioAccumBuffer.set(pcm);
+      } else {
+        const merged = new Float32Array(audioAccumBuffer.length + pcm.length);
+        merged.set(audioAccumBuffer);
+        merged.set(pcm, audioAccumBuffer.length);
+        audioAccumBuffer = merged;
+      }
+      const accumulatedMs = (audioAccumBuffer.length / sampleRate) * 1000;
+      if (accumulatedMs >= AUDIO_ACCUMULATE_TARGET_MS) {
+        const response: OffscreenResponse = {
+          type: 'audioChunk',
+          pcm: encodePcmFloat32(audioAccumBuffer),
+          sampleRate,
+          timestamp: now,
+        };
+        portRef.postMessage(response);
+        audioAccumBuffer = null;
+      }
     };
 
     source.connect(scriptProcessor);
@@ -390,6 +410,8 @@ async function startCapture(streamId: string | null, port: chrome.runtime.Port):
  * 下次 startCapture 可複用已有 MediaStream，完全繞開 streamId TTL。
  */
 async function detachAudioProcessing(): Promise<void> {
+  // M2-66：清除累積緩衝（§5.4：每次 detach 都必須清理）。
+  audioAccumBuffer = null;
   if (scriptProcessor) {
     scriptProcessor.disconnect();
     scriptProcessor = null;

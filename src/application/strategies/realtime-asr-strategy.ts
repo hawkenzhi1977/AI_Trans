@@ -33,6 +33,21 @@ export const VAD_FALLBACK_SILENT_CHUNKS = 40;
 const MIN_TRANSLATE_TEXT_LEN = 3;
 
 /**
+ * M2-66：ASR 結果去重——連續 N 個 chunk 返回相同文本時視為重複（Whisper 對
+ * 低音量/音樂段會反覆產出相同短文本如 [MUSIC]），跳過翻譯以減少鎖競爭。
+ */
+const DEDUP_CONSECUTIVE_THRESHOLD = 3;
+
+/**
+ * M2-66：最小顯示窗口（ms）——ASR segment 的 end-start 可能僅 256ms（單碎片），
+ * 加上推理延遲後 cue 到達時已過期。擴展至至少 5s 確保用戶有時間看到字幕。
+ */
+const MIN_DISPLAY_WINDOW_MS = 5000;
+
+/** M2-66：Backpressure——in-flight ASR 請求數超過此值時跳過新 chunk。 */
+const MAX_INFLIGHT_ASR = 2;
+
+/**
  * M2-58：將 ASR segment 時間戳對齊到視頻時間軸。
  * Whisper 輸出的 start/end 相對於輸入 chunk（0~chunk.duration）；
  * 加上 chunk 開始時的視頻時間（onChunk 以播放狀態反推）即為視頻絕對時間。
@@ -42,11 +57,14 @@ export function alignSegmentsToVideoTimeline(
   segments: SubtitleSegment[],
   chunkStartMs: number,
 ): SubtitleSegment[] {
-  return segments.map((s) => ({
-    ...s,
-    start: Math.max(0, s.start + chunkStartMs),
-    end: Math.max(0, s.end + chunkStartMs),
-  }));
+  return segments.map((s) => {
+    const start = Math.max(0, s.start + chunkStartMs);
+    // M2-66：確保最小顯示窗口——Whisper 對短碎片返回的 segment 可能僅 256ms，
+    // 加上推理延遲後 cue 到達時已過期。擴展 end 至至少 MIN_DISPLAY_WINDOW_MS。
+    const rawEnd = Math.max(0, s.end + chunkStartMs);
+    const end = Math.max(rawEnd, start + MIN_DISPLAY_WINDOW_MS);
+    return { ...s, start, end };
+  });
 }
 
 /** M2-58：過濾空文本 segment（靜音/識別失敗），避免空白 cue 進入 overlay。 */
@@ -86,6 +104,12 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   // M2-65：累計字幕緩衝——每次 emit 發送全量（非僅當前 chunk），避免 content-script 全量替換丟失舊字幕。
   private accumulatedSegments = new Map<string, SubtitleSegment>();
 
+  // M2-66：ASR 結果去重——追蹤連續相同文本的 chunk 數。
+  private lastAsrText = '';
+  private consecutiveDuplicateCount = 0;
+  // M2-66：Backpressure——in-flight ASR 請求計數。
+  private inflightAsrCount = 0;
+
   /** 注入依賴（由 Orchestrator 調用）。 */
   inject(deps: RealtimeASRDeps): void {
     this.deps = deps;
@@ -95,6 +119,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     this.vadFallbackArmed = false;
     this.asrCallCount = 0;
     this.accumulatedSegments.clear();
+    this.lastAsrText = '';
+    this.consecutiveDuplicateCount = 0;
+    this.inflightAsrCount = 0;
     this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
     this.perf = new PerfMetrics(100); // 滑動窗口 100 樣本。
   }
@@ -230,12 +257,19 @@ export class RealtimeASRStrategy implements CaptionStrategy {
       }
       this.consecutiveSilentChunks = 0;
 
+      // M2-66：Backpressure——in-flight ASR 請求過多時跳過（防鎖隊列爆炸）。
+      if (this.inflightAsrCount >= MAX_INFLIGHT_ASR) {
+        diagLog('strategy', `realtime-asr: backpressure — skipping seq=${chunk.seq} (inflight=${this.inflightAsrCount})`);
+        return;
+      }
+
       // M2-58：首次 ASR dispatch breadcrumb（§5.6）——確認 VAD→ASR 交接真的發生。
       this.asrCallCount++;
       if (this.asrCallCount === 1) {
         diagLog('strategy', `realtime-asr: first ASR dispatch (seq=${chunk.seq}, chunkMs=${Math.round(chunk.duration)})`);
       }
 
+      this.inflightAsrCount++;
       try {
         // ASR 推理（流式）。
         const req = {
@@ -274,6 +308,19 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             if (totalTextLen < MIN_TRANSLATE_TEXT_LEN) {
               diagLog('strategy', `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
               return;
+            }
+
+            // M2-66：去重——連續相同文本跳過翻譯（Whisper 對低音量/音樂段反覆產出 [MUSIC]）。
+            const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(' ').toLowerCase();
+            if (currentText === this.lastAsrText) {
+              this.consecutiveDuplicateCount++;
+              if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
+                diagLog('strategy', `realtime-asr: dedup — skipping duplicate text "${currentText.slice(0, 30)}" (consecutive=${this.consecutiveDuplicateCount}, seq=${chunk.seq})`);
+                return;
+              }
+            } else {
+              this.lastAsrText = currentText;
+              this.consecutiveDuplicateCount = 1;
             }
 
             // 翻譯。
@@ -317,6 +364,19 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             return;
           }
 
+          // M2-66：去重（非流式路徑）。
+          const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(' ').toLowerCase();
+          if (currentText === this.lastAsrText) {
+            this.consecutiveDuplicateCount++;
+            if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
+              diagLog('strategy', `realtime-asr: dedup — skipping duplicate text "${currentText.slice(0, 30)}" (consecutive=${this.consecutiveDuplicateCount}, seq=${chunk.seq})`);
+              return;
+            }
+          } else {
+            this.lastAsrText = currentText;
+            this.consecutiveDuplicateCount = 1;
+          }
+
           const translateStart = performance.now();
           const translatedSegments = await this.translateSegments(
             asrResult.segments,
@@ -351,6 +411,8 @@ export class RealtimeASRStrategy implements CaptionStrategy {
           port: 'asr',
           reason: `ASR failed: ${err instanceof Error ? err.message : String(err)}`,
         });
+      } finally {
+        this.inflightAsrCount = Math.max(0, this.inflightAsrCount - 1);
       }
     });
 
