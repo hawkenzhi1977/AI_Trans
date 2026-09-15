@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-09-14（**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
+> 最後更新：2026-09-15（**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
 
 ---
 
@@ -626,6 +626,17 @@
 - **開發者響應**: 查看 popup「最近失敗」的 `asr-stream-id-restart-failed` 診斷；確認 `InMemoryTabStreamIdProvider.consumeStreamId()` 在 restart 後能正確返回 string（有效 id）
 - **代碼落點**: src/runtime/content-script.ts（`onMessage asr:stream-id` handler，`restart()` 觸發 + catch 落診斷）
 
+### 4.27 local-onnx 電路斷開器觸發（M2-65）
+
+- **診斷碼**: `local-onnx-circuit-breaker-opened`
+- **port / kind**: `translation` / `degraded`（recoverable）
+- **用戶可見消息**: popup「最近失敗」——「錯誤: local-onnx-circuit-breaker-opened: N consecutive chunks failed (echoed/degenerate/wrongLanguage), skipping inference for remaining chunks」；字幕顯示原文（未翻譯）
+- **觸發條件**: `LocalONNXTranslationProvider.translate()`/`translateStream()` 中連續 `CIRCUIT_BREAKER_THRESHOLD = 3` 個 chunk 失敗（echoed || degenerate || wrongLanguage），電路斷開器開啟
+- **根因**: local-onnx（Qwen2.5-0.5B on WASM）對特定音頻持續輸出無意義內容（`[BLANK AUDIO]`/回顯原文），M2-64 的 wrongLanguage 回退只解決單 chunk 層面；連續多 chunk 都失敗時用戶仍看到大量原文/無意義字幕，且每次推理耗費 15-27s 浪費 CPU
+- **修復措施**: `local-onnx-translation.ts` 新增 `CIRCUIT_BREAKER_THRESHOLD = 3`——每次 `translate()`/`translateStream()` 調用獨立計數（per-session），失敗條件 = `echoed || degenerate || wrongLanguage`，成功 chunk 重置計數。斷開後剩餘 chunk 直接 `translatedText = sourceText`，不發送 port message（跳過推理）。電路斷開器在每次新調用時重置（非永久）
+- **用戶響應**: 字幕顯示原文（未翻譯）；若持續出現，建議在 Options 中切換到雲端翻譯引擎
+- **開發者響應**: 查看 popup「最近失敗」的 `local-onnx-circuit-breaker-opened` 診斷；確認 N 值（連續失敗 chunk 數）；對照 Offscreen console 的 `wrongLanguage`/`echoed`/`degenerate` 麵包屑確認失敗原因
+- **代碼落點**: src/adapters/translation/local-onnx-translation.ts（`CIRCUIT_BREAKER_THRESHOLD` 常量 + `translate()`/`translateStream()` 電路斷開器邏輯 + `recordDiagnostic`）
 
 ---
 

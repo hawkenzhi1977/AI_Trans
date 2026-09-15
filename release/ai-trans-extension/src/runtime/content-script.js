@@ -497,6 +497,8 @@
     vadWindowStart = 0;
     // M2-58：ASR 調用計數（首調 breadcrumb——確認 VAD→ASR 交接真的發生）。
     asrCallCount = 0;
+    // M2-65：累計字幕緩衝——每次 emit 發送全量（非僅當前 chunk），避免 content-script 全量替換丟失舊字幕。
+    accumulatedSegments = /* @__PURE__ */ new Map();
     /** 注入依賴（由 Orchestrator 調用）。 */
     inject(deps) {
       this.deps = deps;
@@ -504,6 +506,7 @@
       this.consecutiveSilentChunks = 0;
       this.vadFallbackArmed = false;
       this.asrCallCount = 0;
+      this.accumulatedSegments.clear();
       this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
       this.perf = new PerfMetrics(100);
     }
@@ -721,6 +724,7 @@
       this.vadSessionMaxRms = 0;
       this.vadWindowStart = 0;
       this.asrCallCount = 0;
+      this.accumulatedSegments.clear();
       if (this.downgradeCheckInterval !== null) {
         clearInterval(this.downgradeCheckInterval);
         this.downgradeCheckInterval = null;
@@ -750,17 +754,21 @@
     }
     /**
      * M2-58：對齊 + 過濾後推送。全空時跳過 emit（留 breadcrumb，§5.6 不靜默）。
-     * chunk.startTime 已在 onChunk 以播放狀態反推（視頻時間軸）。
+     * M2-65：累計 emit——將新 segment 合併入緩衝（按 id 去重/覆蓋），emit 全量列表。
+     * content-script 的 onEvent 做全量替換 this.cues，因此必須發送累計全量而非僅當前 chunk。
      */
     emitAligned(asrResult, translatedSegments, chunk, emit) {
-      const segments = filterEmptySegments(
-        alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime)
-      );
-      if (segments.length === 0) {
+      const aligned = alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime);
+      const filtered = filterEmptySegments(aligned);
+      if (filtered.length === 0) {
         diagLog("strategy", `realtime-asr: ASR returned no usable text (seq=${chunk.seq}), skipping emit`);
         return;
       }
-      emit({ type: asrResult.isPartial ? "segments-updated" : "segments-ready", segments });
+      for (const seg of filtered) {
+        this.accumulatedSegments.set(seg.id, seg);
+      }
+      const allSegments = [...this.accumulatedSegments.values()].sort((a, b) => a.start - b.start);
+      emit({ type: asrResult.isPartial ? "segments-updated" : "segments-ready", segments: allSegments });
     }
     /** 獲取性能統計摘要（用於觀測與調試）。 */
     getPerfSummary() {
@@ -2467,6 +2475,7 @@ Example output:
   var MAX_SESSION_DURATION_MS = 10 * 60 * 1e3;
   var PER_CHUNK_TIMEOUT_MS = 6e4;
   var SLOW_CHUNK_THRESHOLD_MS = Math.floor(PER_CHUNK_TIMEOUT_MS * 0.75);
+  var CIRCUIT_BREAKER_THRESHOLD = 3;
   var modelStats = {
     totalChunks: 0,
     mergedChunks: 0,
@@ -2551,14 +2560,44 @@ Example output:
     /**
      * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。
      * 分塊避免單次輸入過長壓垮小模型（回顯原文根因之一）。
+     * M2-65：電路斷開器——連續 CIRCUIT_BREAKER_THRESHOLD 個 chunk 失敗後跳過推理，直接回退原文。
      */
     async translate(req) {
       const targetLang = req.targetLang ?? this.defaultTargetLang;
       const translatedSegments = [];
+      let consecutiveFailures = 0;
+      let circuitOpen = false;
       for (let i = 0; i < req.segments.length; i += this.chunkSize) {
         const chunk = req.segments.slice(i, i + this.chunkSize);
+        if (circuitOpen) {
+          translatedSegments.push(
+            ...chunk.map((seg) => ({ ...seg, translatedText: seg.sourceText }))
+          );
+          continue;
+        }
         const chunkResult = await this.translateChunk(chunk, targetLang);
         translatedSegments.push(...chunkResult.segments);
+        if (chunkResult.echoed || chunkResult.degenerate || chunkResult.wrongLanguage) {
+          consecutiveFailures++;
+          if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+            circuitOpen = true;
+            const remaining = Math.ceil((req.segments.length - (i + this.chunkSize)) / this.chunkSize);
+            diagLog("local-onnx", `circuit-breaker-opened: ${consecutiveFailures} consecutive failures, skipping ${remaining} remaining chunks`);
+            recordDiagnostic({
+              type: "pipeline-error",
+              error: {
+                port: "translation",
+                code: "local-onnx-circuit-breaker-opened",
+                recoverable: true,
+                cause: new Error(
+                  `local ONNX circuit breaker opened after ${consecutiveFailures} consecutive failed chunks; ${remaining} remaining chunks skipped (fallback to source text)`
+                )
+              }
+            });
+          }
+        } else {
+          consecutiveFailures = 0;
+        }
       }
       return {
         engineId: this.engineId,
@@ -2771,6 +2810,8 @@ Example output:
       let echoedChunks = 0;
       let degenerateChunks = 0;
       let wrongLanguageChunks = 0;
+      let consecutiveFailures = 0;
+      let circuitOpen = false;
       const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
       const streamStartedAt = performance.now();
       for (let i = 0; i < req.segments.length; i += this.chunkSize) {
@@ -2796,6 +2837,18 @@ Example output:
         }
         const chunk = req.segments.slice(i, i + this.chunkSize);
         const chunkIndex = Math.floor(i / this.chunkSize) + 1;
+        if (circuitOpen) {
+          accumulated.push(
+            ...chunk.map((seg) => ({ ...seg, translatedText: seg.sourceText }))
+          );
+          diagLog("local-onnx", `chunk ${chunkIndex}/${totalChunks} skipped (circuit open), fallback to source`);
+          emit({
+            engineId: this.engineId,
+            degraded: !this.isPrimary,
+            segments: [...accumulated]
+          });
+          continue;
+        }
         const chunkStartedAt = performance.now();
         const chunkResult = await this.translateChunk(chunk, targetLang);
         const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
@@ -2803,6 +2856,27 @@ Example output:
         if (chunkResult.echoed) echoedChunks += 1;
         if (chunkResult.degenerate) degenerateChunks += 1;
         if (chunkResult.wrongLanguage) wrongLanguageChunks += 1;
+        if (chunkResult.echoed || chunkResult.degenerate || chunkResult.wrongLanguage) {
+          consecutiveFailures++;
+          if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+            circuitOpen = true;
+            const remaining = Math.ceil((req.segments.length - (i + this.chunkSize)) / this.chunkSize);
+            diagLog("local-onnx", `circuit-breaker-opened: ${consecutiveFailures} consecutive failures, skipping ${remaining} remaining chunks`);
+            recordDiagnostic({
+              type: "pipeline-error",
+              error: {
+                port: "translation",
+                code: "local-onnx-circuit-breaker-opened",
+                recoverable: true,
+                cause: new Error(
+                  `local ONNX circuit breaker opened after ${consecutiveFailures} consecutive failed chunks; ${remaining} remaining chunks skipped (fallback to source text)`
+                )
+              }
+            });
+          }
+        } else {
+          consecutiveFailures = 0;
+        }
         const totalElapsedMs = Math.round(performance.now() - streamStartedAt);
         const segmentsPerSec = (accumulated.length / (totalElapsedMs / 1e3)).toFixed(2);
         diagLog(

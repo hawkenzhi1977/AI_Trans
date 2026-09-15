@@ -56,6 +56,9 @@ const PER_CHUNK_TIMEOUT_MS = 60_000; // 60 秒
 /** M2-64：慢 chunk 降級閾值——接近超時（75%）才警告，避免正常慢機器（15-27s）被誤判。 */
 const SLOW_CHUNK_THRESHOLD_MS = Math.floor(PER_CHUNK_TIMEOUT_MS * 0.75); // 45 秒
 
+/** M2-65：電路斷開器閾值——連續 N 個 chunk 失敗（echoed/degenerate/wrongLanguage）後跳過推理。 */
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+
 /** 翻譯質量統計（用於後續優化分析）。 */
 const modelStats = {
   totalChunks: 0,
@@ -157,15 +160,51 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
   /**
    * 非流式翻譯——分塊發送給 Service Worker（轉發 Offscreen Document 執行 ONNX 推理）。
    * 分塊避免單次輸入過長壓垮小模型（回顯原文根因之一）。
+   * M2-65：電路斷開器——連續 CIRCUIT_BREAKER_THRESHOLD 個 chunk 失敗後跳過推理，直接回退原文。
    */
   async translate(req: TranslationRequest): Promise<TranslationResult> {
     const targetLang = req.targetLang ?? this.defaultTargetLang;
     const translatedSegments: SubtitleSegment[] = [];
+    let consecutiveFailures = 0;
+    let circuitOpen = false;
 
     for (let i = 0; i < req.segments.length; i += this.chunkSize) {
       const chunk = req.segments.slice(i, i + this.chunkSize);
+
+      if (circuitOpen) {
+        // 電路已斷開：跳過推理，直接回退原文。
+        translatedSegments.push(
+          ...chunk.map((seg) => ({ ...seg, translatedText: seg.sourceText }))
+        );
+        continue;
+      }
+
       const chunkResult = await this.translateChunk(chunk, targetLang);
       translatedSegments.push(...chunkResult.segments);
+
+      // 電路斷開器計數。
+      if (chunkResult.echoed || chunkResult.degenerate || chunkResult.wrongLanguage) {
+        consecutiveFailures++;
+        if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+          circuitOpen = true;
+          const remaining = Math.ceil((req.segments.length - (i + this.chunkSize)) / this.chunkSize);
+          diagLog('local-onnx', `circuit-breaker-opened: ${consecutiveFailures} consecutive failures, skipping ${remaining} remaining chunks`);
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'translation',
+              code: 'local-onnx-circuit-breaker-opened',
+              recoverable: true,
+              cause: new Error(
+                `local ONNX circuit breaker opened after ${consecutiveFailures} consecutive failed chunks; ` +
+                `${remaining} remaining chunks skipped (fallback to source text)`
+              ),
+            },
+          });
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
     }
 
     return {
@@ -433,15 +472,17 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
    * 
    * Fix D: 最大翻譯時限保護——連續翻譯超過 10 分鐘主動中斷，避免 Offscreen 長時間運行不穩定。
    */
-   async translateStream(
-    req: TranslationRequest,
-    emit: (r: TranslationResult) => void
-  ): Promise<void> {
+    async translateStream(
+     req: TranslationRequest,
+     emit: (r: TranslationResult) => void
+   ): Promise<void> {
     const targetLang = req.targetLang ?? this.defaultTargetLang;
     const accumulated: SubtitleSegment[] = [];
     let echoedChunks = 0;
     let degenerateChunks = 0;
     let wrongLanguageChunks = 0;
+    let consecutiveFailures = 0;
+    let circuitOpen = false;
     const totalChunks = Math.ceil(req.segments.length / this.chunkSize);
     const streamStartedAt = performance.now();
 
@@ -472,6 +513,21 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
 
       const chunk = req.segments.slice(i, i + this.chunkSize);
       const chunkIndex = Math.floor(i / this.chunkSize) + 1;
+
+      // M2-65：電路斷開器——連續失敗後跳過推理，直接回退原文。
+      if (circuitOpen) {
+        accumulated.push(
+          ...chunk.map((seg) => ({ ...seg, translatedText: seg.sourceText }))
+        );
+        diagLog('local-onnx', `chunk ${chunkIndex}/${totalChunks} skipped (circuit open), fallback to source`);
+        emit({
+          engineId: this.engineId,
+          degraded: !this.isPrimary,
+          segments: [...accumulated],
+        });
+        continue;
+      }
+
       const chunkStartedAt = performance.now();
       const chunkResult = await this.translateChunk(chunk, targetLang);
       const chunkLatencyMs = Math.round(performance.now() - chunkStartedAt);
@@ -479,6 +535,30 @@ export class LocalONNXTranslationProvider implements TranslationProvider {
       if (chunkResult.echoed) echoedChunks += 1;
       if (chunkResult.degenerate) degenerateChunks += 1;
       if (chunkResult.wrongLanguage) wrongLanguageChunks += 1;
+
+      // M2-65：電路斷開器計數。
+      if (chunkResult.echoed || chunkResult.degenerate || chunkResult.wrongLanguage) {
+        consecutiveFailures++;
+        if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+          circuitOpen = true;
+          const remaining = Math.ceil((req.segments.length - (i + this.chunkSize)) / this.chunkSize);
+          diagLog('local-onnx', `circuit-breaker-opened: ${consecutiveFailures} consecutive failures, skipping ${remaining} remaining chunks`);
+          recordDiagnostic({
+            type: 'pipeline-error',
+            error: {
+              port: 'translation',
+              code: 'local-onnx-circuit-breaker-opened',
+              recoverable: true,
+              cause: new Error(
+                `local ONNX circuit breaker opened after ${consecutiveFailures} consecutive failed chunks; ` +
+                `${remaining} remaining chunks skipped (fallback to source text)`
+              ),
+            },
+          });
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
 
       // D5：記錄 chunk 計時與翻譯速度。
       const totalElapsedMs = Math.round(performance.now() - streamStartedAt);

@@ -452,3 +452,213 @@ describe('RealtimeASRStrategy — M2-58 VAD 兜底與時間軸對齊', () => {
     strategy.stop();
   });
 });
+
+// M2-65：累計 emit——每次 emit 發送全量 segment（非僅當前 chunk）。
+describe('RealtimeASRStrategy — M2-65 累計 emit', () => {
+  let strategy: RealtimeASRStrategy;
+  let mockAudioSource: AudioSourceProvider;
+  let mockHandle: AudioSourceHandle;
+  let mockASR: ASRProvider;
+  let mockTranslation: TranslationProvider;
+  let chunkCallback: ((chunk: AudioChunk) => void) | null = null;
+
+  function makeChunk(seq: number, amplitude: number): AudioChunk {
+    const pcm = new Float32Array(80_000);
+    pcm.fill(amplitude);
+    return { seq, startTime: 0, duration: 5000, sampleRate: 16_000, channels: 1, pcm, isSpeech: true };
+  }
+
+  function makeContext(currentTimeMs: number): StrategyContext {
+    return {
+      platform: {} as PlatformAdapter,
+      playback: () => ({ currentTime: currentTimeMs, playing: true, rate: 1, duration: 100_000, buffered: [] }),
+      config: {
+        asr: { type: 'local-whisper', modelTier: 'base', vadThreshold: 0.01 },
+        targetLang: 'zh-Hant',
+      } as EngineConfig,
+      asr: {} as ASRProvider,
+      translation: {} as TranslationProvider,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    strategy = new RealtimeASRStrategy();
+    mockHandle = {
+      kind: 'tab-capture',
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    mockAudioSource = {
+      kind: 'tab-capture',
+      open: vi.fn().mockResolvedValue(mockHandle),
+      onChunk: vi.fn((cb) => { chunkCallback = cb; }),
+    };
+    mockASR = {
+      engineId: 'test-asr',
+      location: 'local',
+      warmup: vi.fn().mockResolvedValue(undefined),
+      transcribe: vi.fn(),
+    };
+    mockTranslation = {
+      engineId: 'test-llm',
+      location: 'cloud',
+      translate: vi.fn(),
+    };
+    strategy.inject({
+      audioSource: mockAudioSource,
+      asrProvider: mockASR,
+      translationProvider: mockTranslation,
+      vadThreshold: 0.01,
+    });
+    chunkCallback = null;
+  });
+
+  it('M2-65 TC-4：第 2 次 emit 包含第 1 + 第 2 chunk 的 segments（累計）', async () => {
+    const ctx = makeContext(0);
+    const events: Array<{ type: string; segments?: SubtitleSegment[] }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    // 第 1 chunk：ASR 返回 segment id='a'
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 0,
+      segments: [{ id: 'a', sourceText: 'hello', start: 0, end: 1000, origin: 'realtime-asr', provisional: false, revision: 0 }],
+      isPartial: false,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'a', sourceText: 'hello', translatedText: '你好', start: 0, end: 1000 }],
+    });
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 第 2 chunk：ASR 返回 segment id='b'
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 1,
+      segments: [{ id: 'b', sourceText: 'world', start: 0, end: 1000, origin: 'realtime-asr', provisional: false, revision: 0 }],
+      isPartial: false,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'b', sourceText: 'world', translatedText: '世界', start: 0, end: 1000 }],
+    });
+
+    chunkCallback!(makeChunk(1, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 收集 segments-ready/updated 事件
+    const segEvents = events.filter((e) => e.type === 'segments-ready' || e.type === 'segments-updated');
+    expect(segEvents.length).toBeGreaterThanOrEqual(2);
+
+    // 第 1 次 emit：只有 segment 'a'
+    const firstEmit = segEvents[0]!.segments!;
+    expect(firstEmit).toHaveLength(1);
+    expect(firstEmit[0].id).toBe('a');
+
+    // 第 2 次 emit：包含 'a' + 'b'（累計）
+    const secondEmit = segEvents[1]!.segments!;
+    expect(secondEmit).toHaveLength(2);
+    const ids = secondEmit.map((s) => s.id).sort();
+    expect(ids).toEqual(['a', 'b']);
+
+    strategy.stop();
+  });
+
+  it('M2-65 TC-5：provisional 修正覆蓋同 id segment（不重複）', async () => {
+    const ctx = makeContext(0);
+    const events: Array<{ type: string; segments?: SubtitleSegment[] }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    // 第 1 chunk：provisional（id='a', text='hel'）
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 0,
+      segments: [{ id: 'a', sourceText: 'hel', start: 0, end: 500, origin: 'realtime-asr', provisional: true, revision: 1 }],
+      isPartial: true,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'a', sourceText: 'hel', translatedText: '你', start: 0, end: 500 }],
+    });
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 第 2 chunk：final 修正（id='a', text='hello'）
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 1,
+      segments: [{ id: 'a', sourceText: 'hello', start: 0, end: 1000, origin: 'realtime-asr', provisional: false, revision: 2 }],
+      isPartial: false,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'a', sourceText: 'hello', translatedText: '你好', start: 0, end: 1000 }],
+    });
+
+    chunkCallback!(makeChunk(1, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const segEvents = events.filter((e) => e.type === 'segments-ready' || e.type === 'segments-updated');
+    // 最終 emit 只有 1 個 segment（id='a' 被覆蓋，不重複）
+    const lastEmit = segEvents[segEvents.length - 1]!.segments!;
+    expect(lastEmit).toHaveLength(1);
+    expect(lastEmit[0].sourceText).toBe('hello');
+    expect(lastEmit[0].translatedText).toBe('你好');
+
+    strategy.stop();
+  });
+
+  it('M2-65 TC-6：stop() 清空累計緩衝（restart 後重新累積）', async () => {
+    const ctx = makeContext(0);
+    const events: Array<{ type: string; segments?: SubtitleSegment[] }> = [];
+    await strategy.run(ctx, (e) => events.push(e as never));
+
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 0,
+      segments: [{ id: 'x', sourceText: 'test', start: 0, end: 1000, origin: 'realtime-asr', provisional: false, revision: 0 }],
+      isPartial: false,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'x', sourceText: 'test', translatedText: '測試', start: 0, end: 1000 }],
+    });
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // stop 清空緩衝
+    strategy.stop();
+
+    // 重新 run（模擬 restart）
+    const events2: Array<{ type: string; segments?: SubtitleSegment[] }> = [];
+    await strategy.run(ctx, (e) => events2.push(e as never));
+
+    mockASR.transcribe!.mockResolvedValueOnce({
+      seq: 0,
+      segments: [{ id: 'y', sourceText: 'new', start: 0, end: 1000, origin: 'realtime-asr', provisional: false, revision: 0 }],
+      isPartial: false,
+    });
+    mockTranslation.translate!.mockResolvedValueOnce({
+      engineId: 'test-llm',
+      degraded: false,
+      segments: [{ id: 'y', sourceText: 'new', translatedText: '新', start: 0, end: 1000 }],
+    });
+
+    chunkCallback!(makeChunk(0, 0.1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // restart 後只有新 segment（舊 'x' 不在緩衝中）
+    const segEvents2 = events2.filter((e) => e.type === 'segments-ready' || e.type === 'segments-updated');
+    expect(segEvents2.length).toBeGreaterThanOrEqual(1);
+    const lastEmit = segEvents2[segEvents2.length - 1]!.segments!;
+    expect(lastEmit).toHaveLength(1);
+    expect(lastEmit[0].id).toBe('y');
+
+    strategy.stop();
+  });
+});

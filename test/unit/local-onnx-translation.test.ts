@@ -415,8 +415,136 @@ describe('LocalONNXTranslationProvider', () => {
     await provider.translate(req());
 
     // 50s > 45s → 觸發 slow-inference 診斷（第 1 次，未達 3 次門檻但 slowChunks++）
-    // 注意：診斷在 slowChunks >= 3 時才 recordDiagnostic，此處只驗證不拋錯。
+    // 注意：診斷在 slowChunks >= 3 時才 recordDiagnostic，此處只驗證不拋錯即可。
     // 連續 3 次才落診斷——此測試驗證单次不拋錯即可。
     vi.restoreAllMocks();
+  });
+
+  // M2-65：電路斷開器——連續 3 個 chunk 失敗後跳過推理。
+  it('M2-65 TC-1：translateStream 連續 3 chunk wrongLanguage → 電路斷開，後續 chunk 跳過推理', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      chunkSize: 2,
+    });
+
+    (provider as unknown as { port: unknown }).port = mockPort;
+
+    // 所有 chunk 都返回 wrongLanguage
+    mockPort.postMessage.mockImplementation((msg: unknown) => {
+      setTimeout(() => {
+        const msgObj = msg as { topic?: string; messageId?: string };
+        if (msgObj.topic === 'local-onnx:translate') {
+          mockPort._simulateMessage({
+            messageId: msgObj.messageId,
+            result: { ok: true, translatedText: '1. hello\n2. world', wrongLanguage: true },
+          });
+        }
+      }, 0);
+    });
+
+    // 10 segments / chunkSize 2 = 5 chunks
+    const segments = Array.from({ length: 10 }, (_, i) => seg(i));
+    const emitted: Array<{ segments: SubtitleSegment[] }> = [];
+    await provider.translateStream({ segments, targetLang: 'zh-Hant' }, (r) => {
+      emitted.push(r as { segments: SubtitleSegment[] });
+    });
+
+    // 前 3 chunk 正常推理（wrongLanguage），第 4-5 chunk 被跳過
+    // 每次 emit 都是累計全量，所以最終 emit 包含全部 10 segments
+    expect(emitted).toHaveLength(5);
+    // 所有 segment 都回退原文（wrongLanguage → fallback to source）
+    const finalSegments = emitted[4]!.segments;
+    expect(finalSegments).toHaveLength(10);
+    for (let i = 0; i < 10; i++) {
+      expect(finalSegments[i].translatedText).toBe(`line-${i}`);
+    }
+
+    // 驗證電路斷開診斷被記錄
+    const breakerCalls = vi.mocked(recordDiagnostic).mock.calls.filter(
+      (c) => (c[0] as { error?: { code?: string } }).error?.code === 'local-onnx-circuit-breaker-opened'
+    );
+    expect(breakerCalls).toHaveLength(1);
+  });
+
+  it('M2-65 TC-2：電路斷開器在成功 chunk 後重置（第 4 chunk 成功 → 計數歸零）', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      chunkSize: 2,
+    });
+
+    (provider as unknown as { port: unknown }).port = mockPort;
+
+    let callCount = 0;
+    mockPort.postMessage.mockImplementation((msg: unknown) => {
+      setTimeout(() => {
+        const msgObj = msg as { topic?: string; messageId?: string };
+        if (msgObj.topic === 'local-onnx:translate') {
+          callCount++;
+          // 前 2 chunk wrongLanguage，第 3 chunk 成功，第 4-5 chunk wrongLanguage
+          const wrong = callCount !== 3;
+          mockPort._simulateMessage({
+            messageId: msgObj.messageId,
+            result: {
+              ok: true,
+              translatedText: wrong ? '1. hello\n2. world' : '1. 你好\n2. 世界',
+              wrongLanguage: wrong,
+            },
+          });
+        }
+      }, 0);
+    });
+
+    const segments = Array.from({ length: 10 }, (_, i) => seg(i));
+    await provider.translateStream({ segments, targetLang: 'zh-Hant' }, () => {});
+
+    // 5 chunks 全部被推理（電路未斷開，因為第 3 chunk 成功重置了計數）
+    expect(callCount).toBe(5);
+
+    // 電路斷開診斷不應被記錄（最多連續 2 次失敗 < 3）
+    const breakerCalls = vi.mocked(recordDiagnostic).mock.calls.filter(
+      (c) => (c[0] as { error?: { code?: string } }).error?.code === 'local-onnx-circuit-breaker-opened'
+    );
+    expect(breakerCalls).toHaveLength(0);
+  });
+
+  it('M2-65 TC-3：translate（非流式）也尊重電路斷開器', async () => {
+    const provider = new LocalONNXTranslationProvider({
+      modelName: 'onnx-community/Qwen2.5-0.5B-Instruct',
+      chunkSize: 2,
+    });
+
+    (provider as unknown as { port: unknown }).port = mockPort;
+
+    let callCount = 0;
+    mockPort.postMessage.mockImplementation((msg: unknown) => {
+      setTimeout(() => {
+        const msgObj = msg as { topic?: string; messageId?: string };
+        if (msgObj.topic === 'local-onnx:translate') {
+          callCount++;
+          mockPort._simulateMessage({
+            messageId: msgObj.messageId,
+            result: { ok: true, translatedText: '1. hello\n2. world', wrongLanguage: true },
+          });
+        }
+      }, 0);
+    });
+
+    // 10 segments / chunkSize 2 = 5 chunks，前 3 個推理，後 2 個跳過
+    const segments = Array.from({ length: 10 }, (_, i) => seg(i));
+    const result = await provider.translate({ segments, targetLang: 'zh-Hant' });
+
+    // 只有前 3 chunk（6 segments）發送了推理請求
+    expect(callCount).toBe(3);
+    // 所有 segment 回退原文
+    expect(result.segments).toHaveLength(10);
+    for (let i = 0; i < 10; i++) {
+      expect(result.segments[i].translatedText).toBe(`line-${i}`);
+    }
+
+    // 電路斷開診斷被記錄
+    const breakerCalls = vi.mocked(recordDiagnostic).mock.calls.filter(
+      (c) => (c[0] as { error?: { code?: string } }).error?.code === 'local-onnx-circuit-breaker-opened'
+    );
+    expect(breakerCalls).toHaveLength(1);
   });
 });

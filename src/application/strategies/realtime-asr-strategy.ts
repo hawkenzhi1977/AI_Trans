@@ -83,6 +83,8 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   private vadWindowStart = 0;
   // M2-58：ASR 調用計數（首調 breadcrumb——確認 VAD→ASR 交接真的發生）。
   private asrCallCount = 0;
+  // M2-65：累計字幕緩衝——每次 emit 發送全量（非僅當前 chunk），避免 content-script 全量替換丟失舊字幕。
+  private accumulatedSegments = new Map<string, SubtitleSegment>();
 
   /** 注入依賴（由 Orchestrator 調用）。 */
   inject(deps: RealtimeASRDeps): void {
@@ -92,6 +94,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     this.consecutiveSilentChunks = 0;
     this.vadFallbackArmed = false;
     this.asrCallCount = 0;
+    this.accumulatedSegments.clear();
     this.vad = new EnergyVAD({ threshold: this.baseVadThreshold });
     this.perf = new PerfMetrics(100); // 滑動窗口 100 樣本。
   }
@@ -372,6 +375,8 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     this.vadSessionMaxRms = 0;
     this.vadWindowStart = 0;
     this.asrCallCount = 0;
+    // M2-65：清空累計緩衝（restart/seek 時重新累積）。
+    this.accumulatedSegments.clear();
     // M2-13：清理降檔檢查定時器。
     if (this.downgradeCheckInterval !== null) {
       clearInterval(this.downgradeCheckInterval);
@@ -409,7 +414,8 @@ export class RealtimeASRStrategy implements CaptionStrategy {
 
   /**
    * M2-58：對齊 + 過濾後推送。全空時跳過 emit（留 breadcrumb，§5.6 不靜默）。
-   * chunk.startTime 已在 onChunk 以播放狀態反推（視頻時間軸）。
+   * M2-65：累計 emit——將新 segment 合併入緩衝（按 id 去重/覆蓋），emit 全量列表。
+   * content-script 的 onEvent 做全量替換 this.cues，因此必須發送累計全量而非僅當前 chunk。
    */
   private emitAligned(
     asrResult: { isPartial: boolean },
@@ -417,14 +423,21 @@ export class RealtimeASRStrategy implements CaptionStrategy {
     chunk: AudioChunk,
     emit: (e: PipelineEvent) => void,
   ): void {
-    const segments = filterEmptySegments(
-      alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime),
-    );
-    if (segments.length === 0) {
+    const aligned = alignSegmentsToVideoTimeline(translatedSegments, chunk.startTime);
+    const filtered = filterEmptySegments(aligned);
+    if (filtered.length === 0) {
       diagLog('strategy', `realtime-asr: ASR returned no usable text (seq=${chunk.seq}), skipping emit`);
       return;
     }
-    emit({ type: asrResult.isPartial ? 'segments-updated' : 'segments-ready', segments });
+
+    // M2-65：合併入累計緩衝（同 id 覆蓋——provisional 修正）。
+    for (const seg of filtered) {
+      this.accumulatedSegments.set(seg.id, seg);
+    }
+
+    // 按 start 時間排序後 emit 全量。
+    const allSegments = [...this.accumulatedSegments.values()].sort((a, b) => a.start - b.start);
+    emit({ type: asrResult.isPartial ? 'segments-updated' : 'segments-ready', segments: allSegments });
   }
 
   /** 獲取性能統計摘要（用於觀測與調試）。 */
