@@ -432,6 +432,29 @@ describe('RealtimeASRStrategy — M2-58 VAD 兜底與時間軸對齊', () => {
     strategy.stop();
   });
 
+  // M2-68：inject 無 vadThreshold → baseVadThreshold = 0.005（新默認值）。
+  it('M2-68：inject 無 vadThreshold → 使用新默認值 0.005（rms=0.006 通過 VAD）', async () => {
+    strategy.inject({
+      audioSource: mockAudioSource,
+      asrProvider: mockASR,
+      translationProvider: mockTranslation,
+      // 不傳 vadThreshold → 使用默認 0.005。
+    });
+    const ctx = makeContext(0);
+    await strategy.run(ctx, () => {});
+
+    // rms=0.006 > 0.005 → 通過 VAD → ASR 被調用。
+    chunkCallback!(makeChunk(0, 0.006));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mockASR.transcribe).toHaveBeenCalledTimes(1);
+
+    // rms=0.004 < 0.005 → 不通過 VAD。
+    chunkCallback!(makeChunk(1, 0.004));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mockASR.transcribe).toHaveBeenCalledTimes(1);
+    strategy.stop();
+  });
+
   // M2-64：極短文本（< 3 字符）跳過翻譯——避免 local-onnx 對 "um" 輸出 [BLANK AUDIO]。
   it('M2-64：ASR 返回極短文本（len < 3）→ 跳過翻譯不 emit', async () => {
     (mockASR.transcribe as ReturnType<typeof vi.fn>).mockResolvedValue({

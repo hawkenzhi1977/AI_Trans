@@ -253,7 +253,7 @@
 
   // src/infrastructure/vad.ts
   var DEFAULT_VAD_CONFIG = {
-    threshold: 0.01,
+    threshold: 5e-3,
     silenceDurationMs: 2e3
   };
   var EnergyVAD = class {
@@ -497,7 +497,7 @@
     downgradeCheckInterval = null;
     audioHandle = null;
     // M2-58：VAD 統計與兜底（§5.6——「chunk 全被過濾」必須留痕，不得靜默）。
-    baseVadThreshold = 0.01;
+    baseVadThreshold = 5e-3;
     consecutiveSilentChunks = 0;
     vadFallbackArmed = false;
     vadWindowReceived = 0;
@@ -517,7 +517,7 @@
     /** 注入依賴（由 Orchestrator 調用）。 */
     inject(deps) {
       this.deps = deps;
-      this.baseVadThreshold = deps.vadThreshold ?? 0.01;
+      this.baseVadThreshold = deps.vadThreshold ?? 5e-3;
       this.consecutiveSilentChunks = 0;
       this.vadFallbackArmed = false;
       this.asrCallCount = 0;
@@ -3800,11 +3800,11 @@ Example output:
      * 預熱模型——M2-37：轉發 warmup 請求給 Offscreen Document。
      * Offscreen Document 載入 Whisper pipeline 到記憶體，供後續推理使用。
      */
-    async warmup(_config) {
+    async warmup(config) {
       try {
         const response = await chrome.runtime.sendMessage({
           topic: "asr-whisper:warmup",
-          payload: { modelId: this.modelId }
+          payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs }
         });
         const raw = response;
         const warmupResult = "result" in raw && raw.result ? raw.result : raw;

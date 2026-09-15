@@ -105,7 +105,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   private audioHandle: AudioSourceHandle | null = null;
 
   // M2-58：VAD 統計與兜底（§5.6——「chunk 全被過濾」必須留痕，不得靜默）。
-  private baseVadThreshold = 0.01;
+  private baseVadThreshold = 0.005;
   private consecutiveSilentChunks = 0;
   private vadFallbackArmed = false;
   private vadWindowReceived = 0;
@@ -128,7 +128,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
   inject(deps: RealtimeASRDeps): void {
     this.deps = deps;
     // M2-58：記錄基礎閾值（兜底放寬的基準）；重注入時重置兜底狀態（restart 路徑）。
-    this.baseVadThreshold = deps.vadThreshold ?? 0.01;
+    this.baseVadThreshold = deps.vadThreshold ?? 0.005;
     this.consecutiveSilentChunks = 0;
     this.vadFallbackArmed = false;
     this.asrCallCount = 0;

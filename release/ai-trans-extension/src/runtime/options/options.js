@@ -176,7 +176,9 @@
         type: asrType,
         modelTier,
         endpoint: $("asr-endpoint").value || void 0,
-        customModelPath: $("asr-custom-model").value || void 0
+        customModelPath: $("asr-custom-model").value || void 0,
+        vadThreshold: parseFloat($("asr-vad-threshold").value) / 100,
+        accumulateTargetMs: parseInt($("asr-accumulate-window").value, 10)
       },
       targetLang: $("target-lang").value || "zh-Hant",
       displayMode: $("display-mode").value,
@@ -205,6 +207,10 @@
     $("asr-tier").value = config.asr.modelTier ?? "base";
     $("asr-endpoint").value = config.asr.endpoint ?? "";
     $("asr-custom-model").value = config.asr.customModelPath ?? "";
+    const vadPct = (config.asr.vadThreshold ?? 5e-3) * 100;
+    $("asr-vad-threshold").value = String(vadPct);
+    $("asr-vad-val").textContent = vadPct.toFixed(1);
+    $("asr-accumulate-window").value = String(config.asr.accumulateTargetMs ?? 3e3);
     $("target-lang").value = config.targetLang;
     $("display-mode").value = config.displayMode;
     $("performance-profile").value = config.performanceProfile;
@@ -294,6 +300,9 @@
     });
     $("style-bg-opacity").addEventListener("input", () => {
       $("style-bg-opacity-val").textContent = $("style-bg-opacity").value;
+    });
+    $("asr-vad-threshold").addEventListener("input", () => {
+      $("asr-vad-val").textContent = ($("asr-vad-threshold").valueAsNumber / 100).toFixed(3);
     });
     $("btn-save").addEventListener("click", () => void save());
     $("btn-reset").addEventListener("click", () => {

@@ -108,6 +108,8 @@ function readForm(): EngineConfig {
       modelTier,
       endpoint: $<HTMLInputElement>('asr-endpoint').value || undefined,
       customModelPath: $<HTMLInputElement>('asr-custom-model').value || undefined,
+      vadThreshold: parseFloat($<HTMLInputElement>('asr-vad-threshold').value) / 100,
+      accumulateTargetMs: parseInt($<HTMLSelectElement>('asr-accumulate-window').value, 10),
     },
     targetLang: $<HTMLSelectElement>('target-lang').value || 'zh-Hant',
     displayMode: $<HTMLSelectElement>('display-mode').value as 'mono' | 'bilingual',
@@ -141,6 +143,10 @@ function fillForm(config: EngineConfig): void {
   $<HTMLSelectElement>('asr-tier').value = config.asr.modelTier ?? 'base';
   $<HTMLInputElement>('asr-endpoint').value = config.asr.endpoint ?? '';
   $<HTMLInputElement>('asr-custom-model').value = config.asr.customModelPath ?? '';
+  const vadPct = (config.asr.vadThreshold ?? 0.005) * 100;
+  $<HTMLInputElement>('asr-vad-threshold').value = String(vadPct);
+  $<HTMLSpanElement>('asr-vad-val').textContent = vadPct.toFixed(1);
+  $<HTMLSelectElement>('asr-accumulate-window').value = String(config.asr.accumulateTargetMs ?? 3000);
   $<HTMLSelectElement>('target-lang').value = config.targetLang;
   $<HTMLSelectElement>('display-mode').value = config.displayMode;
   $<HTMLSelectElement>('performance-profile').value = config.performanceProfile;
@@ -253,6 +259,11 @@ async function init(): Promise<void> {
   // 透明度滑塊：即時顯示數值
   $<HTMLInputElement>('style-bg-opacity').addEventListener('input', () => {
     $<HTMLSpanElement>('style-bg-opacity-val').textContent = $<HTMLInputElement>('style-bg-opacity').value;
+  });
+
+  // VAD 閾值滑塊：即時顯示數值（百分比）
+  $<HTMLInputElement>('asr-vad-threshold').addEventListener('input', () => {
+    $<HTMLSpanElement>('asr-vad-val').textContent = ($<HTMLInputElement>('asr-vad-threshold').valueAsNumber / 100).toFixed(3);
   });
 
   $<HTMLButtonElement>('btn-save').addEventListener('click', () => void save());

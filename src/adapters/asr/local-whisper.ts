@@ -86,11 +86,11 @@ export class LocalWhisperASR implements ASRProvider {
    * 預熱模型——M2-37：轉發 warmup 請求給 Offscreen Document。
    * Offscreen Document 載入 Whisper pipeline 到記憶體，供後續推理使用。
    */
-  async warmup(_config: ASRConfig): Promise<void> {
+  async warmup(config: ASRConfig): Promise<void> {
     try {
       const response = await chrome.runtime.sendMessage({
         topic: 'asr-whisper:warmup',
-        payload: { modelId: this.modelId },
+        payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs },
       });
 
       // 響應可能直接是結果，或包裹在 { ok, result } 中。

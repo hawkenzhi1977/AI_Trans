@@ -4,7 +4,7 @@ import type { AudioChunk } from '../domain/models/audio';
 
 /** VAD 配置。 */
 export interface VADConfig {
-  /** RMS 能量閾值（0-1），低於此值視為靜音。默認 0.01。 */
+  /** RMS 能量閾值（0-1），低於此值視為靜音。默認 0.005。 */
   threshold: number;
   /** 靜音持續時間（毫秒），超過則觸發分段邊界。默認 2000ms。 */
   silenceDurationMs: number;
@@ -12,7 +12,7 @@ export interface VADConfig {
 
 /** 默認 VAD 配置。 */
 export const DEFAULT_VAD_CONFIG: VADConfig = {
-  threshold: 0.01,
+  threshold: 0.005,
   silenceDurationMs: 2000,
 };
 

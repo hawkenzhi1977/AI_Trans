@@ -23,7 +23,7 @@ type OffscreenRequest =
   | { type: 'asr-whisper:check-status'; payload: { modelId: string } }
   | { type: 'asr-whisper:download'; payload: { modelId: string } }
   | { type: 'asr-whisper:clear-cache'; payload?: { modelId?: string } }
-  | { type: 'asr-whisper:warmup'; payload: { modelId: string } }
+  | { type: 'asr-whisper:warmup'; payload: { modelId: string; accumulateTargetMs?: number } }
   | { type: 'asr-whisper:transcribe'; payload: { pcm: string; sampleRate: number; hintLang?: string } };
 
 /** Offscreen Document 發送的響應類型。 */
@@ -137,9 +137,10 @@ let audioContext: AudioContext | null = null;
 let scriptProcessor: ScriptProcessorNode | null = null;
 let currentPort: chrome.runtime.Port | null = null;
 
-// M2-66：音頻累積緩衝——將 256ms 碎片累積至 ~5s 再發送，
+// M2-68：音頻累積緩衝——將 256ms 碎片累積至目標窗口再發送，
 // 讓 Whisper 有足夠上下文產出準確結果（256ms 碎片只能識別 [MUSIC]）。
-const AUDIO_ACCUMULATE_TARGET_MS = 5000;
+// M2-68：可配置（默認 3000ms），經 warmup 消息傳入。
+let AUDIO_ACCUMULATE_TARGET_MS = 3000;
 let audioAccumBuffer: Float32Array | null = null;
 // M2-53：tabCapture 聲音回播——Chrome 以非原生採樣率打開 AudioContext 時
 // 不會自動將捕獲流回播到揚聲器，需要獨立的原生採樣率 passthrough context 負責回播，
@@ -592,7 +593,11 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender) => {
         busyCount = Math.max(0, busyCount - 1);
         return false;
       }
-      const warmupMsg = message as { topic?: string; payload?: { modelId?: string } };
+      const warmupMsg = message as { topic?: string; payload?: { modelId?: string; accumulateTargetMs?: number } };
+      // M2-68：接收可配置音頻累積窗口。
+      if (warmupMsg.payload?.accumulateTargetMs) {
+        AUDIO_ACCUMULATE_TARGET_MS = warmupMsg.payload.accumulateTargetMs;
+      }
       void warmupAsrPipeline(warmupMsg.payload?.modelId ?? 'Xenova/whisper-base.en').then(broadcast);
       return false;
     }
@@ -686,10 +691,14 @@ function connectToServiceWorker(): void {
           result = await clearAsrModelCache(msg.payload?.modelId);
           broadcastToAll(result as OffscreenResponse);
           break;
-        case 'asr-whisper:warmup':
+        case 'asr-whisper:warmup': {
+          // M2-68：接收可配置音頻累積窗口（port 路徑）。
+          const accMs = (msg.payload as { accumulateTargetMs?: number })?.accumulateTargetMs;
+          if (accMs) AUDIO_ACCUMULATE_TARGET_MS = accMs;
           result = await warmupAsrPipeline(msg.payload?.modelId ?? 'Xenova/whisper-base.en');
           broadcastToAll(result as OffscreenResponse);
           break;
+        }
         case 'asr-whisper:transcribe': {
           const pcmData = decodePcmFloat32(msg.payload?.pcm ?? '');
           result = await runAsrInference(

@@ -4,10 +4,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // offscreen.ts 模組頂層引用 chrome.runtime.onMessage——jsdom 無 chrome，需先 stub。
-vi.stubGlobal('chrome', {
-  runtime: { onMessage: { addListener: vi.fn() }, sendMessage: vi.fn(), getURL: vi.fn(() => '') },
-  storage: { local: { get: vi.fn(), set: vi.fn() } },
-  offscreen: { createDocument: vi.fn(), closeDocument: vi.fn() },
+// 使用 vi.hoisted 確保在 import offscreen.ts 前執行（ES module hoisting）。
+vi.hoisted(() => {
+  (globalThis as Record<string, unknown>).chrome = {
+    runtime: { onMessage: { addListener: vi.fn() }, onConnect: { addListener: vi.fn() }, sendMessage: vi.fn(), getURL: vi.fn(() => ''), connect: vi.fn(() => ({ postMessage: vi.fn(), onMessage: { addListener: vi.fn() }, onDisconnect: { addListener: vi.fn() }, disconnect: vi.fn() })) },
+    storage: { local: { get: vi.fn(), set: vi.fn() } },
+    offscreen: { createDocument: vi.fn(), closeDocument: vi.fn() },
+  };
 });
 
 // transformers.js mock（與 offscreen-local-onnx 測試一致，避免真實載入）。
@@ -143,8 +146,8 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
 
     expect(scriptProcessors).toHaveLength(1);
     const input = new Float32Array(4096).fill(0.1);
-    // M2-66：音頻累積至 ~5s 才發送（4096 samples × 20 = 81920 samples ≈ 5.12s @ 16kHz）。
-    for (let i = 0; i < 20; i++) {
+    // M2-68：音頻累積至 ~3s 才發送（4096 samples × 12 = 49152 samples ≈ 3.07s @ 16kHz）。
+    for (let i = 0; i < 12; i++) {
       scriptProcessors[0].onaudioprocess!({
         inputBuffer: { getChannelData: () => input },
       });
@@ -157,8 +160,8 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
     // M2-59：pcm 為 base64 string（修復 extension messaging 對 Float32Array 序列化損毀）。
     expect(typeof chunkMsg!.pcm).toBe('string');
     const decoded = decodePcmFloat32(chunkMsg!.pcm!);
-    // 累積 20 × 4096 = 81920 samples
-    expect(decoded).toHaveLength(81_920);
+    // 累積 12 × 4096 = 49152 samples
+    expect(decoded).toHaveLength(49_152);
     // 值精確還原（非引用同一陣列——事件緩衝回收後仍有效）。
     for (let i = 0; i < decoded.length; i++) {
       expect(decoded[i]).toBeCloseTo(0.1, 6);
@@ -169,6 +172,33 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
       .map((c) => (typeof c[0] === 'string' ? c[0] : ''))
       .filter((m) => m.includes('first audioChunk sent'));
     expect(firstChunkLogs).toHaveLength(1);
+  });
+
+  it('M2-68：默認 accumulateTargetMs=3000 → ~12 chunks (3.07s) 觸發（非舊 5s）', async () => {
+    const port = makeMockPort();
+    await _testExports.startCapture('stream-1', port as never);
+
+    const input = new Float32Array(4096).fill(0.1);
+    // 3000ms @ 16kHz = 48000 samples; 4096 × 12 = 49152 > 48000 → 第 12 塊觸發。
+    // 先餵 11 塊（45056 samples < 48000）→ 不觸發。
+    for (let i = 0; i < 11; i++) {
+      scriptProcessors[0].onaudioprocess!({
+        inputBuffer: { getChannelData: () => input },
+      });
+    }
+    let chunkMsg = port.postMessage.mock.calls
+      .map((c) => c[0] as { type: string })
+      .find((m) => m.type === 'audioChunk');
+    expect(chunkMsg).toBeUndefined();
+
+    // 第 12 塊觸發。
+    scriptProcessors[0].onaudioprocess!({
+      inputBuffer: { getChannelData: () => input },
+    });
+    chunkMsg = port.postMessage.mock.calls
+      .map((c) => c[0] as { type: string; pcm?: string })
+      .find((m) => m.type === 'audioChunk');
+    expect(chunkMsg).toBeDefined();
   });
 
   it('onaudioprocess：5s 窗口統計 breadcrumb（maxRms 可判定「有 chunk 但內容靜音」）', async () => {

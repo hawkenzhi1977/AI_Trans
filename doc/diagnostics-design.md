@@ -1027,7 +1027,7 @@ DiagnosticRecord 結構:
 
 - **診斷碼**: vad-filtering-all
 - **用戶可見消息**: 最近失敗: 降級: vad-filtering-all: 40 consecutive chunks below threshold (0.01 -> 0.005), sessionMaxRms=0.00000; threshold relaxed (<timestamp>)
-- **觸發條件**: `RealtimeASRStrategy` 捕獲中連續 `VAD_FALLBACK_SILENT_CHUNKS = 40` 塊（≈10s）音頻 RMS 全部低於 VAD 閾值（`asr.vadThreshold`，預設 0.01）——即 VAD 把全部音頻當靜音過濾，ASR 永遠收不到語音段
+- **觸發條件**: `RealtimeASRStrategy` 捕獲中連續 `VAD_FALLBACK_SILENT_CHUNKS = 40` 塊（≈10s）音頻 RMS 全部低於 VAD 閾值（`asr.vadThreshold`，**M2-68：預設 0.005**）——即 VAD 把全部音頻當靜音過濾，ASR 永遠收不到語音段
 - **根因**: 低音量視頻（旁白/音樂背景）的 RMS 持續低於閾值；`vadThreshold` 無 UI 配置項，用戶無法手動調整
 - **處理（§5.6 不靜默）**: 落 `engine-degraded` 診斷（reason 含 `vad-filtering-all` + 實際閾值與 sessionMaxRms 證據）+ `diagLog('strategy', ...)`，並將 VAD 閾值放寬為原值一半（`EnergyVAD.setThreshold(base/2)`）——低音量視頻不再永久靜音；放寬僅一次（`vadFallbackArmed` 防重複觸發），`stop()` 重置狀態（restart 不繼承舊會話放寬）
 - **用戶響應**: 若持續出現且 sessionMaxRms 極低（<0.001），視頻本身音量過小——調大系統/瀏覽器音量後重新授權 ASR

@@ -48833,7 +48833,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var audioContext = null;
   var scriptProcessor = null;
   var currentPort = null;
-  var AUDIO_ACCUMULATE_TARGET_MS = 5e3;
+  var AUDIO_ACCUMULATE_TARGET_MS = 3e3;
   var audioAccumBuffer = null;
   var passthroughContext = null;
   var passthroughSource = null;
@@ -49158,6 +49158,9 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
           return false;
         }
         const warmupMsg = message;
+        if (warmupMsg.payload?.accumulateTargetMs) {
+          AUDIO_ACCUMULATE_TARGET_MS = warmupMsg.payload.accumulateTargetMs;
+        }
         void warmupAsrPipeline(warmupMsg.payload?.modelId ?? "Xenova/whisper-base.en").then(broadcast);
         return false;
       }
@@ -49229,10 +49232,13 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             result = await clearAsrModelCache(msg.payload?.modelId);
             broadcastToAll(result);
             break;
-          case "asr-whisper:warmup":
+          case "asr-whisper:warmup": {
+            const accMs = msg.payload?.accumulateTargetMs;
+            if (accMs) AUDIO_ACCUMULATE_TARGET_MS = accMs;
             result = await warmupAsrPipeline(msg.payload?.modelId ?? "Xenova/whisper-base.en");
             broadcastToAll(result);
             break;
+          }
           case "asr-whisper:transcribe": {
             const pcmData = decodePcmFloat32(msg.payload?.pcm ?? "");
             result = await runAsrInference(

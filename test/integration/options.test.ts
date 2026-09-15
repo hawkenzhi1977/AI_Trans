@@ -26,6 +26,9 @@ const HTML = `
   <select id="asr-tier"><option value="tiny">tiny</option><option value="base" selected>base</option><option value="small">small</option><option value="tiny-multi">tiny-multi</option><option value="base-multi">base-multi</option><option value="small-multi">small-multi</option></select>
   <input id="asr-endpoint" />
   <input id="asr-custom-model" />
+  <input id="asr-vad-threshold" type="range" min="0.1" max="5" step="0.1" value="0.5" />
+  <span id="asr-vad-val">0.5</span>
+  <select id="asr-accumulate-window"><option value="2000">2s</option><option value="3000" selected>3s</option><option value="5000">5s</option></select>
   <input id="asr-model-name" disabled />
   <p id="asr-model-size-info"></p>
   <span id="asr-model-status-badge">檢測中...</span>
@@ -398,5 +401,54 @@ describe('Options — M1-59 模型狀態廣播即時刷新', () => {
       modelId: 'Xenova/whisper-base.en',
     });
     expect(document.getElementById('asr-model-status-badge')!.textContent).toContain('下載中');
+  });
+});
+
+// M2-68：VAD 閾值 + 音頻累積窗口 UI 配置。
+describe('Options — M2-68 VAD 閾值 + 音頻累積窗口', () => {
+  beforeEach(() => {
+    resetChromeMock();
+    document.body.innerHTML = HTML;
+  });
+
+  it('fillForm：config.vadThreshold=0.008 → slider=0.8 + span 顯示', async () => {
+    const config: EngineConfig = { ...SAVED_CONFIG, asr: { type: 'local-whisper', modelTier: 'base', vadThreshold: 0.008 } };
+    await chrome.storage.local.set({ engineConfig: config });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, result: { downloaded: false } });
+    await loadOptions();
+    expect((document.getElementById('asr-vad-threshold') as HTMLInputElement).value).toBe('0.8');
+    expect(document.getElementById('asr-vad-val')!.textContent).toBe('0.8');
+  });
+
+  it('fillForm：config.accumulateTargetMs=2000 → select=2000', async () => {
+    const config: EngineConfig = { ...SAVED_CONFIG, asr: { type: 'local-whisper', modelTier: 'base', accumulateTargetMs: 2000 } };
+    await chrome.storage.local.set({ engineConfig: config });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, result: { downloaded: false } });
+    await loadOptions();
+    expect((document.getElementById('asr-accumulate-window') as HTMLSelectElement).value).toBe('2000');
+  });
+
+  it('readForm：slider=1.0 + select=5000 → config.vadThreshold=0.01, accumulateTargetMs=5000', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, result: { downloaded: false } });
+    await loadOptions();
+
+    (document.getElementById('asr-vad-threshold') as HTMLInputElement).value = '1.0';
+    (document.getElementById('asr-accumulate-window') as HTMLSelectElement).value = '5000';
+    (document.getElementById('btn-save') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const saved = (await chrome.storage.local.get('engineConfig')).engineConfig as EngineConfig;
+    expect(saved.asr.vadThreshold).toBeCloseTo(0.01, 4);
+    expect(saved.asr.accumulateTargetMs).toBe(5000);
+  });
+
+  it('fillForm：無 vadThreshold → 默認 slider=0.5（0.005×100）', async () => {
+    await chrome.storage.local.set({ engineConfig: SAVED_CONFIG });
+    (chrome.runtime.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, result: { downloaded: false } });
+    await loadOptions();
+    // SAVED_CONFIG.asr 無 vadThreshold → fillForm 用默認 0.005。
+    expect((document.getElementById('asr-vad-threshold') as HTMLInputElement).value).toBe('0.5');
+    expect(document.getElementById('asr-vad-val')!.textContent).toBe('0.5');
   });
 });
