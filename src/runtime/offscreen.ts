@@ -700,6 +700,21 @@ function connectToServiceWorker(): void {
           broadcastToAll(result as OffscreenResponse);
           break;
         }
+        case 'asr:release-stream': {
+          // M2-67：SW 在調用 getMediaStreamId 前通知釋放已有 MediaStream。
+          // Chrome 對同一 tab 只允許一個 active capture stream；舊 tracks 未 stop 時
+          // getMediaStreamId 會報 "Cannot capture a tab with an active stream."。
+          await detachAudioProcessing();
+          if (mediaStream) {
+            for (const track of mediaStream.getTracks()) {
+              track.onended = null;
+              try { track.stop(); } catch { /* 已停止，忽略 */ }
+            }
+            mediaStream = null;
+          }
+          result = { released: true };
+          break;
+        }
         default:
           error = `Unknown message type: ${type}`;
       }

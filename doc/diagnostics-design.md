@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-09-15（**M2-66：實時 ASR 字幕不顯示修復**——新增 §4.28 `realtime-asr-backpressure`（inflight ≥ MAX_INFLIGHT_ASR=2 時跳過新 chunk，diagLog 留痕）+ §4.29 `realtime-asr-dedup`（連續 DEDUP_CONSECUTIVE_THRESHOLD=3 次相同 ASR 文本跳過翻譯，diagLog 留痕）；`alignSegmentsToVideoTimeline()` 新增 MIN_DISPLAY_WINDOW_MS=5000 最小顯示窗口（非診斷碼，行為變更）。先前：**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
+> 最後更新：2026-09-15（**M2-67：重新授權 ASR 失敗修復 + non-speech token 去重正規化**——§4.29 `realtime-asr-dedup` 更新：去重比較改用 `normalizeForDedup()`（`[MUSIC]`/`(laughing)` 等 non-speech token → `"ns"`），覆蓋 Whisper token 變體；`asr:get-stream-id` handler 新增 release-stream 前置步驟（非診斷碼，行為變更：調用 `getMediaStreamId` 前先釋放 offscreen MediaStream）。先前：**M2-66：實時 ASR 字幕不顯示修復**——新增 §4.28 `realtime-asr-backpressure`（inflight ≥ MAX_INFLIGHT_ASR=2 時跳過新 chunk，diagLog 留痕）+ §4.29 `realtime-asr-dedup`（連續 DEDUP_CONSECUTIVE_THRESHOLD=3 次相同 ASR 文本跳過翻譯，diagLog 留痕）；`alignSegmentsToVideoTimeline()` 新增 MIN_DISPLAY_WINDOW_MS=5000 最小顯示窗口（非診斷碼，行為變更）。先前：**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
 
 ---
 
@@ -650,17 +650,17 @@
 - **開發者響應**: Options 頁開啟 `strategy` 調試日誌，觀察 backpressure 頻率；若 >50% chunk 被跳過則推理速度跟不上音頻速率
 - **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`MAX_INFLIGHT_ASR` + `inflightAsrCount` + onChunk 檢查 + try/finally 遞減）
 
-### 4.29 realtime-asr ASR 去重跳過（M2-66）
+### 4.29 realtime-asr ASR 去重跳過（M2-66 / M2-67）
 
 - **診斷碼**: `realtime-asr-dedup`（diagLog，非 recordDiagnostic）
 - **port / kind**: `strategy` / info（diagLog 留痕，不發降級事件）
 - **用戶可見消息**: 無直接 UI 顯示（diagLog `strategy` 分類可選開啟）；間接效果：音樂/靜音段不產生重複字幕
-- **觸發條件**: `RealtimeASRStrategy` 流式/非流式路徑中 ASR 返回文本與 `lastAsrText` 相同且 `consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD (3)`——連續 3 次相同文本跳過翻譯
-- **根因**: Whisper 對 256ms 碎片（音樂/靜音）產出重複 `[MUSIC]`（7 chars），通過 `MIN_TRANSLATE_TEXT_LEN=3` 過濾但觸發大量無意義翻譯推理（每次 15-27s）
-- **修復措施**: `DEDUP_CONSECUTIVE_THRESHOLD = 3`、`lastAsrText: string`、`consecutiveDuplicateCount: number`；流式（transcribeStream）和非流式（transcribe）路徑均在翻譯前檢查；不同文本重置計數為 1；`stop()`/`inject()` 重置。跳過時 `diagLog('strategy', 'realtime-asr: dedup — skipping duplicate text "..." (consecutive=N, seq=M)')`
+- **觸發條件**: `RealtimeASRStrategy` 流式/非流式路徑中 ASR 返回文本經 `normalizeForDedup()` 正規化後與 `lastAsrText` 相同且 `consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD (3)`——連續 3 次相同（正規化後）文本跳過翻譯
+- **根因**: Whisper 對音樂/靜音段產出 non-speech token（`[MUSIC]`、`[APPLAUSE]`、`(laughing)` 等），通過 `MIN_TRANSLATE_TEXT_LEN=3` 過濾但觸發大量無意義翻譯推理（每次 15-27s）。M2-67：token 變體多（bracket/parenthetical），精確匹配去重無法覆蓋
+- **修復措施**: `DEDUP_CONSECUTIVE_THRESHOLD = 3`、`lastAsrText: string`、`consecutiveDuplicateCount: number`；**M2-67：`normalizeForDedup()`**——全段 bracket token（`[MUSIC]`）→ `"ns"`、全段 parenthetical（`(laughing)`）→ `"ns"`、混合文本替換 token 為 `"ns"` 保留語音文字；流式/非流式路徑均用正規化後比較；不同文本重置計數為 1；`stop()`/`inject()` 重置。跳過時 `diagLog('strategy', 'realtime-asr: dedup — skipping duplicate text "..." (consecutive=N, seq=M)')`
 - **用戶響應**: 音樂/靜音段無重複字幕（正常行為）；若所有字幕都被跳過則 ASR 模型可能持續產出相同文本
 - **開發者響應**: Options 頁開啟 `strategy` 調試日誌，觀察 dedup 頻率與跳過文本內容；若跳過文本非 `[MUSIC]`/`[BLANK]` 則可能是 ASR 模型問題
-- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`DEDUP_CONSECUTIVE_THRESHOLD` + `lastAsrText` + `consecutiveDuplicateCount` + 流式/非流式去重檢查 + stop/inject 重置）
+- **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（`normalizeForDedup()` + `DEDUP_CONSECUTIVE_THRESHOLD` + `lastAsrText` + `consecutiveDuplicateCount` + 流式/非流式去重檢查 + stop/inject 重置）
 
 ---
 

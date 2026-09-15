@@ -259,6 +259,74 @@ describe('Service Worker — asr:get-stream-id（M2-52）', () => {
       })
     );
   });
+
+  it('M2-67：offscreen port 存在時先發 asr:release-stream 再調 getMediaStreamId', async () => {
+    await loadWorker();
+    const listener = getListener();
+
+    // 模擬 offscreen port 已連接（offscreen-onnx）。
+    const postMessageMock = vi.fn();
+    const onMessageAddMock = vi.fn();
+    const onDisconnectAddMock = vi.fn();
+    const fakePort = {
+      name: 'offscreen-onnx',
+      postMessage: postMessageMock,
+      onMessage: { addListener: onMessageAddMock, removeListener: vi.fn() },
+      onDisconnect: { addListener: onDisconnectAddMock, removeListener: vi.fn() },
+      disconnect: vi.fn(),
+    };
+    const onConnectAdd = (chrome.runtime.onConnect.addListener as ReturnType<typeof vi.fn>);
+    onConnectAdd.mock.calls[0][0](fakePort as unknown as chrome.runtime.Port);
+
+    // 模擬 offscreen 回應 release-stream（sendToOffscreen 等待 messageId 匹配）。
+    // sendToOffscreen 會生成隨機 messageId，我們需要攔截 postMessage 並回傳。
+    postMessageMock.mockImplementation((msg: { messageId?: string }) => {
+      // 找到已註冊的 responseListener 並觸發。
+      const listenerCb = onMessageAddMock.mock.calls[0]?.[0];
+      if (listenerCb && msg.messageId) {
+        listenerCb({ messageId: msg.messageId, result: { released: true } });
+      }
+    });
+
+    const getStreamIdMock = (chrome as unknown as { tabCapture: { getMediaStreamId: ReturnType<typeof vi.fn> } })
+      .tabCapture.getMediaStreamId;
+    getStreamIdMock.mockImplementationOnce((_opts: unknown, cb: (id: string) => void) => {
+      cb('fresh-stream-id');
+    });
+
+    const sendResponse = vi.fn();
+    listener({ topic: 'asr:get-stream-id' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // release-stream 消息已發送給 offscreen。
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ topic: 'asr:release-stream' })
+    );
+    // getMediaStreamId 在 release 之後調用。
+    expect(getStreamIdMock).toHaveBeenCalled();
+    // 最終響應成功。
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true, streamId: 'fresh-stream-id' });
+  });
+
+  it('M2-67：offscreen port 不存在時跳過 release，直接調 getMediaStreamId', async () => {
+    await loadWorker();
+    const listener = getListener();
+
+    // 不連接任何 offscreen port（offscreenPort 為 null）。
+    const getStreamIdMock = (chrome as unknown as { tabCapture: { getMediaStreamId: ReturnType<typeof vi.fn> } })
+      .tabCapture.getMediaStreamId;
+    getStreamIdMock.mockImplementationOnce((_opts: unknown, cb: (id: string) => void) => {
+      cb('direct-stream-id');
+    });
+
+    const sendResponse = vi.fn();
+    listener({ topic: 'asr:get-stream-id' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // getMediaStreamId 仍被調用（release 跳過不阻塞）。
+    expect(getStreamIdMock).toHaveBeenCalled();
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true, streamId: 'direct-stream-id' });
+  });
 });
 
 // M2-45：Content-script 透過 SW 創建 Offscreen Document（chrome.offscreen 僅在 SW 可用）。

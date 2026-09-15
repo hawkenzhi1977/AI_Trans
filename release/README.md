@@ -5,8 +5,8 @@ This directory is a ready-to-load Chrome MV3 extension release.
 
 - `ai-trans-extension/` — 未打包擴充目錄（推薦用於「加載已解壓的擴充程序」）
   Unpacked extension folder (use "Load unpacked").
-- `ai-trans-extension-v0.2.0.zip` — 壓縮包（便於分發，需先解壓）
-  Zip archive (for distribution; unzip before loading).
+- `ai-trans-extension-v0.6.2.zip` — 壓縮包（便於分發，需先解壓）
+  Zip archive (for distribution; unzip before loading). `ai-trans-extension-v0.6.2.zip`
 
 ---
 

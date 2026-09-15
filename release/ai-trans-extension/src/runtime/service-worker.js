@@ -275,24 +275,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const payload = msg.payload ?? {};
     const targetTabId = sender.tab?.id ?? payload.targetTabId;
     const constraints = targetTabId != null ? { targetTabId } : {};
-    new Promise((resolve, reject) => {
+    const releasePromise = (async () => {
+      if (!offscreenPort) return;
       try {
-        chrome.tabCapture.getMediaStreamId(constraints, (streamId) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message ?? "getMediaStreamId failed"));
-          } else {
-            resolve(streamId);
-          }
-        });
-      } catch (err) {
-        reject(err instanceof Error ? err : new Error(String(err)));
+        await sendToOffscreen({ topic: "asr:release-stream" });
+      } catch {
       }
-    }).then((streamId) => sendResponse({ ok: true, streamId })).catch(
-      (err) => sendResponse({
-        ok: false,
-        error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`
-      })
-    );
+    })();
+    releasePromise.then(() => {
+      new Promise((resolve, reject) => {
+        try {
+          chrome.tabCapture.getMediaStreamId(constraints, (streamId) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message ?? "getMediaStreamId failed"));
+            } else {
+              resolve(streamId);
+            }
+          });
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }).then((streamId) => sendResponse({ ok: true, streamId })).catch(
+        (err) => sendResponse({
+          ok: false,
+          error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`
+        })
+      );
+    });
     return true;
   }
   if (msg.topic === "offscreen:ensure-created") {

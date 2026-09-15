@@ -48,6 +48,20 @@ const MIN_DISPLAY_WINDOW_MS = 5000;
 const MAX_INFLIGHT_ASR = 2;
 
 /**
+ * M2-67：non-speech token 正規化——Whisper 對音樂/音效段產出 [MUSIC]、[APPLAUSE]、
+ * (laughing)、(gunsire) 等變體，精確匹配去重無法覆蓋。正規化為統一類別標記後比較。
+ */
+export function normalizeForDedup(text: string): string {
+  const t = text.trim().toLowerCase();
+  // 全段為 bracket token（[MUSIC]、[APPLAUSE] 等）→ 統一為 'ns'。
+  if (/^\[[a-z ]+\]$/.test(t)) return 'ns';
+  // 全段為 parenthetical（(laughing)、(gunsire) 等）→ 統一為 'ns'。
+  if (/^\([^)]+\)$/.test(t)) return 'ns';
+  // 混合文本：替換 bracket/parenthetical token 為 'ns'，保留實際語音文字。
+  return t.replace(/\[[a-z ]+\]/g, 'ns').replace(/\([^)]*\)/g, 'ns');
+}
+
+/**
  * M2-58：將 ASR segment 時間戳對齊到視頻時間軸。
  * Whisper 輸出的 start/end 相對於輸入 chunk（0~chunk.duration）；
  * 加上 chunk 開始時的視頻時間（onChunk 以播放狀態反推）即為視頻絕對時間。
@@ -310,8 +324,9 @@ export class RealtimeASRStrategy implements CaptionStrategy {
               return;
             }
 
-            // M2-66：去重——連續相同文本跳過翻譯（Whisper 對低音量/音樂段反覆產出 [MUSIC]）。
-            const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(' ').toLowerCase();
+            // M2-66/M2-67：去重——連續相同文本跳過翻譯（Whisper 對低音量/音樂段反覆產出 [MUSIC]）。
+            // M2-67：正規化 non-speech token（[MUSIC]/(laughing) 等）後比較，覆蓋變體。
+            const currentText = normalizeForDedup(asrResult.segments.map((s) => s.sourceText.trim()).join(' '));
             if (currentText === this.lastAsrText) {
               this.consecutiveDuplicateCount++;
               if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
@@ -364,8 +379,8 @@ export class RealtimeASRStrategy implements CaptionStrategy {
             return;
           }
 
-          // M2-66：去重（非流式路徑）。
-          const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(' ').toLowerCase();
+          // M2-66/M2-67：去重（非流式路徑）——正規化 non-speech token 後比較。
+          const currentText = normalizeForDedup(asrResult.segments.map((s) => s.sourceText.trim()).join(' '));
           if (currentText === this.lastAsrText) {
             this.consecutiveDuplicateCount++;
             if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {

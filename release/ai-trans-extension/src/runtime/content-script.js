@@ -468,6 +468,12 @@
   var DEDUP_CONSECUTIVE_THRESHOLD = 3;
   var MIN_DISPLAY_WINDOW_MS = 5e3;
   var MAX_INFLIGHT_ASR = 2;
+  function normalizeForDedup(text) {
+    const t = text.trim().toLowerCase();
+    if (/^\[[a-z ]+\]$/.test(t)) return "ns";
+    if (/^\([^)]+\)$/.test(t)) return "ns";
+    return t.replace(/\[[a-z ]+\]/g, "ns").replace(/\([^)]*\)/g, "ns");
+  }
   function alignSegmentsToVideoTimeline(segments, chunkStartMs) {
     return segments.map((s) => {
       const start2 = Math.max(0, s.start + chunkStartMs);
@@ -658,7 +664,7 @@
                 diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
                 return;
               }
-              const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(" ").toLowerCase();
+              const currentText = normalizeForDedup(asrResult.segments.map((s) => s.sourceText.trim()).join(" "));
               if (currentText === this.lastAsrText) {
                 this.consecutiveDuplicateCount++;
                 if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {
@@ -703,7 +709,7 @@
               diagLog("strategy", `realtime-asr: skipping translation for very short text (len=${totalTextLen}, seq=${chunk.seq})`);
               return;
             }
-            const currentText = asrResult.segments.map((s) => s.sourceText.trim()).join(" ").toLowerCase();
+            const currentText = normalizeForDedup(asrResult.segments.map((s) => s.sourceText.trim()).join(" "));
             if (currentText === this.lastAsrText) {
               this.consecutiveDuplicateCount++;
               if (this.consecutiveDuplicateCount >= DEDUP_CONSECUTIVE_THRESHOLD) {

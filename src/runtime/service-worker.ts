@@ -204,28 +204,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const targetTabId = sender.tab?.id ?? payload.targetTabId;
     const constraints: chrome.tabCapture.GetMediaStreamOptions =
       targetTabId != null ? { targetTabId } : {};
+
+    // M2-67：先釋放 offscreen 端已有的 MediaStream（tracks active 時 Chrome 拒絕
+    // getMediaStreamId："Cannot capture a tab with an active stream."）。
+    // 通過 offscreen-onnx port 發 asr:release-stream，offscreen stop tracks + null。
+    // best-effort：port 不存在（offscreen 未啟動）時跳過，不阻塞 getMediaStreamId。
+    const releasePromise = (async () => {
+      if (!offscreenPort) return;
+      try {
+        await sendToOffscreen({ topic: 'asr:release-stream' });
+      } catch {
+        // offscreen 未就緒或 port 斷開——不阻塞，getMediaStreamId 仍可能成功。
+      }
+    })();
+
     // TS 類型定義為 callback 風格（返回 void），需手動包裝為 Promise。
     // Chrome 116+ 跨 render process 限制：必須在 SW 中調用才能讓 offscreen 消費 streamId。
-    new Promise<string>((resolve, reject) => {
-      try {
-        chrome.tabCapture.getMediaStreamId(constraints, (streamId: string) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message ?? 'getMediaStreamId failed'));
-          } else {
-            resolve(streamId);
-          }
-        });
-      } catch (err) {
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    })
-      .then((streamId) => sendResponse({ ok: true, streamId }))
-      .catch((err) =>
-        sendResponse({
-          ok: false,
-          error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`,
-        })
-      );
+    releasePromise.then(() => {
+      new Promise<string>((resolve, reject) => {
+        try {
+          chrome.tabCapture.getMediaStreamId(constraints, (streamId: string) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message ?? 'getMediaStreamId failed'));
+            } else {
+              resolve(streamId);
+            }
+          });
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      })
+        .then((streamId) => sendResponse({ ok: true, streamId }))
+        .catch((err) =>
+          sendResponse({
+            ok: false,
+            error: `asr:get-stream-id failed: ${err instanceof Error ? err.message : String(err)}`,
+          })
+        );
+    });
     return true; // 異步響應
   }
 

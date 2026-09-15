@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { RealtimeASRStrategy, alignSegmentsToVideoTimeline, filterEmptySegments, VAD_FALLBACK_SILENT_CHUNKS } from '../../src/application/strategies/realtime-asr-strategy';
+import { RealtimeASRStrategy, alignSegmentsToVideoTimeline, filterEmptySegments, VAD_FALLBACK_SILENT_CHUNKS, normalizeForDedup } from '../../src/application/strategies/realtime-asr-strategy';
 import type { AudioSourceProvider, AudioSourceHandle, AudioChunk } from '../../src/domain/models/audio';
 import type { ASRProvider } from '../../src/domain/ports/asr-provider';
 import type { TranslationProvider } from '../../src/domain/ports/translation-provider';
@@ -870,5 +870,157 @@ describe('RealtimeASRStrategy — M2-66 去重與 Backpressure', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     strategy.stop();
+  });
+});
+
+// M2-67：non-speech token 正規化去重。
+describe('RealtimeASRStrategy — M2-67 non-speech token 去重', () => {
+  describe('normalizeForDedup', () => {
+    it('TC-1：[MUSIC] → "ns"', () => {
+      expect(normalizeForDedup('[MUSIC]')).toBe('ns');
+    });
+
+    it('TC-2：[APPLAUSE] → "ns"', () => {
+      expect(normalizeForDedup('[APPLAUSE]')).toBe('ns');
+    });
+
+    it('TC-3：(laughing) → "ns"', () => {
+      expect(normalizeForDedup('(laughing)')).toBe('ns');
+    });
+
+    it('TC-4：(gunsire) → "ns"', () => {
+      expect(normalizeForDedup('(gunsire)')).toBe('ns');
+    });
+
+    it('TC-5：混合文本 "hello [MUSIC] world" → "hello ns world"', () => {
+      expect(normalizeForDedup('hello [MUSIC] world')).toBe('hello ns world');
+    });
+
+    it('TC-6：純語音文本不變', () => {
+      expect(normalizeForDedup('hello world')).toBe('hello world');
+    });
+
+    it('TC-7：大小寫不敏感', () => {
+      expect(normalizeForDedup('[Music]')).toBe('ns');
+    });
+
+    it('TC-8：多 token 混合 "hello (laughing) world [MUSIC]" → "hello ns world ns"', () => {
+      expect(normalizeForDedup('hello (laughing) world [MUSIC]')).toBe('hello ns world ns');
+    });
+  });
+
+  // 集成測試：不同 non-speech token 變體應觸發去重。
+  describe('M2-67 集成：non-speech token 變體去重', () => {
+    let strategy: RealtimeASRStrategy;
+    let mockAudioSource: AudioSourceProvider;
+    let mockHandle: AudioSourceHandle;
+    let mockASR: ASRProvider;
+    let mockTranslation: TranslationProvider;
+    let chunkCallback: ((chunk: AudioChunk) => void) | null = null;
+
+    function makeChunk(seq: number): AudioChunk {
+      const pcm = new Float32Array(80_000);
+      pcm.fill(0.1);
+      return { seq, startTime: 0, duration: 5000, sampleRate: 16_000, channels: 1, pcm, isSpeech: true };
+    }
+
+    function makeContext(): StrategyContext {
+      return {
+        platform: {} as PlatformAdapter,
+        playback: () => ({ currentTime: 0, playing: true, rate: 1, duration: 100_000, buffered: [] }),
+        config: {
+          asr: { type: 'local-whisper', modelTier: 'base', vadThreshold: 0.01 },
+          targetLang: 'zh-Hant',
+        } as EngineConfig,
+        asr: {} as ASRProvider,
+        translation: {} as TranslationProvider,
+      };
+    }
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+      strategy = new RealtimeASRStrategy();
+      mockHandle = {
+        kind: 'tab-capture',
+        start: vi.fn().mockResolvedValue(undefined),
+        stop: vi.fn().mockResolvedValue(undefined),
+      };
+      mockAudioSource = {
+        kind: 'tab-capture',
+        open: vi.fn().mockResolvedValue(mockHandle),
+        onChunk: vi.fn((cb) => { chunkCallback = cb; }),
+      };
+      mockASR = {
+        engineId: 'test-asr',
+        location: 'local',
+        warmup: vi.fn().mockResolvedValue(undefined),
+        transcribe: vi.fn(),
+      };
+      mockTranslation = {
+        engineId: 'test-llm',
+        location: 'cloud',
+        translate: vi.fn(),
+      };
+      strategy.inject({
+        audioSource: mockAudioSource,
+        asrProvider: mockASR,
+        translationProvider: mockTranslation,
+        vadThreshold: 0.01,
+      });
+      chunkCallback = null;
+    });
+
+    it('TC-9：[MUSIC] 和 (laughing) 交替 → 正規化後相同 → 第 3 次觸發 dedup', async () => {
+      const ctx = makeContext();
+      await strategy.run(ctx, () => {});
+
+      const tokens = ['[MUSIC]', '(laughing)', '[APPLAUSE]'];
+      for (let i = 0; i < 4; i++) {
+        mockASR.transcribe!.mockResolvedValueOnce({
+          seq: i,
+          segments: [{ id: `ns${i}`, sourceText: tokens[i % 3], start: 0, end: 5000, origin: 'realtime-asr' as const, provisional: false, revision: 0 }],
+          isPartial: false,
+          rtf: 0.5,
+        });
+        mockTranslation.translate!.mockResolvedValueOnce({
+          engineId: 'test-llm',
+          degraded: false,
+          segments: [{ id: `ns${i}`, sourceText: tokens[i % 3], translatedText: '音樂', start: 0, end: 5000 }],
+        });
+        chunkCallback!(makeChunk(i));
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      // 4 個 chunk 全部正規化為 "ns" → 第 1、2 次翻譯，第 3、4 次 dedup 跳過。
+      expect(mockTranslation.translate).toHaveBeenCalledTimes(2);
+      strategy.stop();
+    });
+
+    it('TC-10：non-speech token 與語音文本交替 → 不觸發 dedup', async () => {
+      const ctx = makeContext();
+      await strategy.run(ctx, () => {});
+
+      // 交替：[MUSIC] → "ns"，"hello world" → "hello world"（不同）
+      const texts = ['[MUSIC]', 'hello world', '[APPLAUSE]', 'goodbye'];
+      for (let i = 0; i < 4; i++) {
+        mockASR.transcribe!.mockResolvedValueOnce({
+          seq: i,
+          segments: [{ id: `m${i}`, sourceText: texts[i], start: 0, end: 5000, origin: 'realtime-asr' as const, provisional: false, revision: 0 }],
+          isPartial: false,
+          rtf: 0.5,
+        });
+        mockTranslation.translate!.mockResolvedValueOnce({
+          engineId: 'test-llm',
+          degraded: false,
+          segments: [{ id: `m${i}`, sourceText: texts[i], translatedText: '譯', start: 0, end: 5000 }],
+        });
+        chunkCallback!(makeChunk(i));
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      // 每次文本都不同（正規化後）→ 全部翻譯，無 dedup。
+      expect(mockTranslation.translate).toHaveBeenCalledTimes(4);
+      strategy.stop();
+    });
   });
 });

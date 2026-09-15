@@ -49243,6 +49243,21 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
             broadcastToAll(result);
             break;
           }
+          case "asr:release-stream": {
+            await detachAudioProcessing();
+            if (mediaStream) {
+              for (const track of mediaStream.getTracks()) {
+                track.onended = null;
+                try {
+                  track.stop();
+                } catch {
+                }
+              }
+              mediaStream = null;
+            }
+            result = { released: true };
+            break;
+          }
           default:
             error = `Unknown message type: ${type}`;
         }
