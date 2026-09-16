@@ -2,7 +2,7 @@
 
 本文件按業務流程章節組織,列出所有診斷信息、錯誤消息、觸發條件、根因、用戶響應、開發者響應及代碼落點。
 
-> 最後更新：2026-09-15（**M2-67：重新授權 ASR 失敗修復 + non-speech token 去重正規化**——§4.29 `realtime-asr-dedup` 更新：去重比較改用 `normalizeForDedup()`（`[MUSIC]`/`(laughing)` 等 non-speech token → `"ns"`），覆蓋 Whisper token 變體；`asr:get-stream-id` handler 新增 release-stream 前置步驟（非診斷碼，行為變更：調用 `getMediaStreamId` 前先釋放 offscreen MediaStream）。先前：**M2-66：實時 ASR 字幕不顯示修復**——新增 §4.28 `realtime-asr-backpressure`（inflight ≥ MAX_INFLIGHT_ASR=2 時跳過新 chunk，diagLog 留痕）+ §4.29 `realtime-asr-dedup`（連續 DEDUP_CONSECUTIVE_THRESHOLD=3 次相同 ASR 文本跳過翻譯，diagLog 留痕）；`alignSegmentsToVideoTimeline()` 新增 MIN_DISPLAY_WINDOW_MS=5000 最小顯示窗口（非診斷碼，行為變更）。先前：**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
+> 最後更新：2026-09-16（**M2-69：Offscreen 單例衝突修復**——新增 §11.4a-1「Offscreen 單例衝突」：`ensureOffscreenDocument()` `getContexts` 改為不帶 `documentUrls` 過濾（僅按 contextType）；`createDocument()` 被拒「Only a single offscreen document may be created」時重查 `getContexts`，確認已存在視為成功；`LocalWhisperASR.warmup()` 偵測 single offscreen 錯誤時發 `offscreen:ensure-created` + 重試一次。解決「ASR warmup 失敗 → realtime-asr 策略整體降級 → 中英文字幕皆不出現」根因（失敗發生在 warmup 階段、音頻流之前）。先前：**M2-66：實時 ASR 字幕不顯示修復**——新增 §4.28 `realtime-asr-backpressure`（inflight ≥ MAX_INFLIGHT_ASR=2 時跳過新 chunk，diagLog 留痕）+ §4.29 `realtime-asr-dedup`（連續 DEDUP_CONSECUTIVE_THRESHOLD=3 次相同 ASR 文本跳過翻譯，diagLog 留痕）；`alignSegmentsToVideoTimeline()` 新增 MIN_DISPLAY_WINDOW_MS=5000 最小顯示窗口（非診斷碼，行為變更）。先前：**M2-65：local-onnx 電路斷開器**——新增 §4.27 `local-onnx-circuit-breaker-opened`（連續 3 chunk 失敗跳過推理直接回退原文，per-session 計數）。先前：**M2-64：local-onnx 慢機器字幕停滯修復**——§4.24 `local-onnx-slow-inference` 閾值 15s→45s（`SLOW_CHUNK_THRESHOLD_MS = PER_CHUNK_TIMEOUT_MS * 0.75`，與 M2-63 超時同步）；新增 wrongLanguage 回退原文行為（[BLANK AUDIO] → sourceText）+ 極短文本（<3 字符）跳過翻譯；先前：**M2-63**：ASR transcribe 超時 60s→120s（串行化排隊+推理）；`PER_CHUNK_TIMEOUT_MS` 30s→60s。先前：**M2-38**：Small model (MarianMT) 退化輸出檢測——新增 §4.23 `small-model-degenerate`（3-gram 唯一率 <0.2 判定重複循環，回退原文 + 提示用戶切換 Large model）；先前：**M2-26**：新增 §2.21「本地 ONNX 模型載入後 popup 彈不出」場景、§4.20「local-onnx-webgpu-fallback」、§4.21「popup-init-slow」、§4.22「popup-init-timeout」）
 
 ---
 
@@ -978,10 +978,22 @@ DiagnosticRecord 結構:
 - **診斷碼**: asr-warmup-failed
 - **用戶可見消息**: 最近失敗: 降級: ASR warmup failed: <錯誤> (<timestamp>)
 - **觸發條件**: `RealtimeASRStrategy.run()` 中 `await asrProvider.warmup(ctx.config.asr)` 拋錯
-- **根因**: Whisper 模型未下載 / 網絡錯誤 / offscreen 通信失敗
-- **用戶響應**: 從 Options 頁面下載 ASR 模型；檢查網絡連接
+- **根因**: Whisper 模型未下載 / 網絡錯誤 / offscreen 通信失敗 / **offscreen 單例衝突**（M2-69）
+- **用戶響應**: 從 Options 頁面下載 ASR 模型；檢查網絡連接；若為 offscreen 衝突（已自動重試仍失敗）刷新頁面重試
 - **開發者響應**: 查看 catch 中 `recordDiagnostic` 的 cause 鏈；確認 offscreen document 是否存活
 - **代碼落點**: src/application/strategies/realtime-asr-strategy.ts（run() warmup try/catch）
+
+#### 11.4a-1 Offscreen 單例衝突（M2-69）
+
+- **症狀**: `ASR warmup failed: asr-whisper operation failed: Only a single offscreen document may be created. / 請從選項頁面下載 ASR 模型`——但模型其實已下載，且 local-onnx 翻譯模型能正常載入（證明 offscreen 曾存活）。
+- **根因**: Chrome MV3 限制同一 extension 只能存在一個 offscreen document。`ensureOffscreenDocument()`（service-worker.ts）用 `chrome.runtime.getContexts({ OFFSCREEN_DOCUMENT, documentUrls: [OFFSCREEN_URL] })` 檢查是否已存在；真實 Chrome 中該 URL 精確匹配可能漏判（時序/URL 字串差異），返回空 → 誤判「不存在」→ 調 `createDocument()` → Chrome 拋「Only a single offscreen document may be created」。ASR warmup 經此路徑失敗 → realtime-asr 策略整體降級 → 中英文字幕皆不出現（與 VAD/音頻累積窗口/模型檔位無關，因失敗發生在 warmup 階段、音頻流之前）。
+- **修復（M2-69）**:
+  1. `ensureOffscreenDocument()`：`getContexts` 改為不帶 `documentUrls` 過濾（僅按 contextType 匹配，更寬鬆可靠）；`createDocument()` 被拒且錯誤含「single offscreen document」時重查 `getContexts`，若確認已存在則視為成功（不拋錯）。
+  2. `LocalWhisperASR.warmup()`：偵測到「single offscreen document」錯誤時，先發 `offscreen:ensure-created`（讓 SW 重查/重建）再重試一次 warmup，覆蓋 SW `offscreenPort` 指向已關閉舊 document 的 port 路徑失敗情境。
+- **用戶響應**: 多數情況自動恢復（重試成功）；若仍失敗，刷新 YouTube 頁面重試。
+- **開發者響應**: SW console 查 `[AI_Trans:sw] offscreen created` 出現次數；確認 `getContexts` 是否漏判。
+- **代碼落點**: src/runtime/service-worker.ts（`ensureOffscreenDocument` / `hasOffscreenDocument`）、src/adapters/asr/local-whisper.ts（`warmup` / `doWarmup`）
+- **回歸測試**: test/unit/service-worker.test.ts（M2-69 ×3）、test/unit/local-whisper-asr.test.ts（M2-69 ×3）
 
 ### 11.4b ASR Transcribe 超時（M2-57）
 

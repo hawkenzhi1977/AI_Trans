@@ -28,7 +28,7 @@ const HTML = `
   <input id="asr-custom-model" />
   <input id="asr-vad-threshold" type="range" min="0.1" max="5" step="0.1" value="0.5" />
   <span id="asr-vad-val">0.5</span>
-  <select id="asr-accumulate-window"><option value="2000">2s</option><option value="3000" selected>3s</option><option value="5000">5s</option></select>
+  <select id="asr-accumulate-window"><option value="2000" selected>2s</option><option value="3000">3s</option><option value="5000">5s</option></select>
   <input id="asr-model-name" disabled />
   <p id="asr-model-size-info"></p>
   <span id="asr-model-status-badge">檢測中...</span>

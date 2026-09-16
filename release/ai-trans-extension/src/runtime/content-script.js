@@ -636,8 +636,7 @@
         try {
           const req = {
             chunk,
-            hintLang: void 0,
-            // 由配置驅動。
+            hintLang: ctx.audioLanguage,
             allowPartial: true
           };
           const asrStartTime = performance.now();
@@ -3007,6 +3006,7 @@ Example output:
 
   // src/adapters/render/overlay-renderer.ts
   var NO_CUE_LOG_INTERVAL_MS = 5e3;
+  var ASR_GRACE_PERIOD_MS = 5e3;
   var OverlayRenderer = class {
     root = null;
     styleEl = null;
@@ -3082,9 +3082,14 @@ Example output:
       this.currentId = null;
     }
     draw(currentTime) {
-      const active = this.cues.find(
+      let active = this.cues.find(
         (c) => currentTime >= c.start && currentTime < c.end
       );
+      if (!active) {
+        active = this.cues.filter(
+          (c) => (c.origin === "realtime-asr" || c.origin === "lookahead-asr") && currentTime >= c.end && currentTime - c.end <= ASR_GRACE_PERIOD_MS
+        ).sort((a, b) => b.end - a.end)[0];
+      }
       if (active) {
         if (active.id !== this.lastLoggedActiveId) {
           diagLog("overlay", "draw() found active cue:", active.id, "start:", active.start, "end:", active.end);
@@ -3802,15 +3807,7 @@ Example output:
      */
     async warmup(config) {
       try {
-        const response = await chrome.runtime.sendMessage({
-          topic: "asr-whisper:warmup",
-          payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs }
-        });
-        const raw = response;
-        const warmupResult = "result" in raw && raw.result ? raw.result : raw;
-        if (!warmupResult?.ok) {
-          throw new Error(warmupResult?.error ?? "warmup failed");
-        }
+        await this.doWarmup(config);
         this.warmedUp = true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -3828,6 +3825,38 @@ Example output:
           }
         });
         throw error;
+      }
+    }
+    /**
+     * 實際 warmup——發送 asr-whisper:warmup 並校驗結果。
+     * M2-69：偵測「Only a single offscreen document may be created」時自愈——
+     * 先發 offscreen:ensure-created（讓 SW 重查/創建），再重試一次 doWarmup。
+     * 根因：SW 的 offscreenPort 可能指向已關閉的舊 document（port 路徑直接失敗），
+     * 或 getContexts 漏判導致重複創建被拒；ensure-created + 重試可恢復。
+     */
+    async doWarmup(config) {
+      const response = await chrome.runtime.sendMessage({
+        topic: "asr-whisper:warmup",
+        payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs }
+      });
+      const raw = response;
+      const warmupResult = "result" in raw && raw.result ? raw.result : raw;
+      if (!warmupResult?.ok) {
+        const errMsg = warmupResult?.error ?? "warmup failed";
+        if (/only a single offscreen document/i.test(errMsg)) {
+          await chrome.runtime.sendMessage({ topic: "offscreen:ensure-created" });
+          const retryResponse = await chrome.runtime.sendMessage({
+            topic: "asr-whisper:warmup",
+            payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs }
+          });
+          const retryRaw = retryResponse;
+          const retryResult = "result" in retryRaw && retryRaw.result ? retryRaw.result : retryRaw;
+          if (!retryResult?.ok) {
+            throw new Error(retryResult?.error ?? errMsg);
+          }
+          return;
+        }
+        throw new Error(errMsg);
       }
     }
     /** 非流式推理——M2-37：轉發推理請求給 Offscreen Document。 */
@@ -4781,7 +4810,8 @@ Example output:
           translatedText: s.translatedText ?? s.sourceText,
           provisional: s.provisional,
           start: s.start,
-          end: s.end
+          end: s.end,
+          origin: s.origin
         }));
         if (this.cues.length > 0) {
           const maxEnd = Math.max(...this.cues.map((c) => c.end));

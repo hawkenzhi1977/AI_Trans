@@ -288,7 +288,7 @@ export class RealtimeASRStrategy implements CaptionStrategy {
         // ASR 推理（流式）。
         const req = {
           chunk,
-          hintLang: undefined, // 由配置驅動。
+          hintLang: ctx.audioLanguage,
           allowPartial: true,
         };
 

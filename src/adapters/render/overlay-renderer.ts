@@ -9,6 +9,13 @@ import { diagLog } from '../../infrastructure/debug-log';
  */
 const NO_CUE_LOG_INTERVAL_MS = 5_000;
 
+/**
+ * ASR 字幕寬限期（ms）——ASR 管線固有延遲（音頻累積 + 推理 + 翻譯 ≈ 4-6s）
+ * 導致 cue 到達時 currentTime 已超過 end。寬限期內仍顯示該 cue，
+ * 僅對 ASR 來源（realtime-asr / lookahead-asr）生效，原生字幕不受影響。
+ */
+const ASR_GRACE_PERIOD_MS = 5_000;
+
 export class OverlayRenderer implements SubtitleRenderer {
   private root: HTMLElement | null = null;
   private styleEl: HTMLStyleElement | null = null;
@@ -97,9 +104,22 @@ export class OverlayRenderer implements SubtitleRenderer {
   }
 
   private draw(currentTime: Millis): void {
-    const active = this.cues.find(
+    let active = this.cues.find(
       (c) => currentTime >= c.start && currentTime < c.end
     );
+    // ASR 寬限期：管線延遲導致 currentTime 已超過 cue.end，
+    // 在 ASR_GRACE_PERIOD_MS 內仍顯示（取最接近的 ASR cue）。
+    // 僅對明確標記為 ASR 來源的 cue 生效；無 origin（舊數據）或 native 不享有。
+    if (!active) {
+      active = this.cues
+        .filter(
+          (c) =>
+            (c.origin === 'realtime-asr' || c.origin === 'lookahead-asr') &&
+            currentTime >= c.end &&
+            currentTime - c.end <= ASR_GRACE_PERIOD_MS
+        )
+        .sort((a, b) => b.end - a.end)[0];
+    }
     if (active) {
       // 降壓：只在切換到新 cue 時才記錄
       if (active.id !== this.lastLoggedActiveId) {

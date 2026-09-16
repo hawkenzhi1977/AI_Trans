@@ -48833,7 +48833,7 @@ ${fake_token_around_image}${global_img_token}` + image_token.repeat(image_seq_le
   var audioContext = null;
   var scriptProcessor = null;
   var currentPort = null;
-  var AUDIO_ACCUMULATE_TARGET_MS = 3e3;
+  var AUDIO_ACCUMULATE_TARGET_MS = 2e3;
   var audioAccumBuffer = null;
   var passthroughContext = null;
   var passthroughSource = null;

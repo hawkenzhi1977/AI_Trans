@@ -610,6 +610,7 @@ class SubtitleController {
         provisional: s.provisional,
         start: s.start,
         end: s.end,
+        origin: s.origin,
       }));
       // D3：記錄 playback vs coverage gap（正值 = 翻譯落後播放位置，負值 = 翻譯超前）。
       if (this.cues.length > 0) {

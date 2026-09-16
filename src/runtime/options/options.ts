@@ -146,7 +146,7 @@ function fillForm(config: EngineConfig): void {
   const vadPct = (config.asr.vadThreshold ?? 0.005) * 100;
   $<HTMLInputElement>('asr-vad-threshold').value = String(vadPct);
   $<HTMLSpanElement>('asr-vad-val').textContent = vadPct.toFixed(1);
-  $<HTMLSelectElement>('asr-accumulate-window').value = String(config.asr.accumulateTargetMs ?? 3000);
+  $<HTMLSelectElement>('asr-accumulate-window').value = String(config.asr.accumulateTargetMs ?? 2000);
   $<HTMLSelectElement>('target-lang').value = config.targetLang;
   $<HTMLSelectElement>('display-mode').value = config.displayMode;
   $<HTMLSelectElement>('performance-profile').value = config.performanceProfile;

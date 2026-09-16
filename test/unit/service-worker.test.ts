@@ -371,4 +371,53 @@ describe('Service Worker — offscreen:ensure-created（M2-45）', () => {
       expect.objectContaining({ ok: false, error: expect.stringContaining('offscreen create failed') })
     );
   });
+
+  it('M2-69：createDocument 被拒 single offscreen + getContexts 查到已存在 → 視為成功（ok:true）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    // 模擬真實 Chrome：createDocument 拋「Only a single offscreen document may be created」。
+    (chrome.offscreen.createDocument as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('Only a single offscreen document may be created.')
+    );
+    // getContexts 重查時返回已存在的 offscreen context（首次檢查返空 → 觸發 createDocument）。
+    const getContextsMock = chrome.runtime.getContexts as ReturnType<typeof vi.fn>;
+    getContextsMock
+      .mockResolvedValueOnce([]) // 首次 hasOffscreenDocument → 空 → createDocument
+      .mockResolvedValueOnce([{ contextType: 'OFFSCREEN_DOCUMENT' }]); // catch 重查 → 已存在
+    const sendResponse = vi.fn();
+    listener({ topic: 'offscreen:ensure-created' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    // 被拒後重查確認存在 → 不拋錯 → ok:true。
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('M2-69：createDocument 被拒 single offscreen + getContexts 仍查不到 → 拋錯（ok:false）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    (chrome.offscreen.createDocument as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('Only a single offscreen document may be created.')
+    );
+    // getContexts 始終返空（重查也查不到）→ 應拋錯。
+    (chrome.runtime.getContexts as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    const sendResponse = vi.fn();
+    listener({ topic: 'offscreen:ensure-created' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: false, error: expect.stringContaining('single offscreen document') })
+    );
+  });
+
+  it('M2-69：createDocument 被拒非 single offscreen 錯誤 → 直接拋錯（不重查）', async () => {
+    await loadWorker();
+    const listener = getListener();
+    (chrome.offscreen.createDocument as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('offscreen api unavailable')
+    );
+    const sendResponse = vi.fn();
+    listener({ topic: 'offscreen:ensure-created' }, {}, sendResponse);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: false, error: expect.stringContaining('offscreen api unavailable') })
+    );
+  });
 });

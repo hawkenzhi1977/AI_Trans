@@ -88,19 +88,7 @@ export class LocalWhisperASR implements ASRProvider {
    */
   async warmup(config: ASRConfig): Promise<void> {
     try {
-      const response = await chrome.runtime.sendMessage({
-        topic: 'asr-whisper:warmup',
-        payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs },
-      });
-
-      // 響應可能直接是結果，或包裹在 { ok, result } 中。
-      const raw = response as { ok?: boolean; result?: AsrWarmupResponse } | AsrWarmupResponse;
-      const warmupResult = 'result' in raw && raw.result ? raw.result : (raw as AsrWarmupResponse);
-
-      if (!warmupResult?.ok) {
-        throw new Error(warmupResult?.error ?? 'warmup failed');
-      }
-
+      await this.doWarmup(config);
       this.warmedUp = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -120,6 +108,43 @@ export class LocalWhisperASR implements ASRProvider {
         },
       });
       throw error;
+    }
+  }
+
+  /**
+   * 實際 warmup——發送 asr-whisper:warmup 並校驗結果。
+   * M2-69：偵測「Only a single offscreen document may be created」時自愈——
+   * 先發 offscreen:ensure-created（讓 SW 重查/創建），再重試一次 doWarmup。
+   * 根因：SW 的 offscreenPort 可能指向已關閉的舊 document（port 路徑直接失敗），
+   * 或 getContexts 漏判導致重複創建被拒；ensure-created + 重試可恢復。
+   */
+  private async doWarmup(config: ASRConfig): Promise<void> {
+    const response = await chrome.runtime.sendMessage({
+      topic: 'asr-whisper:warmup',
+      payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs },
+    });
+
+    // 響應可能直接是結果，或包裹在 { ok, result } 中。
+    const raw = response as { ok?: boolean; result?: AsrWarmupResponse } | AsrWarmupResponse;
+    const warmupResult = 'result' in raw && raw.result ? raw.result : (raw as AsrWarmupResponse);
+
+    if (!warmupResult?.ok) {
+      const errMsg = warmupResult?.error ?? 'warmup failed';
+      // M2-69：offscreen 單例衝突 → ensure-created + 重試一次。
+      if (/only a single offscreen document/i.test(errMsg)) {
+        await chrome.runtime.sendMessage({ topic: 'offscreen:ensure-created' });
+        const retryResponse = await chrome.runtime.sendMessage({
+          topic: 'asr-whisper:warmup',
+          payload: { modelId: this.modelId, accumulateTargetMs: config.accumulateTargetMs },
+        });
+        const retryRaw = retryResponse as { ok?: boolean; result?: AsrWarmupResponse } | AsrWarmupResponse;
+        const retryResult = 'result' in retryRaw && retryRaw.result ? retryRaw.result : (retryRaw as AsrWarmupResponse);
+        if (!retryResult?.ok) {
+          throw new Error(retryResult?.error ?? errMsg);
+        }
+        return;
+      }
+      throw new Error(errMsg);
     }
   }
 

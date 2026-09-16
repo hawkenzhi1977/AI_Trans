@@ -109,4 +109,128 @@ describe('OverlayRenderer 播放狀態驅動渲染（M1-26）', () => {
     expect(spans?.length).toBe(1);
     expect(root?.textContent).toBe('English text');
   });
+
+  // ASR 寬限期：管線延遲導致 currentTime 超過 cue.end，仍應顯示。
+  it('ASR cue 在 end 後 5s 內仍顯示（寬限期）', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const asrCue: RenderableCue = {
+      id: 'asr-1',
+      start: 0,
+      end: 2000,
+      translatedText: 'ASR譯文',
+      provisional: false,
+      sourceText: 'asr-src',
+      origin: 'realtime-asr',
+    };
+    // currentTime=4000：已超過 end(2000) 2s，在 5s 寬限期內。
+    r.render([asrCue], 4000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toContain('ASR譯文');
+  });
+
+  it('ASR cue 超過寬限期（>5s）後清空', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const asrCue: RenderableCue = {
+      id: 'asr-1',
+      start: 0,
+      end: 2000,
+      translatedText: 'ASR譯文',
+      provisional: false,
+      sourceText: 'asr-src',
+      origin: 'realtime-asr',
+    };
+    // currentTime=8000：已超過 end(2000) 6s，超出寬限期。
+    r.render([asrCue], 8000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toBe('');
+  });
+
+  it('原生字幕不受寬限期影響（end 後立即清空）', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const nativeCue: RenderableCue = {
+      id: 'native-1',
+      start: 0,
+      end: 2000,
+      translatedText: '原生譯文',
+      provisional: false,
+      sourceText: 'native-src',
+      origin: 'native',
+    };
+    // currentTime=3000：已超過 end(2000) 1s，原生字幕無寬限期。
+    r.render([nativeCue], 3000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toBe('');
+  });
+
+  it('lookahead-asr cue 同樣享有寬限期', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const cue: RenderableCue = {
+      id: 'la-1',
+      start: 0,
+      end: 2000,
+      translatedText: '預緩衝譯文',
+      provisional: false,
+      sourceText: 'la-src',
+      origin: 'lookahead-asr',
+    };
+    r.render([cue], 5000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toContain('預緩衝譯文');
+  });
+
+  it('無 origin 的 cue（舊數據）不享有寬限期', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const cue: RenderableCue = {
+      id: 'no-origin',
+      start: 0,
+      end: 2000,
+      translatedText: '無來源譯文',
+      provisional: false,
+      sourceText: 'src',
+    };
+    // 無 origin → 視為非 ASR，不享有寬限期。
+    r.render([cue], 3000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toBe('');
+  });
+
+  it('多個 ASR cue 時取最接近 currentTime 的（end 最大）', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const r = new OverlayRenderer();
+    r.mount(container, { 'display-mode': 'mono' });
+
+    const older: RenderableCue = {
+      id: 'old', start: 0, end: 2000,
+      translatedText: '舊', provisional: false, origin: 'realtime-asr',
+    };
+    const newer: RenderableCue = {
+      id: 'new', start: 2000, end: 4000,
+      translatedText: '新', provisional: false, origin: 'realtime-asr',
+    };
+    // currentTime=5000：old 超 3s、new 超 1s，都寬限期內 → 取 new（end 最大）。
+    r.render([older, newer], 5000);
+    const root = container.querySelector<HTMLElement>('.ai-trans-overlay');
+    expect(root?.textContent).toContain('新');
+  });
 });

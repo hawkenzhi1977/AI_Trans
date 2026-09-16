@@ -152,18 +152,28 @@ void store.get();
 var OFFSCREEN_REASON = "LOCAL_ONNX_INFERENCE";
 var OFFSCREEN_URL = "src/runtime/offscreen.html";
 var offscreenPort = null;
+async function hasOffscreenDocument() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT]
+  });
+  return contexts.length > 0;
+}
 async function ensureOffscreenDocument() {
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
-  });
-  if (existingContexts.length > 0) return;
+  if (await hasOffscreenDocument()) return;
   console.warn("[AI_Trans:sw] offscreen created");
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [chrome.offscreen.Reason.USER_MEDIA],
-    justification: OFFSCREEN_REASON
-  });
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      justification: OFFSCREEN_REASON
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/only a single offscreen document/i.test(msg)) {
+      if (await hasOffscreenDocument()) return;
+    }
+    throw err;
+  }
 }
 async function sendToOffscreen(message) {
   return sendToOffscreenInternal(message, false);

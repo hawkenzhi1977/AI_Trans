@@ -139,8 +139,8 @@ let currentPort: chrome.runtime.Port | null = null;
 
 // M2-68：音頻累積緩衝——將 256ms 碎片累積至目標窗口再發送，
 // 讓 Whisper 有足夠上下文產出準確結果（256ms 碎片只能識別 [MUSIC]）。
-// M2-68：可配置（默認 3000ms），經 warmup 消息傳入。
-let AUDIO_ACCUMULATE_TARGET_MS = 3000;
+// M2-68：可配置（默認 2000ms），經 warmup 消息傳入。
+let AUDIO_ACCUMULATE_TARGET_MS = 2000;
 let audioAccumBuffer: Float32Array | null = null;
 // M2-53：tabCapture 聲音回播——Chrome 以非原生採樣率打開 AudioContext 時
 // 不會自動將捕獲流回播到揚聲器，需要獨立的原生採樣率 passthrough context 負責回播，

@@ -89,6 +89,54 @@ describe('LocalWhisperASR — M2-37 消息代理', () => {
     }
   });
 
+  it('M2-69：warmup 遇 single offscreen 錯誤 → ensure-created + 重試成功', async () => {
+    // 第一次 warmup：SW 回傳 single offscreen 錯誤（result.ok=false）。
+    mockSendMessage.mockResolvedValueOnce({
+      ok: false,
+      error: 'asr-whisper operation failed: Only a single offscreen document may be created.',
+    });
+    // 第二次：offscreen:ensure-created → ok。
+    mockSendMessage.mockResolvedValueOnce({ ok: true });
+    // 第三次：重試 warmup → 成功。
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });
+
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await expect(asr.warmup(mockConfig)).resolves.toBeUndefined();
+
+    // 共發送 3 次：warmup(失敗) → ensure-created → warmup(重試成功)。
+    expect(mockSendMessage).toHaveBeenCalledTimes(3);
+    expect(mockSendMessage).toHaveBeenNthCalledWith(2, { topic: 'offscreen:ensure-created' });
+    expect(mockSendMessage).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ topic: 'asr-whisper:warmup' })
+    );
+  });
+
+  it('M2-69：warmup 遇 single offscreen 錯誤 → 重試仍失敗 → 拋錯', async () => {
+    // 第一次 warmup：single offscreen 錯誤。
+    mockSendMessage.mockResolvedValueOnce({
+      ok: false,
+      error: 'asr-whisper operation failed: Only a single offscreen document may be created.',
+    });
+    // ensure-created → ok。
+    mockSendMessage.mockResolvedValueOnce({ ok: true });
+    // 重試 warmup → 仍失敗（非 single offscreen）。
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: false, error: 'model not downloaded' } });
+
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await expect(asr.warmup(mockConfig)).rejects.toThrow('ASR warmup failed');
+    expect(mockSendMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it('M2-69：warmup 一般失敗（非 single offscreen）→ 不重試直接拋錯', async () => {
+    mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: false, error: 'model not downloaded' } });
+
+    const asr = new LocalWhisperASR({ modelTier: 'base' });
+    await expect(asr.warmup(mockConfig)).rejects.toThrow('ASR warmup failed');
+    // 只發送一次（無 ensure-created / 無重試）。
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('transcribe 轉發 asr-whisper:transcribe 消息給 Offscreen', async () => {
     // 先 warmup
     mockSendMessage.mockResolvedValueOnce({ ok: true, result: { ok: true } });

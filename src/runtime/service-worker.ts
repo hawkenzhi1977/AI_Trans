@@ -21,21 +21,41 @@ let offscreenPort: chrome.runtime.Port | null = null;
  * 確保 Offscreen Document 存在——MV3 中 SW 無法持有大模型，
  * 故將 ONNX 推理移至 Offscreen Document（具備完整 DOM 與 WebGPU/WASM 支援）。
  */
+/**
+ * 查詢是否已存在 offscreen document。
+ * M2-69：不帶 documentUrls 過濾——真實 Chrome 中 getContexts 的 URL 精確匹配可能漏判
+ * （URL 字串差異/時序），導致「已存在卻查不到」→ createDocument 拋
+ * "Only a single offscreen document may be created"。僅按 contextType 匹配更寬鬆可靠。
+ */
+async function hasOffscreenDocument(): Promise<boolean> {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+  });
+  return contexts.length > 0;
+}
+
 async function ensureOffscreenDocument(): Promise<void> {
   // 檢查是否已有 offscreen document。
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
-  });
-  if (existingContexts.length > 0) return;
+  if (await hasOffscreenDocument()) return;
 
   // 建立 offscreen document。
   console.warn('[AI_Trans:sw] offscreen created');
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [chrome.offscreen.Reason.USER_MEDIA],
-    justification: OFFSCREEN_REASON,
-  });
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      justification: OFFSCREEN_REASON,
+    });
+  } catch (err) {
+    // M2-69：createDocument 被拒「Only a single offscreen document may be created」
+    // 表示已存在一個 offscreen（getContexts 漏判）。重查確認存在即視為成功，
+    // 避免 ASR warmup 因重複創建失敗而降級（真實環境「字幕不出現」根因）。
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/only a single offscreen document/i.test(msg)) {
+      if (await hasOffscreenDocument()) return;
+    }
+    throw err;
+  }
 }
 
 /**

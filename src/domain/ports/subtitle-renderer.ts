@@ -1,4 +1,4 @@
-import type { Millis } from '../models/subtitle';
+import type { CaptionOrigin, Millis } from '../models/subtitle';
 
 /** 渲染器可消費的字幕提示（譯文為主）。 */
 export interface RenderableCue {
@@ -10,6 +10,8 @@ export interface RenderableCue {
   active?: boolean;
   start: Millis;
   end: Millis;
+  /** 來源級別——區分原生字幕與 ASR 字幕（grace period 僅對 ASR 生效）。 */
+  origin?: CaptionOrigin;
 }
 
 /** 字幕渲染端口——覆蓋層/樣式變化可替換實現。 */

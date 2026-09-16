@@ -146,8 +146,8 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
 
     expect(scriptProcessors).toHaveLength(1);
     const input = new Float32Array(4096).fill(0.1);
-    // M2-68：音頻累積至 ~3s 才發送（4096 samples × 12 = 49152 samples ≈ 3.07s @ 16kHz）。
-    for (let i = 0; i < 12; i++) {
+    // M2-68：音頻累積至 ~2s 才發送（4096 samples × 8 = 32768 samples ≈ 2.05s @ 16kHz）。
+    for (let i = 0; i < 8; i++) {
       scriptProcessors[0].onaudioprocess!({
         inputBuffer: { getChannelData: () => input },
       });
@@ -160,8 +160,8 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
     // M2-59：pcm 為 base64 string（修復 extension messaging 對 Float32Array 序列化損毀）。
     expect(typeof chunkMsg!.pcm).toBe('string');
     const decoded = decodePcmFloat32(chunkMsg!.pcm!);
-    // 累積 12 × 4096 = 49152 samples
-    expect(decoded).toHaveLength(49_152);
+    // 累積 8 × 4096 = 32768 samples
+    expect(decoded).toHaveLength(32_768);
     // 值精確還原（非引用同一陣列——事件緩衝回收後仍有效）。
     for (let i = 0; i < decoded.length; i++) {
       expect(decoded[i]).toBeCloseTo(0.1, 6);
@@ -174,14 +174,14 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
     expect(firstChunkLogs).toHaveLength(1);
   });
 
-  it('M2-68：默認 accumulateTargetMs=3000 → ~12 chunks (3.07s) 觸發（非舊 5s）', async () => {
+  it('M2-68：默認 accumulateTargetMs=2000 → ~8 chunks (2.05s) 觸發', async () => {
     const port = makeMockPort();
     await _testExports.startCapture('stream-1', port as never);
 
     const input = new Float32Array(4096).fill(0.1);
-    // 3000ms @ 16kHz = 48000 samples; 4096 × 12 = 49152 > 48000 → 第 12 塊觸發。
-    // 先餵 11 塊（45056 samples < 48000）→ 不觸發。
-    for (let i = 0; i < 11; i++) {
+    // 2000ms @ 16kHz = 32000 samples; 4096 × 8 = 32768 > 32000 → 第 8 塊觸發。
+    // 先餵 7 塊（28672 samples < 32000）→ 不觸發。
+    for (let i = 0; i < 7; i++) {
       scriptProcessors[0].onaudioprocess!({
         inputBuffer: { getChannelData: () => input },
       });
@@ -191,7 +191,7 @@ describe('offscreen M2-58 音頻捕獲儀表化', () => {
       .find((m) => m.type === 'audioChunk');
     expect(chunkMsg).toBeUndefined();
 
-    // 第 12 塊觸發。
+    // 第 8 塊觸發。
     scriptProcessors[0].onaudioprocess!({
       inputBuffer: { getChannelData: () => input },
     });

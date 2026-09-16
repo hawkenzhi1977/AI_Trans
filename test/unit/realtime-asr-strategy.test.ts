@@ -42,6 +42,7 @@ function createMockContext(): StrategyContext {
     } as EngineConfig,
     asr: {} as ASRProvider,
     translation: {} as TranslationProvider,
+    audioLanguage: 'en',
   };
 }
 
@@ -70,7 +71,8 @@ describe('RealtimeASRStrategy — §5.4 資源清理', () => {
       location: 'local',
       warmup: vi.fn().mockResolvedValue(undefined),
       transcribe: vi.fn().mockResolvedValue({
-        segments: [{ id: '1', sourceText: 'hello', start: 0, end: 1000 }],
+        seq: 0,
+        segments: [{ id: '1', sourceText: 'hello world this is a test', start: 0, end: 1000, origin: 'realtime-asr' as const, provisional: false, revision: 0 }],
         isPartial: false,
         rtf: 0.5,
       }),
@@ -134,6 +136,24 @@ describe('RealtimeASRStrategy — §5.4 資源清理', () => {
     // 等待 fire-and-forget promise 完成
     await new Promise((r) => setTimeout(r, 10));
     // 不應拋錯到 unhandled rejection
+  });
+
+  it('hintLang 從 ctx.audioLanguage 傳入 ASR 請求', async () => {
+    const ctx = createMockContext();
+    await strategy.run(ctx, () => {});
+
+    expect(chunkCallback).not.toBeNull();
+    // 使用有能量的 PCM（RMS > threshold）以通過 VAD。
+    const chunk = createMockChunk(0);
+    chunk.pcm.fill(0.1);
+    chunkCallback!(chunk);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // mockASR 無 transcribeStream → 走非流式路徑：transcribe 應收到 hintLang='en'。
+    expect(mockASR.transcribe).toHaveBeenCalledWith(
+      expect.objectContaining({ hintLang: 'en' }),
+    );
+    strategy.stop();
   });
 });
 

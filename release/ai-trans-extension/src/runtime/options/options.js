@@ -210,7 +210,7 @@
     const vadPct = (config.asr.vadThreshold ?? 5e-3) * 100;
     $("asr-vad-threshold").value = String(vadPct);
     $("asr-vad-val").textContent = vadPct.toFixed(1);
-    $("asr-accumulate-window").value = String(config.asr.accumulateTargetMs ?? 3e3);
+    $("asr-accumulate-window").value = String(config.asr.accumulateTargetMs ?? 2e3);
     $("target-lang").value = config.targetLang;
     $("display-mode").value = config.displayMode;
     $("performance-profile").value = config.performanceProfile;
