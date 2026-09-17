@@ -20,9 +20,9 @@ describe('config defaults', () => {
   });
 
   it('PROFILE_DEFAULTS 覆蓋三檔且 ASR 模型層級遞增', () => {
-    expect(PROFILE_DEFAULTS.streaming.asr.modelTier).toBe('tiny');
-    expect(PROFILE_DEFAULTS.balanced.asr.modelTier).toBe('base');
-    expect(PROFILE_DEFAULTS.quality.asr.modelTier).toBe('small');
+    expect(PROFILE_DEFAULTS.streaming.asr.modelTier).toBe('tiny-multi');
+    expect(PROFILE_DEFAULTS.balanced.asr.modelTier).toBe('base-multi');
+    expect(PROFILE_DEFAULTS.quality.asr.modelTier).toBe('small-multi');
   });
 
   it('streaming 檔位默認單語顯示以降延遲', () => {

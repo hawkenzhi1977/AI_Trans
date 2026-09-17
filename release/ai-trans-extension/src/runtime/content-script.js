@@ -111,7 +111,7 @@
   var DEFAULT_CONFIG = {
     enabled: true,
     translation: { type: "cloud-llm", fallbackType: "mt" },
-    asr: { type: "local-whisper", modelTier: "base" },
+    asr: { type: "local-whisper", modelTier: "base-multi" },
     targetLang: "zh-Hant",
     displayMode: "bilingual",
     performanceProfile: "balanced",

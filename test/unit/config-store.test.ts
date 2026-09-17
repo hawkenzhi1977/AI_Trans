@@ -41,7 +41,7 @@ describe('ChromeStorageConfigStore', () => {
     expect(config.targetLang).toBe('en');
     // 未覆蓋項保留默認
     expect(config.translation.fallbackType).toBe('mt');
-    expect(config.asr.modelTier).toBe('base');
+    expect(config.asr.modelTier).toBe('base-multi');
   });
 
   it('subscribe 在 set 後收到新配置', async () => {

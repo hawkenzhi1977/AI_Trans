@@ -94,15 +94,15 @@ export const PROFILE_DEFAULTS: Record<
   Pick<EngineConfig, 'asr' | 'displayMode'>
 > = {
   streaming: {
-    asr: { type: 'local-whisper', modelTier: 'tiny' },
+    asr: { type: 'local-whisper', modelTier: 'tiny-multi' },
     displayMode: 'mono',
   },
   balanced: {
-    asr: { type: 'local-whisper', modelTier: 'base' },
+    asr: { type: 'local-whisper', modelTier: 'base-multi' },
     displayMode: 'bilingual',
   },
   quality: {
-    asr: { type: 'local-whisper', modelTier: 'small' },
+    asr: { type: 'local-whisper', modelTier: 'small-multi' },
     displayMode: 'bilingual',
   },
 };
@@ -111,7 +111,7 @@ export const PROFILE_DEFAULTS: Record<
 export const DEFAULT_CONFIG: EngineConfig = {
   enabled: true,
   translation: { type: 'cloud-llm', fallbackType: 'mt' },
-  asr: { type: 'local-whisper', modelTier: 'base' },
+  asr: { type: 'local-whisper', modelTier: 'base-multi' },
   targetLang: 'zh-Hant',
   displayMode: 'bilingual',
   performanceProfile: 'balanced',

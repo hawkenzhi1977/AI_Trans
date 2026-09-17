@@ -17,22 +17,22 @@
   };
   var PROFILE_DEFAULTS = {
     streaming: {
-      asr: { type: "local-whisper", modelTier: "tiny" },
+      asr: { type: "local-whisper", modelTier: "tiny-multi" },
       displayMode: "mono"
     },
     balanced: {
-      asr: { type: "local-whisper", modelTier: "base" },
+      asr: { type: "local-whisper", modelTier: "base-multi" },
       displayMode: "bilingual"
     },
     quality: {
-      asr: { type: "local-whisper", modelTier: "small" },
+      asr: { type: "local-whisper", modelTier: "small-multi" },
       displayMode: "bilingual"
     }
   };
   var DEFAULT_CONFIG = {
     enabled: true,
     translation: { type: "cloud-llm", fallbackType: "mt" },
-    asr: { type: "local-whisper", modelTier: "base" },
+    asr: { type: "local-whisper", modelTier: "base-multi" },
     targetLang: "zh-Hant",
     displayMode: "bilingual",
     performanceProfile: "balanced",
